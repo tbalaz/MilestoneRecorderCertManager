@@ -640,6 +640,14 @@ function Invoke-RemoteServerEncryption {
             Start-Sleep -Milliseconds 800
             $work    = Join-Path $env:windir ("Temp\MRC-{0}" -f [guid]::NewGuid().ToString('N'))
             New-Item -ItemType Directory -Path $work -Force | Out-Null
+            # E1: protect the work folder itself (SYSTEM + Administrators, no inheritance) before ANY
+            # file is written into it - pw.txt must never land in a folder any authenticated user can read.
+            $aclWork = Get-Acl -Path $work
+            $aclWork.SetAccessRuleProtection($true, $false)
+            foreach ($idName in @('NT AUTHORITY\SYSTEM','BUILTIN\Administrators')) {
+                $aclWork.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($idName, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+            }
+            Set-Acl -Path $work -AclObject $aclWork
             $outFile = Join-Path $work 'out.txt'
             $errFile = Join-Path $work 'err.txt'
             $cmdFile = Join-Path $work 'run.cmd'
@@ -656,28 +664,35 @@ function Invoke-RemoteServerEncryption {
             $launchPw   = $nc.Password
             $cmdSpec    = '"{0}" /c "{1}"' -f "$env:windir\System32\cmd.exe", $cmdFile
             $pwFile     = Join-Path $work 'pw.txt'
-            [IO.File]::WriteAllText($pwFile, $launchPw)
-            $aclPw = Get-Acl -Path $pwFile
-            $aclPw.SetAccessRuleProtection($true, $false)
-            foreach ($idName in @('NT AUTHORITY\SYSTEM','BUILTIN\Administrators')) {
-                $aclPw.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($idName, 'FullControl', 'Allow')))
-            }
-            Set-Acl -Path $pwFile -AclObject $aclPw
-            $launcherPs1 = Join-Path $work 'launcher.ps1'
-            $ps1Body = $LauncherSource.
-                Replace('__USER__',    ($launchUser -replace "'","''")).
-                Replace('__DOMAIN__',  ($launchDom  -replace "'","''")).
-                Replace('__PWFILE__',  ($pwFile     -replace "'","''")).
-                Replace('__CMDLINE__', ($cmdSpec    -replace "'","''")).
-                Replace('__WORKDIR__', ($scDir      -replace "'","''"))
-            [IO.File]::WriteAllText($launcherPs1, $ps1Body, [Text.UTF8Encoding]::new($true))
-            $taskName = "MRC-SCSys-$([guid]::NewGuid().ToString('N').Substring(0,8))"
-            $elog.Add("[$env:COMPUTERNAME] SYSTEM task ${taskName}: LogonUser+CreateProcessAsUser as ${launchDom}\${launchUser} -> $scExe $scArgs")
-            $action    = New-ScheduledTaskAction -Execute "$env:windir\System32\WindowsPowerShell\v1.0\powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$launcherPs1`""
-            $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -RunLevel Highest -LogonType ServiceAccount
-            $sett      = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 15)
-            Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Settings $sett -Force | Out-Null
+            $taskName   = "MRC-SCSys-$([guid]::NewGuid().ToString('N').Substring(0,8))"
+            $taskRegistered = $false
+            $launcherPs1 = $null
+            $state = $null; $scExit = $null
             try {
+                # E1: everything from the pw.txt write to the end of the task is ONE try/finally - a
+                # failure anywhere in here (Set-Acl, Register-ScheduledTask, the wait loop) still cleans
+                # up the secret file and the launcher, and unregisters the task only if it was registered.
+                [IO.File]::WriteAllText($pwFile, $launchPw)
+                $aclPw = Get-Acl -Path $pwFile
+                $aclPw.SetAccessRuleProtection($true, $false)
+                foreach ($idName in @('NT AUTHORITY\SYSTEM','BUILTIN\Administrators')) {
+                    $aclPw.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($idName, 'FullControl', 'Allow')))
+                }
+                Set-Acl -Path $pwFile -AclObject $aclPw
+                $launcherPs1 = Join-Path $work 'launcher.ps1'
+                $ps1Body = $LauncherSource.
+                    Replace('__USER__',    ($launchUser -replace "'","''")).
+                    Replace('__DOMAIN__',  ($launchDom  -replace "'","''")).
+                    Replace('__PWFILE__',  ($pwFile     -replace "'","''")).
+                    Replace('__CMDLINE__', ($cmdSpec    -replace "'","''")).
+                    Replace('__WORKDIR__', ($scDir      -replace "'","''"))
+                [IO.File]::WriteAllText($launcherPs1, $ps1Body, [Text.UTF8Encoding]::new($true))
+                $elog.Add("[$env:COMPUTERNAME] SYSTEM task ${taskName}: LogonUser+CreateProcessAsUser as ${launchDom}\${launchUser} -> $scExe $scArgs")
+                $action    = New-ScheduledTaskAction -Execute "$env:windir\System32\WindowsPowerShell\v1.0\powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$launcherPs1`""
+                $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -RunLevel Highest -LogonType ServiceAccount
+                $sett      = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 15)
+                Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Settings $sett -Force | Out-Null
+                $taskRegistered = $true
                 Start-ScheduledTask -TaskName $taskName
                 $deadline = (Get-Date).AddMinutes(10)
                 do {
@@ -685,8 +700,28 @@ function Invoke-RemoteServerEncryption {
                     $state  = (Get-ScheduledTask -TaskName $taskName).State
                     $scExit = (Get-ScheduledTaskInfo -TaskName $taskName).LastTaskResult
                 } while (($state -eq 'Running' -or $scExit -eq 267009 -or $scExit -eq 267011) -and (Get-Date) -lt $deadline)
+                if ($state -eq 'Running' -or $scExit -eq 267009 -or $scExit -eq 267011) {
+                    # E2: the 10-minute deadline passed and the task is still running - do not give up here.
+                    # Wait up to 10 more minutes for the ServerConfigurator PROCESS itself to exit. Never kill it.
+                    $elog.Add("[$env:COMPUTERNAME] still running after 10 minutes - waiting up to 10 more minutes for ServerConfigurator to exit on its own")
+                    $procDeadline = (Get-Date).AddMinutes(10)
+                    $procGone = $false
+                    do {
+                        Start-Sleep -Seconds 2
+                        if (-not (Get-Process -Name ServerConfigurator -ErrorAction SilentlyContinue)) { $procGone = $true; break }
+                    } while ((Get-Date) -lt $procDeadline)
+                    if (-not $procGone) {
+                        throw "ServerConfigurator is still running after 20 minutes on $env:COMPUTERNAME - stopped here so nothing else changes while it works. Wait for it to finish, check the state, then run again."
+                    }
+                    $settleDeadline = (Get-Date).AddSeconds(30)
+                    do {
+                        Start-Sleep -Seconds 2
+                        $state  = (Get-ScheduledTask -TaskName $taskName).State
+                        $scExit = (Get-ScheduledTaskInfo -TaskName $taskName).LastTaskResult
+                    } while (($state -eq 'Running' -or $scExit -eq 267009 -or $scExit -eq 267011) -and (Get-Date) -lt $settleDeadline)
+                }
             } finally {
-                Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+                if ($taskRegistered) { Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue }
                 Remove-Item -LiteralPath $pwFile      -Force -ErrorAction SilentlyContinue
                 Remove-Item -LiteralPath $launcherPs1 -Force -ErrorAction SilentlyContinue
             }
@@ -804,6 +839,7 @@ function Invoke-ScWithWedgeRetry {
         if(-not (Test-Path variable:script:WedgeDepth)){ $script:WedgeDepth = 0 }   # StrictMode-safe init (runspaces too)
         if($script:WedgeDepth -ge 3){ $WorkLog.Add("[$GroupName] WEDGE: giving up after 3 recovery attempts"); throw }   # bounded: SC + up to 3 recoveries
         $dn=if($m -match 'Unable to (?:stop|restart) the service (.+?)\.'){ $Matches[1].Trim() }
+            elseif($m -match 'Could not stop service MilestoneEventServer'){ 'Milestone XProtect Event Server' }   # SC names the ES by its service name (MilestoneEventServerService)
             elseif($m -match 'Could not stop service (Milestone XProtect [A-Za-z ]+?Server)'){ $Matches[1].Trim() }   # SC 20000 PreExecute CouldNotStopServer variant
             else { 'Milestone XProtect Management Server' }
         $WorkLog.Add("[$GroupName] WEDGE: '$dn' stuck - SC could not stop/restart it (SC 10000) - bouncing it and retrying SC (recovery $($script:WedgeDepth + 1) of 3)")
@@ -863,15 +899,20 @@ function Confirm-EventServerEncryption {
                 }
             }
             $esSel = { $_.Name -eq 'MilestoneEventServer' -or $_.DisplayName -eq 'Milestone XProtect Event Server' -or $_.Name -match '^W3SVC$|^WAS$' }
-            $svc = Get-Service | Where-Object $esSel
+            # A Disabled service is a valid, intentional state (e.g. on an MS cluster node, by design) -
+            # never a start attempt, never counted as "stopped".
+            $svcAll = @(Get-Service | Where-Object $esSel)
+            $disabled = @($svcAll | Where-Object { [string]$_.StartType -eq 'Disabled' } | ForEach-Object { $_.Name })
+            if ($disabled.Count) { $rlog.Add("[$env:COMPUTERNAME] skipped (Disabled): $($disabled -join ',')") }
+            $svc = @($svcAll | Where-Object { [string]$_.StartType -ne 'Disabled' })
             foreach ($s in ($svc | Where-Object { $_.Status -ne 'Running' })) {
                 try { Start-Service $s.Name -ErrorAction Stop; $rlog.Add("[$env:COMPUTERNAME] started service: $($s.Name)") }
                 catch { $rlog.Add("[$env:COMPUTERNAME] FAILED to start $($s.Name): $($_.Exception.Message)") }
             }
             Start-Sleep -Seconds 3
-            $svc = Get-Service | Where-Object $esSel
+            $svc = @(Get-Service | Where-Object $esSel | Where-Object { [string]$_.StartType -ne 'Disabled' })
             $stopped = @($svc | Where-Object { $_.Status -ne 'Running' } | Select-Object -ExpandProperty Name)
-            $rlog.Add("[$env:COMPUTERNAME] services running: $(($svc | Where-Object Status -eq Running).Count)/$($svc.Count)$(if ($stopped) { ' STILL STOPPED: ' + ($stopped -join ',') })")
+            $rlog.Add("[$env:COMPUTERNAME] services running: $(@($svc | Where-Object Status -eq Running).Count)/$($svc.Count)$(if ($stopped) { ' STILL STOPPED: ' + ($stopped -join ',') })")
             [pscustomobject]@{ Bound = 'n/a'; AllServicesRunning = ($stopped.Count -eq 0); Stopped = $stopped; Logs = $rlog.ToArray() }
         }
         foreach ($l in $res.Logs) { $log.Add($l) }
