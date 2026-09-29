@@ -12,10 +12,13 @@ run as Administrator.
 
 | Script | Use it for | Run it on |
 | --- | --- | --- |
-| **`Mrc-Guided.ps1`** | **Start here.** A 4-step wizard for everyday use: Connect, Check, Turn encryption ON / OFF, Result. It handles the whole system in the right order, failover clusters included, and can undo a run. | The Management Server (any node of a cluster) |
-| `Mrc-Ms-Gui.ps1` | Management Server only (advanced). | The Management Server |
-| `Mrc-Es-Gui.ps1` | A standalone Event Server only (advanced). | The Event Server |
-| `Mrc-Rec-Gui.ps1` | Recording Servers only, discovered from the VMS and handled in parallel (advanced). | The Management Server or a workstation |
+| **`Mrc-Guided.ps1`** | **Start here - this is all you need.** A 4-step wizard: Connect, Check, Turn encryption ON / OFF, Result. It handles the whole system in the right order: the Event Server, the Management Server and **all Recording Servers** (found automatically from the VMS and handled in parallel), failover clusters included, and it can undo a run. | The Management Server (any node of a cluster) |
+| `Mrc-Ms-Gui.ps1` | Advanced / troubleshooting: the Management Server alone. | The Management Server |
+| `Mrc-Es-Gui.ps1` | Advanced / troubleshooting: a standalone Event Server alone. | The Event Server |
+| `Mrc-Rec-Gui.ps1` | Advanced / troubleshooting: Recording Servers alone (the guided script already includes them). | The Management Server or a workstation |
+
+The three role scripts change one role at a time and leave the order to you. Use them only when
+support asks for it or for a special case; for normal use, `Mrc-Guided.ps1` covers every role.
 
 ## Quick start (guided)
 
@@ -26,7 +29,9 @@ powershell -ExecutionPolicy Bypass -STA -File .\Mrc-Guided.ps1
 
 1. **Connect**: enter the Event Server name (or tick "The Event Server is on this computer, or
    not installed"), an admin account, and the signing CA. Recording Servers are found
-   automatically.
+   automatically from the VMS (needs MilestonePSTools on the Management Server); add any
+   missing ones in "Extra recording servers". Tick "Recording servers use a different account"
+   if they need their own login.
 2. **Check**: see every server (every cluster node) and whether it is encrypted now.
 3. **Action**: click **Turn encryption ON** or **Turn encryption OFF**.
 4. **Result**: the final state of every server, and a saved report. If something failed:
