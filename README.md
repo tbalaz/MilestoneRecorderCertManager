@@ -31,7 +31,8 @@ powershell -ExecutionPolicy Bypass -STA -File .\Mrc-Guided.ps1
    not installed"), an admin account, and the signing CA. Recording Servers are found
    automatically from the VMS (needs MilestonePSTools on the Management Server); add any
    missing ones in "Extra recording servers". Tick "Recording servers use a different account"
-   if they need their own login.
+   if they need their own login. If something on this page fails, click **Open log**: it shows
+   every address and account that was tried and the exact reason.
 2. **Check**: see every server (every cluster node) and whether it is encrypted now.
 3. **Action**: click **Turn encryption ON** or **Turn encryption OFF**.
 4. **Result**: the final state of every server, and a saved report. If something failed:
@@ -115,7 +116,11 @@ skipped with a message.
   (Windows feature RSAT-Clustering-PowerShell). Without it the wizard refuses to change
   anything, rather than treating a cluster node as a single server.
 - An admin account that is a local administrator on those servers and in the Milestone
-  Administrators role.
+  Administrators role. A domain account (`DOMAIN\user`) or a local Windows account works. Type a
+  local account as `COMPUTERNAME\user` or just `user` (both are tried). A local account must
+  exist with the same name and password on every server. If it is not the built-in
+  Administrator, set `LocalAccountTokenFilterPolicy=1` on the remote servers, otherwise
+  Windows blocks its admin rights over WinRM.
 - A signing CA with its private key in the Management Server's certificate store. All
   certificates must chain to the same CA. Use "Create signing CA" only if encryption was
   never set up in the system.

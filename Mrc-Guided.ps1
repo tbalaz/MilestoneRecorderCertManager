@@ -1464,6 +1464,64 @@ function Invoke-RecordersParallel { param([object[]]$Boxes,[string]$Action,[hash
     $out.ToArray()
 }
 
+# The window's log (the 'Show details' box on the Action page) saved to a file, so it can be read from
+# ANY page - the Connect page has no log box. One file per wizard session, rewritten on every save.
+$script:UiLogPath = ''
+function Save-UiLog {
+    try {
+        if(-not (Test-Path -LiteralPath $script:RunsDir)){ [void](New-Item -ItemType Directory -Path $script:RunsDir -Force) }
+        if(-not $script:UiLogPath){ $script:UiLogPath = Join-Path $script:RunsDir ("guided-{0:yyyyMMdd-HHmmss}-log.txt" -f (Get-Date)) }
+        [IO.File]::WriteAllText($script:UiLogPath, ([string]$script:Log.Text -replace "(?<!`r)`n","`r`n"), [Text.UTF8Encoding]::new($false))
+        $script:UiLogPath
+    } catch { '' }
+}
+
+# One readable line for a failed VMS login: exception type + the distinct messages down the inner chain
+# (MilestonePSTools wraps the SDK error, and the type name alone does not say WHY the login failed).
+function Get-VmsErrorText { param($Err)
+    $parts = @(); $e = $Err.Exception
+    while($e){ $m = Get-FirstLine $e.Message; if($m -and ($parts -notcontains $m)){ $parts += $m }; $e = $e.InnerException }
+    "$($Err.Exception.GetType().Name): $((@($parts) | Select-Object -First 3) -join ' | ')"
+}
+# Accounts to try for a VMS login. A local Windows account is only valid as COMPUTER\user: typed as
+# 'user' or '.\user' it is ALSO tried as <this computer>\user (the wizard runs on the Management Server).
+function Get-VmsCredVariants { param([pscredential]$Cred)
+    $v = @()
+    if(-not $Cred){ return @() }
+    $u = [string]$Cred.UserName
+    $v += [pscustomobject]@{ Label=$u; Cred=$Cred }
+    $bare = $null
+    if($u -match '^\.\\(.+)$'){ $bare = $Matches[1] } elseif($u -notmatch '[\\@]'){ $bare = $u }
+    if($bare){ $v += [pscustomobject]@{ Label="$env:COMPUTERNAME\$bare"; Cred=[pscredential]::new("$env:COMPUTERNAME\$bare",$Cred.Password) } }
+    $v
+}
+# Log in to the VMS (MilestonePSTools Connect-Vms) on the first address that accepts one of the accounts.
+# -AllowCurrentUser adds the Windows user running the wizard as a last try (read-only discovery only - the
+# Administrators-role check must test the TYPED account). Every failure is logged with its real reason.
+function Connect-VmsAny { param([string[]]$Urls,[pscredential]$Cred,[switch]$AllowCurrentUser,[string]$Purpose)
+    $reasons = [System.Collections.Generic.List[string]]::new()
+    $variants = @(Get-VmsCredVariants $Cred)
+    if($AllowCurrentUser){ $variants += [pscustomobject]@{ Label="$env:USERDOMAIN\$env:USERNAME (the Windows user running this wizard)"; Cred=$null } }
+    $unreachable = '(?i)could not be resolved|no such host|unable to connect|actively refused|timed out|timeout|ServerNotFound|remote name|no connection could be made'
+    foreach($url in @($Urls)){
+        foreach($v in $variants){
+            $cp = @{ ServerAddress=[uri]$url; AcceptEula=$true; ErrorAction='Stop' }
+            if($v.Cred){ $cp.Credential = $v.Cred }
+            try {
+                Connect-Vms @cp | Out-Null
+                Write-Log "VMS login OK ($Purpose): $url as $($v.Label)" 'Good'
+                return [pscustomobject]@{ Ok=$true; Url=$url; As=$v.Label; Reasons=$reasons.ToArray() }
+            } catch {
+                $m = Get-VmsErrorText $_
+                $reasons.Add("$url as $($v.Label): $m")
+                Write-Log "  VMS login ($Purpose) $url as $($v.Label) -> $m"
+                if($m -match $unreachable){ break }   # nothing answers at this address - other accounts will not help
+            }
+        }
+    }
+    [pscustomobject]@{ Ok=$false; Url=''; As=''; Reasons=$reasons.ToArray() }
+}
+
 # Recorder discovery from the VMS. ADAPTED from Mrc-Rec-Gui.ps1 Do-Load (same candidate-URL
 # logic and the same skip of the recorder co-located on the management server), returning plain
 # objects instead of filling a grid. Needs MilestonePSTools on this machine.
@@ -1493,18 +1551,13 @@ function Get-VmsRecorderList { param([string]$Domain,[pscredential]$VmsCred,[str
     if($typedAddr -match '^https?://'){ & $addc $typedAddr }
     foreach($h in $hosts){ & $addc "https://$h" }
     foreach($h in $hosts){ & $addc "http://$h" }
-    $connected=$false
-    $connectedUrl=$null
-    foreach($u in $cands){
-        try {
-            $cp=@{ServerAddress=[uri]$u;AcceptEula=$true;ErrorAction='Stop'}
-            if($VmsCred){ $cp.Credential=$VmsCred }
-            Write-Log "Connecting VMS $u to discover recorders..."
-            Connect-Vms @cp | Out-Null
-            Write-Log "Connected: $u" 'Good'; $connected=$true; $connectedUrl=$u; break
-        } catch { Write-Log "  $u -> $($_.Exception.GetType().Name)" }
+    Write-Log "Logging in to the VMS to find the recording servers (addresses: $($cands -join ', '))..."
+    $vl = Connect-VmsAny -Urls $cands.ToArray() -Cred $VmsCred -AllowCurrentUser -Purpose 'recorder discovery'
+    if(-not $vl.Ok){
+        $why = (@($vl.Reasons) | Select-Object -First 8) -join "`r`n  "
+        throw "Could not log in to the VMS (Milestone management server). Tried:`r`n  $why`r`nMost common causes: a local Windows account must be typed as COMPUTERNAME\user, and the account must be in the Milestone Administrators role (Management Client > Security > Roles > Administrators)."
     }
-    if(-not $connected){ throw "Could not connect to the VMS on any of: $($cands -join ', ')." }
+    $connectedUrl=$vl.Url
     $msNames = [System.Collections.Generic.List[string]]::new()
     $addMs = { param($n) if($n){ try { $s = Normalize-RecorderHostName $n; if($msNames -notcontains $s){ [void]$msNames.Add($s) } } catch {} } }
     try { $vmsMs = Get-VmsManagementServer -ErrorAction Stop; if($vmsMs -and $vmsMs.Name){ & $addMs $vmsMs.Name } } catch {}
@@ -3149,11 +3202,8 @@ function Get-MilestoneAdminProblem {
     if($script:MsFqdn){ $hosts += [string]$script:MsFqdn }
     $hosts += $env:COMPUTERNAME
     $cands = @(); foreach($h in ($hosts | Select-Object -Unique)){ $cands += "https://$h" }; foreach($h in ($hosts | Select-Object -Unique)){ $cands += "http://$h" }
-    $connected = $false
-    foreach($u in $cands){
-        try { Connect-Vms -ServerAddress ([uri]$u) -Credential $script:AdminCred -AcceptEula -ErrorAction Stop | Out-Null; $connected = $true; break } catch {}
-    }
-    if(-not $connected){ Write-Log 'Milestone Administrators role: not checked (could not connect to the VMS with the admin account).' 'Err'; return '' }
+    $vl = Connect-VmsAny -Urls $cands -Cred $script:AdminCred -Purpose 'Administrators role check'
+    if(-not $vl.Ok){ Write-Log "Milestone Administrators role: not checked (could not log in to the VMS with the admin account: $(@($vl.Reasons) | Select-Object -Last 1))." 'Err'; return '' }
     $memSids = @()
     try {
         $roles = @(Get-VmsRole -ErrorAction Stop | Where-Object { [string]$_.Name -eq 'Administrators' -or ([string]$_.PSObject.Properties['RoleType'].Value) -match 'Adm' })
@@ -3543,7 +3593,7 @@ function Initialize-Targets { param([string]$ManualList,[bool]$Discover)
     if($script:MsCluster -and $script:MsCluster.Address -and ([string]::IsNullOrWhiteSpace($vmsAddr) -or $vmsAddr -match '<[^>]+>')){ $vmsAddr = [string]$script:MsCluster.Address }
     if($Discover){
         try { foreach($r in @(Get-VmsRecorderList -Domain $script:DomainName -VmsCred $script:AdminCred -MsAddrText $vmsAddr)){ & $add $r.Name $r.Target $r.Fqdn } }
-        catch { $discErr=Get-FirstLine $_.Exception.Message; Write-Log "Recording server discovery failed: $(Format-Err $_)" 'Err' }
+        catch { $discErr=([string]$_.Exception.Message).Trim(); Write-Log "Recording server discovery failed: $(Format-Err $_)" 'Err' }
     }
     foreach($h in @(([string]$ManualList) -split '[;,\r\n]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ -and -not $_.StartsWith('#') })){
         $parts=$h -split '=',2
@@ -4193,7 +4243,8 @@ function Do-Connect {
         $script:ConnectStatus.Text='Looking for the recording servers and checking every computer. Please wait...'; [Windows.Forms.Application]::DoEvents()
         $err = Initialize-Targets -ManualList $script:ManualRecBox.Text -Discover $true
         if($err -and -not $script:ManualRecBox.Text.Trim()){
-            $q="The recording servers could not be found automatically:`r`n$err`r`n`r`nYou can type them in the 'Extra recording servers' box instead.`r`n`r`nContinue WITHOUT recording servers?"
+            $lp = Save-UiLog
+            $q="The recording servers could not be found automatically:`r`n$err`r`n`r`nYes = continue WITHOUT recording servers.`r`nNo = stay on this page: type them in the 'Extra recording servers' box (one per line: name, or name=IP) and click Next again.$(if($lp){"`r`n`r`nFull details: click 'Open log' on this page ($lp)."})"
             if([Windows.Forms.MessageBox]::Show($q,'Recording servers not found',4,'Warning') -ne 'Yes'){ return }
         }
         $all=@(Get-AllBoxes); Update-BoxStates $all
@@ -4204,7 +4255,8 @@ function Do-Connect {
         $script:Page=2
     } catch {
         Write-Log "Check failed: $(Format-Err $_)" 'Err'
-        [Windows.Forms.MessageBox]::Show("Could not check the computers:`r`n$(Get-FirstLine $_.Exception.Message)",'Error',0,'Error')|Out-Null
+        $lp = Save-UiLog
+        [Windows.Forms.MessageBox]::Show("Could not check the computers:`r`n$(Get-FirstLine $_.Exception.Message)$(if($lp){"`r`n`r`nFull details: click 'Open log' on this page ($lp)."})",'Error',0,'Error')|Out-Null
     } finally { $script:ConnectStatus.Text=''; Set-Busy $false; Show-Page $script:Page }
 }
 function Do-Recheck {
@@ -4471,7 +4523,9 @@ $recLbl=New-UiLabel 'Extra recording servers (optional, one per line):' 24 466 2
 $script:ManualRecBox=[Windows.Forms.TextBox]::new(); $script:ManualRecBox.Multiline=$true; $script:ManualRecBox.ScrollBars='Vertical'
 $script:ManualRecBox.Location=[Drawing.Point]::new(320,466); $script:ManualRecBox.Size=[Drawing.Size]::new(320,60); $p1.Controls.Add($script:ManualRecBox)
 $recHint=New-UiLabel 'Recording servers are found automatically. Add them here only if they are missing.' 656 466 320 60; $recHint.TextAlign='TopLeft'; $p1.Controls.Add($recHint)
-$script:ConnectStatus=New-UiLabel '' 24 540 950 30; $script:ConnectStatus.Font=$script:UiBold; $script:ConnectStatus.ForeColor=[Drawing.Color]::DarkOrange; $p1.Controls.Add($script:ConnectStatus)
+$script:ConnectStatus=New-UiLabel '' 24 540 760 30; $script:ConnectStatus.Font=$script:UiBold; $script:ConnectStatus.ForeColor=[Drawing.Color]::DarkOrange; $p1.Controls.Add($script:ConnectStatus)
+$openLogBtn=New-UiButton 'Open log' 794 536 180 34; $p1.Controls.Add($openLogBtn)
+$openLogBtn.Add_Click({ $lp = Save-UiLog; if($lp){ Start-Process notepad.exe -ArgumentList "`"$lp`"" } else { [Windows.Forms.MessageBox]::Show('The log could not be saved.','Log',0,'Warning')|Out-Null } })
 # Resolve-Signer (verbatim) reads these: store mode only in the wizard; the PFX controls are never shown.
 $script:SignerStoreRadio=[Windows.Forms.RadioButton]::new(); $script:SignerStoreRadio.Checked=$true
 $script:SignerPfxRadio=[Windows.Forms.RadioButton]::new()
