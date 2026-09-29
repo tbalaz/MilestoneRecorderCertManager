@@ -115,6 +115,7 @@ param(
     [string]$RecPwFile,                                 # file holding the recording-server password (headless only)
     [string]$RootSubject = '<signer-subject>',          # signing CA subject (store lookup by CN)
     [string]$ExtraSans = '',                            # extra SAN DNS names for the Management Server certificate
+    [string]$SearchPaths = '',                          # ';' list of folders (or exe paths) to search for ServerConfigurator.exe / MilestonePSTools when not installed in the default folder
     [string]$LogFile,                                   # optional: tee the log here
     [string]$MsAddr = '',                               # VMS address for recorder discovery (default: this machine)
     [string]$Domain = ''                                # DNS domain suffix (default: this machine's primary DNS suffix)
@@ -141,6 +142,7 @@ $script:Defaults = @{
     MsFqdn        = '<mgmt-fqdn>'                     # this Management Server's certificate name (default: COMPUTERNAME.<domain>)
     EsHost        = '<event-server-host>'             # standalone Event Server host
     ExtraSans     = ''                                # extra SAN names for the Management Server certificate
+    SearchPaths   = ''                                # extra folders to search for ServerConfigurator.exe / MilestonePSTools ('D:\Milestone;E:\Apps')
 }
 $script:DefaultsLoaded = @()
 $script:DefaultsLoadError = $null
@@ -163,6 +165,7 @@ $AdminUser   = Resolve-Default $AdminUser   'MsUser'
 $RecUser     = Resolve-Default $RecUser     'RecUser'
 $RootSubject = Resolve-Default $RootSubject 'SignerSubject'
 $ExtraSans   = Resolve-Default $ExtraSans   'ExtraSans'
+$SearchPaths = Resolve-Default $SearchPaths 'SearchPaths'
 $MsAddr      = Resolve-Default $MsAddr      'MsAddr'
 if (-not $NoEventServer) { $EsHost = Resolve-Default $EsHost 'EsHost' }
 
@@ -558,9 +561,20 @@ function Invoke-RemoteRecorderInstall {
                 $Tp = ($Tp -replace '[^A-Fa-f0-9]', '').ToUpperInvariant()
                 $elog.Add("[$env:COMPUTERNAME] Running as: $([System.Security.Principal.WindowsIdentity]::GetCurrent().Name)")
                 $elog.Add("[$env:COMPUTERNAME] Thumbprint (sanitized): $Tp")
-                $scExe = if ([string]::IsNullOrWhiteSpace($ConfPath)) {
-                    'C:\Program Files\Milestone\Server Configurator\ServerConfigurator.exe'
-                } else { $ConfPath }
+                # ServerConfigurator.exe location on THIS computer (install folders differ per server): the search
+                # list in $ConfPath first (exe paths, or folders: <f>, <f>\Server Configurator, <f>\Milestone\Server
+                # Configurator), then <Milestone root>\Server Configurator derived from the Milestone service image
+                # paths, then %ProgramFiles%\Milestone; last, a bounded recursive search of the given folders.
+                $scExe = $null; $scLook = [System.Collections.Generic.List[string]]::new()
+                $scDirs = @(([string]$ConfPath) -split ';' | ForEach-Object { $_.Trim().Trim('"') } | Where-Object { $_ })
+                foreach ($scP in $scDirs) { if ($scP -match '\.exe$') { $scLook.Add($scP) } else { foreach ($scSub in @('', 'Server Configurator', 'Milestone\Server Configurator')) { $scLook.Add((Join-Path (Join-Path $scP $scSub) 'ServerConfigurator.exe')) } } }
+                foreach ($scSvc in @(Get-CimInstance Win32_Service -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like 'Milestone XProtect*' -or $_.Name -like 'MilestoneEventServer*' })) {
+                    try { if ([string]$scSvc.PathName -match '^\s*"?([^"]+?\.exe)') { $scUp = [IO.Path]::GetDirectoryName([IO.Path]::GetDirectoryName($Matches[1])); foreach ($scRoot in @($scUp, $(if ($scUp) { [IO.Path]::GetDirectoryName($scUp) }))) { if ($scRoot) { $scLook.Add((Join-Path $scRoot 'Server Configurator\ServerConfigurator.exe')) } } } } catch {}
+                }
+                $scLook.Add((Join-Path $env:ProgramFiles 'Milestone\Server Configurator\ServerConfigurator.exe'))
+                foreach ($scC in $scLook) { if (Test-Path -LiteralPath $scC -PathType Leaf) { $scExe = $scC; break } }
+                if (-not $scExe) { foreach ($scP in @($scDirs | Where-Object { $_ -notmatch '\.exe$' -and (Test-Path -LiteralPath $_ -PathType Container) })) { $scHit = Get-ChildItem -LiteralPath $scP -Filter 'ServerConfigurator.exe' -File -Recurse -Depth 4 -ErrorAction SilentlyContinue | Select-Object -First 1; if ($scHit) { $scExe = $scHit.FullName; break } } }
+                if (-not $scExe) { $scExe = '(not found - looked in: ' + ((@($scLook) | Select-Object -Unique) -join '; ') + $(if (@($scDirs).Count) { '; and searched below: ' + ($scDirs -join '; ') } else { '' }) + ')' }
                 if (-not (Test-Path -LiteralPath $scExe)) { throw "ServerConfigurator not found: $scExe" }
                 $scDir   = [System.IO.Path]::GetDirectoryName($scExe)
                 # Kill any stale ServerConfigurator first: its singleton lock makes the next run exit -4/1 silently.
@@ -621,7 +635,7 @@ function Invoke-RemoteRecorderInstall {
                 $elog.Add("[$env:COMPUTERNAME] SC stdout: $(if ($stdout -and $stdout.Trim()) { $stdout.Trim() } else { '(empty)' })")
                 $elog.Add("[$env:COMPUTERNAME] SC stderr: $(if ($stderr -and $stderr.Trim()) { $stderr.Trim() } else { '(empty)' })")
                 $elog.Add("[$env:COMPUTERNAME] SC exit code: $scExit")
-                $scLog = Get-ChildItem -Path 'C:\ProgramData\Milestone' -Recurse -Filter '*.log' -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match 'erver.?onfigurator' } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+                $scLog = Get-ChildItem -Path (Join-Path $env:ProgramData 'Milestone') -Recurse -Filter '*.log' -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match 'erver.?onfigurator' } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
                 $runLines = @()
                 if ($scLog) {
                     $allLog = @(Get-Content -LiteralPath $scLog.FullName -ErrorAction SilentlyContinue)
@@ -687,9 +701,20 @@ function Invoke-RemoteServerEncryption {
                 $certTp = $cert.Thumbprint
                 $elog.Add("[$env:COMPUTERNAME] Found cert: $($cert.Subject)")
             }
-            $scExe = if ([string]::IsNullOrWhiteSpace($ConfPath)) {
-                'C:\Program Files\Milestone\Server Configurator\ServerConfigurator.exe'
-            } else { $ConfPath }
+            # ServerConfigurator.exe location on THIS computer (install folders differ per server): the search
+            # list in $ConfPath first (exe paths, or folders: <f>, <f>\Server Configurator, <f>\Milestone\Server
+            # Configurator), then <Milestone root>\Server Configurator derived from the Milestone service image
+            # paths, then %ProgramFiles%\Milestone; last, a bounded recursive search of the given folders.
+            $scExe = $null; $scLook = [System.Collections.Generic.List[string]]::new()
+            $scDirs = @(([string]$ConfPath) -split ';' | ForEach-Object { $_.Trim().Trim('"') } | Where-Object { $_ })
+            foreach ($scP in $scDirs) { if ($scP -match '\.exe$') { $scLook.Add($scP) } else { foreach ($scSub in @('', 'Server Configurator', 'Milestone\Server Configurator')) { $scLook.Add((Join-Path (Join-Path $scP $scSub) 'ServerConfigurator.exe')) } } }
+            foreach ($scSvc in @(Get-CimInstance Win32_Service -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like 'Milestone XProtect*' -or $_.Name -like 'MilestoneEventServer*' })) {
+                try { if ([string]$scSvc.PathName -match '^\s*"?([^"]+?\.exe)') { $scUp = [IO.Path]::GetDirectoryName([IO.Path]::GetDirectoryName($Matches[1])); foreach ($scRoot in @($scUp, $(if ($scUp) { [IO.Path]::GetDirectoryName($scUp) }))) { if ($scRoot) { $scLook.Add((Join-Path $scRoot 'Server Configurator\ServerConfigurator.exe')) } } } } catch {}
+            }
+            $scLook.Add((Join-Path $env:ProgramFiles 'Milestone\Server Configurator\ServerConfigurator.exe'))
+            foreach ($scC in $scLook) { if (Test-Path -LiteralPath $scC -PathType Leaf) { $scExe = $scC; break } }
+            if (-not $scExe) { foreach ($scP in @($scDirs | Where-Object { $_ -notmatch '\.exe$' -and (Test-Path -LiteralPath $_ -PathType Container) })) { $scHit = Get-ChildItem -LiteralPath $scP -Filter 'ServerConfigurator.exe' -File -Recurse -Depth 4 -ErrorAction SilentlyContinue | Select-Object -First 1; if ($scHit) { $scExe = $scHit.FullName; break } } }
+            if (-not $scExe) { $scExe = '(not found - looked in: ' + ((@($scLook) | Select-Object -Unique) -join '; ') + $(if (@($scDirs).Count) { '; and searched below: ' + ($scDirs -join '; ') } else { '' }) + ')' }
             if (-not (Test-Path -LiteralPath $scExe)) { throw "ServerConfigurator not found: $scExe | $($elog.ToArray() -join ' | ')" }
             $scDir   = [System.IO.Path]::GetDirectoryName($scExe)
             # Kill any stale ServerConfigurator first: its singleton lock makes the next run exit -4/1 silently.
@@ -788,7 +813,7 @@ function Invoke-RemoteServerEncryption {
             $elog.Add("[$env:COMPUTERNAME] SC stdout: $(if ($stdout -and $stdout.Trim()) { $stdout.Trim() } else { '(empty)' })")
             $elog.Add("[$env:COMPUTERNAME] SC stderr: $(if ($stderr -and $stderr.Trim()) { $stderr.Trim() } else { '(empty)' })")
             $elog.Add("[$env:COMPUTERNAME] SC exit code: $scExit")
-            $scLog = Get-ChildItem -Path 'C:\ProgramData\Milestone' -Recurse -Filter '*.log' -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match 'erver.?onfigurator' } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            $scLog = Get-ChildItem -Path (Join-Path $env:ProgramData 'Milestone') -Recurse -Filter '*.log' -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match 'erver.?onfigurator' } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
             $runLines = @()
             if ($scLog) {
                 $allLog = @(Get-Content -LiteralPath $scLog.FullName -ErrorAction SilentlyContinue)
@@ -886,10 +911,10 @@ function Repair-WedgedService {
 function Invoke-ScWithWedgeRetry {
     param([string]$ComputerName,[pscredential]$Credential,[string]$Thumbprint,[string]$CertificateGroup,
           [ValidateSet('enableencryption','disableencryption')][string]$Action,
-          [System.Collections.Generic.List[string]]$WorkLog,[string]$GroupName)
+          [System.Collections.Generic.List[string]]$WorkLog,[string]$GroupName,[string]$ScPaths='')
     try {
         Invoke-RemoteServerEncryption -ComputerName $ComputerName -Credential $Credential -UseSsl:$false `
-            -Thumbprint $Thumbprint -ServerConfiguratorPath '' -ScCredential $Credential -CertificateGroup $CertificateGroup -Action $Action
+            -Thumbprint $Thumbprint -ServerConfiguratorPath $ScPaths -ScCredential $Credential -CertificateGroup $CertificateGroup -Action $Action
     } catch {
         $m=$_.Exception.Message
         if($m -notmatch 'cannot accept control messages|Unable to (?:stop|restart) the service|Could not stop service'){ throw }
@@ -1209,7 +1234,7 @@ $script:HostWorker = {
             for($i=0;$i -lt $guids.Count;$i++){
                 $g=$guids[$i]; $gn= if($i -lt $names.Count){ $names[$i] } else { $g }
                 $e=Invoke-ScWithWedgeRetry -ComputerName $P.Fqdn -Credential $P.Cred `
-                     -Thumbprint $pkg.Thumbprint -CertificateGroup $g -Action enableencryption -WorkLog $logs -GroupName $gn
+                     -Thumbprint $pkg.Thumbprint -CertificateGroup $g -Action enableencryption -WorkLog $logs -GroupName $gn -ScPaths ([string]$P.ScPaths)
                 foreach($l in $e.Logs){ $logs.Add("[$gn] $l") }
                 if($e.ExitCode -in 0,200000){ $okG+=$gn }
                 elseif($e.ExitCode -eq 100){ $failG+="$gn=exit100(not authorized)" }
@@ -1232,7 +1257,7 @@ $script:HostWorker = {
             for($i=0;$i -lt $guids.Count;$i++){
                 $g=$guids[$i]; $gn= if($i -lt $names.Count){ $names[$i] } else { $g }
                 $r=Invoke-ScWithWedgeRetry -ComputerName $P.Fqdn -Credential $P.Cred `
-                     -Thumbprint '' -CertificateGroup $g -Action disableencryption -WorkLog $logs -GroupName $gn
+                     -Thumbprint '' -CertificateGroup $g -Action disableencryption -WorkLog $logs -GroupName $gn -ScPaths ([string]$P.ScPaths)
                 foreach($l in $r.Logs){ $logs.Add($l) }
                 if($r.CertApplied -or ($r.ExitCode -in 0,100,200000)){ $okG+=$gn } else { $failG+="$gn=exit $($r.ExitCode)" }
             }
@@ -1276,7 +1301,7 @@ $script:EsHostWorker = {
                  -EnableEncryption $false -ServerConfiguratorPath '' -ScCredential $P.Cred -CertificateGroup ''
             foreach($l in $r.Logs){ $logs.Add($l) }
             $e=Invoke-ScWithWedgeRetry -ComputerName $P.Fqdn -Credential $P.Cred `
-                 -Thumbprint $pkg.Thumbprint -CertificateGroup $P.Guid -Action enableencryption -WorkLog $logs -GroupName $P.GroupName
+                 -Thumbprint $pkg.Thumbprint -CertificateGroup $P.Guid -Action enableencryption -WorkLog $logs -GroupName $P.GroupName -ScPaths ([string]$P.ScPaths)
             foreach($l in $e.Logs){ $logs.Add("[$($P.GroupName)] $l") }
             $failMsg=''
             $regFail = Test-EsRegistrationFailed -ScLogs $e.Logs
@@ -1294,7 +1319,7 @@ $script:EsHostWorker = {
                           else { "FAILED $failMsg svc=$(if($conf.AllServicesRunning){'up'}else{'CHECK: ' + ($conf.Stopped -join ',')})" }
         } else {
             $r=Invoke-ScWithWedgeRetry -ComputerName $P.Fqdn -Credential $P.Cred `
-                 -Thumbprint '' -CertificateGroup $P.Guid -Action disableencryption -WorkLog $logs -GroupName $P.GroupName
+                 -Thumbprint '' -CertificateGroup $P.Guid -Action disableencryption -WorkLog $logs -GroupName $P.GroupName -ScPaths ([string]$P.ScPaths)
             foreach($l in $r.Logs){ $logs.Add("[$($P.GroupName)] $l") }
             $failMsg=''
             if((Test-EsRegistrationFailed -ScLogs $r.Logs) -and ($r.CertApplied -or $r.ExitCode -ne 0)){ $failMsg=(Get-EsNotRegisteredMsg -ExitCode $r.ExitCode -What 'decryption') }
@@ -1440,7 +1465,7 @@ function Invoke-RecordersParallel { param([object[]]$Boxes,[string]$Action,[hash
         # the box off to the runspace - the engine calls inside HostWorker have no concept of Get-ConnAddr,
         # so a workgroup recorder addressed by name must already be resolved by the time it gets there.
         $conn = try { Get-ConnAddr $box.Addr $Common.Cred } catch { $box.Addr }
-        $P=@{Target=$box.Target;Fqdn=$conn;Cred=$Common.Cred;SignerTp=$Common.SignerTp;CaCer=$Common.CaCer;Domain=$Common.Domain;OutputDir=$Common.OutputDir;Guids=$Common.Guids;Names=$Common.Names;Action=$Action;BindExpected=$true;ExtraSans=''}
+        $P=@{Target=$box.Target;Fqdn=$conn;Cred=$Common.Cred;SignerTp=$Common.SignerTp;CaCer=$Common.CaCer;Domain=$Common.Domain;OutputDir=$Common.OutputDir;Guids=$Common.Guids;Names=$Common.Names;Action=$Action;BindExpected=$true;ExtraSans='';ScPaths=[string]$Common.ScPaths}
         $ps=[powershell]::Create(); $ps.RunspacePool=$pool
         [void]$ps.AddScript($script:HostWorker).AddArgument($P)
         $jobs += [pscustomobject]@{Box=$box;PS=$ps;Handle=$ps.BeginInvoke();Done=$false}
@@ -2134,19 +2159,38 @@ $script:ServiceProbeSb = {
     [pscustomobject]@{ Status=$(if($s){ [string]$s.Status } else { 'not installed' }); Port=[bool]$open }
 }
 
-# W1: does ServerConfigurator.exe exist at the engine's fixed install path on this computer? The engine
-# (Invoke-RemoteServerEncryption / ScRegisterSb) always uses this same hardcoded path - this wizard
-# supports the default Milestone install folder only, so a missing exe must be caught before anything
-# is attempted, not discovered as an opaque SC failure mid-run.
-$script:ScExePath = 'C:\Program Files\Milestone\Server Configurator\ServerConfigurator.exe'
-$script:ScExistsSb = { param([string]$Path) [pscustomobject]@{ Exists=[bool](Test-Path -LiteralPath $Path) } }
+# W1: can ServerConfigurator.exe be found on this computer? Same search as the engine's SC scriptblocks
+# (verbatim resolver lines): the operator's search folders ($script:ScSearchPaths), the Milestone service
+# install folders, %ProgramFiles%\Milestone, then a bounded search of the given folders. Caught here,
+# before anything changes, instead of as an opaque SC failure mid-run.
+$script:ScSearchPaths = ''
+$script:ScFindSb = {
+    param([string]$ConfPath)
+    # ServerConfigurator.exe location on THIS computer (install folders differ per server): the search
+    # list in $ConfPath first (exe paths, or folders: <f>, <f>\Server Configurator, <f>\Milestone\Server
+    # Configurator), then <Milestone root>\Server Configurator derived from the Milestone service image
+    # paths, then %ProgramFiles%\Milestone; last, a bounded recursive search of the given folders.
+    $scExe = $null; $scLook = [System.Collections.Generic.List[string]]::new()
+    $scDirs = @(([string]$ConfPath) -split ';' | ForEach-Object { $_.Trim().Trim('"') } | Where-Object { $_ })
+    foreach ($scP in $scDirs) { if ($scP -match '\.exe$') { $scLook.Add($scP) } else { foreach ($scSub in @('', 'Server Configurator', 'Milestone\Server Configurator')) { $scLook.Add((Join-Path (Join-Path $scP $scSub) 'ServerConfigurator.exe')) } } }
+    foreach ($scSvc in @(Get-CimInstance Win32_Service -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like 'Milestone XProtect*' -or $_.Name -like 'MilestoneEventServer*' })) {
+        try { if ([string]$scSvc.PathName -match '^\s*"?([^"]+?\.exe)') { $scUp = [IO.Path]::GetDirectoryName([IO.Path]::GetDirectoryName($Matches[1])); foreach ($scRoot in @($scUp, $(if ($scUp) { [IO.Path]::GetDirectoryName($scUp) }))) { if ($scRoot) { $scLook.Add((Join-Path $scRoot 'Server Configurator\ServerConfigurator.exe')) } } } } catch {}
+    }
+    $scLook.Add((Join-Path $env:ProgramFiles 'Milestone\Server Configurator\ServerConfigurator.exe'))
+    foreach ($scC in $scLook) { if (Test-Path -LiteralPath $scC -PathType Leaf) { $scExe = $scC; break } }
+    if (-not $scExe) { foreach ($scP in @($scDirs | Where-Object { $_ -notmatch '\.exe$' -and (Test-Path -LiteralPath $_ -PathType Container) })) { $scHit = Get-ChildItem -LiteralPath $scP -Filter 'ServerConfigurator.exe' -File -Recurse -Depth 4 -ErrorAction SilentlyContinue | Select-Object -First 1; if ($scHit) { $scExe = $scHit.FullName; break } } }
+    if (-not $scExe) { $scExe = '(not found - looked in: ' + ((@($scLook) | Select-Object -Unique) -join '; ') + $(if (@($scDirs).Count) { '; and searched below: ' + ($scDirs -join '; ') } else { '' }) + ')' }
+    [pscustomobject]@{ Found=[bool](Test-Path -LiteralPath $scExe -PathType Leaf); Path=$scExe }
+}
 function Get-ScMissingProblem { param([object[]]$Boxes)
     $out = [System.Collections.Generic.List[string]]::new()
     foreach($b in @($Boxes)){
         try {
-            $r = if($b.IsNode){ Get-First -Items @(Invoke-OnNode -Node $b.Target -Cred $b.Cred -Sb $script:ScExistsSb -ArgumentList @($script:ScExePath)) }
-                 else { Get-First -Items @(Invoke-OnBox -Computer $b.Addr -Cred $b.Cred -Sb $script:ScExistsSb -ArgumentList @($script:ScExePath)) }
-            if(-not $r -or -not $r.Exists){ $out.Add("$($b.Name): ServerConfigurator was not found at $($script:ScExePath). This wizard supports the default Milestone install folder only.") }
+            $r = if($b.IsNode){ Get-First -Items @(Invoke-OnNode -Node $b.Target -Cred $b.Cred -Sb $script:ScFindSb -ArgumentList @($script:ScSearchPaths)) }
+                 elseif(Test-LocalTarget $b.Addr){ Get-First -Items @(& $script:ScFindSb $script:ScSearchPaths) }
+                 else { Get-First -Items @(Invoke-OnBox -Computer $b.Addr -Cred $b.Cred -Sb $script:ScFindSb -ArgumentList @($script:ScSearchPaths)) }
+            if(-not $r -or -not $r.Found){ $out.Add("$($b.Name): ServerConfigurator.exe was not found $(if($r){$r.Path}). If Milestone is installed in another folder on that computer, add the folder under 'Search folders...' on the Connect page (headless: -SearchPaths 'D:\Milestone').") }
+            else { Write-Log "[$($b.Name)] ServerConfigurator: $($r.Path)" }
         } catch { $out.Add("$($b.Name): could not check for ServerConfigurator ($(Get-FirstLine $_.Exception.Message)).") }
     }
     $out.ToArray()
@@ -2231,10 +2275,11 @@ $script:KeyGrantSb = {
 # CreateProcessAsUser as the admin). The engine's Invoke-RemoteServerEncryption only knows
 # enable/disable, so this is a separate, non-engine copy of that pattern for the register verb.
 $script:ScRegisterSb = {
-    param([string]$MsAddress,[pscredential]$RunCred,[string]$LauncherSource)
+    param([string]$MsAddress,[pscredential]$RunCred,[string]$LauncherSource,[string]$ScExePath)
     $ErrorActionPreference = 'Stop'
     $elog = [System.Collections.Generic.List[string]]::new()
-    $scExe = 'C:\Program Files\Milestone\Server Configurator\ServerConfigurator.exe'
+    # Located on this computer beforehand by $script:ScFindSb (Invoke-ScRegisterOn); default as a last resort.
+    $scExe = if($ScExePath){ $ScExePath } else { Join-Path $env:ProgramFiles 'Milestone\Server Configurator\ServerConfigurator.exe' }
     if(-not (Test-Path -LiteralPath $scExe)){ throw "ServerConfigurator not found: $scExe" }
     $scDir = [System.IO.Path]::GetDirectoryName($scExe)
     Get-Process -Name ServerConfigurator -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
@@ -2320,7 +2365,7 @@ $script:ScRegisterSb = {
     $elog.Add("[$env:COMPUTERNAME] SC stdout: $(if($stdout -and $stdout.Trim()){ $stdout.Trim() } else { '(empty)' })")
     $elog.Add("[$env:COMPUTERNAME] SC stderr: $(if($stderr -and $stderr.Trim()){ $stderr.Trim() } else { '(empty)' })")
     $elog.Add("[$env:COMPUTERNAME] SC exit code: $scExit")
-    $scLog = Get-ChildItem -Path 'C:\ProgramData\Milestone' -Recurse -Filter '*.log' -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match 'erver.?onfigurator' } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    $scLog = Get-ChildItem -Path (Join-Path $env:ProgramData 'Milestone') -Recurse -Filter '*.log' -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match 'erver.?onfigurator' } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
     $runLines = @()
     if($scLog){
         $allLog = @(Get-Content -LiteralPath $scLog.FullName -ErrorAction SilentlyContinue)
@@ -2650,7 +2695,7 @@ function Invoke-NodeSc { param([string]$Key,$Box,[bool]$Want,[string]$Thumbprint
         $conn = Get-VerifiedNodeAddr $Box   # identity-checked: this address answers as $Box.Target right now
         if($conn -ne $Box.Addr){ $logs.Add("connecting to $($Box.Name) by its own address $conn (verified: it answers as $($Box.Target))") }
         $e = Invoke-ScWithWedgeRetry -ComputerName $conn -Credential $Box.Cred -Thumbprint $(if($Want){$Thumbprint}else{''}) `
-                 -CertificateGroup $guid -Action $(if($Want){'enableencryption'}else{'disableencryption'}) -WorkLog $logs -GroupName $gn
+                 -CertificateGroup $guid -Action $(if($Want){'enableencryption'}else{'disableencryption'}) -WorkLog $logs -GroupName $gn -ScPaths $script:ScSearchPaths
         foreach($l in $e.Logs){ $logs.Add("[$gn] $l") }
         $failMsg = ''
         if($isMs){
@@ -2738,7 +2783,11 @@ function Get-MsRegisterAddress { param([bool]$Encrypted)
 # launcher in $script:ScRegisterSb. Cluster node -> node path (identity-guarded); the standalone
 # Management Server -> this computer, in-process; anything else -> host path.
 function Invoke-ScRegisterOn { param($Box,[string]$Address)
-    $scArgs = @($Address,$Box.Cred,$script:LauncherCSharp)
+    $f = if($Box.IsNode){ Get-First -Items @(Invoke-OnNode -Node $Box.Target -Cred $Box.Cred -Sb $script:ScFindSb -ArgumentList @($script:ScSearchPaths)) }
+         elseif((Get-BoxKind $Box) -eq 'MS'){ Get-First -Items @(& $script:ScFindSb $script:ScSearchPaths) }
+         else { Get-First -Items @(Invoke-OnBox -Computer $Box.Addr -Cred $Box.Cred -Sb $script:ScFindSb -ArgumentList @($script:ScSearchPaths)) }
+    if(-not $f -or -not $f.Found){ throw "ServerConfigurator was not found on $($Box.Name) $(if($f){$f.Path})" }
+    $scArgs = @($Address,$Box.Cred,$script:LauncherCSharp,[string]$f.Path)
     if($Box.IsNode){ return (Get-First -Items @(Invoke-OnNode -Node $Box.Target -Cred $Box.Cred -Sb $script:ScRegisterSb -ArgumentList $scArgs)) }
     if((Get-BoxKind $Box) -eq 'MS'){ return (Get-First -Items @(& $script:ScRegisterSb @scArgs)) }
     Get-First -Items @(Invoke-OnBox -Computer $Box.Addr -Cred $Box.Cred -Sb $script:ScRegisterSb -ArgumentList $scArgs)
@@ -2802,7 +2851,7 @@ function Invoke-NodeRegister { param($Box,[string]$Address,[string]$Key='MS')
 $script:RegFindings = @(); $script:LastRegFindings = @(); $script:FixRegistrationOn = $false
 $script:RegAddrSb = {
     param([bool]$IsEs)
-    $dir = 'C:\Program Files\Milestone\XProtect Data Collector Server'
+    $dir = Join-Path $env:ProgramFiles 'Milestone\XProtect Data Collector Server'   # fallback only: the service path below wins
     try {
         $svc = Get-CimInstance Win32_Service -Filter "DisplayName='Milestone XProtect Data Collector Server'" -ErrorAction Stop | Select-Object -First 1
         if($svc -and $svc.PathName){
@@ -3181,6 +3230,18 @@ function Invoke-ClusterStage { param([string]$Key,[bool]$Want,[object[]]$Todo)
 # contains it) is a member. Anything that cannot be checked is logged and does not block.
 $script:HasPsTools = $null
 function Test-HasPsTools { if($null -eq $script:HasPsTools){ $script:HasPsTools = [bool](Get-Module -ListAvailable -Name MilestonePSTools) }; $script:HasPsTools }
+# MilestonePSTools installed outside PSModulePath: a MilestonePSTools.psd1 below one of the search folders
+# puts its module root (the folder holding the 'MilestonePSTools' folder) on PSModulePath for this session.
+function Add-SearchPathModules {
+    foreach($d in @(([string]$script:ScSearchPaths) -split ';' | ForEach-Object { $_.Trim().Trim('"') } | Where-Object { $_ -and $_ -notmatch '\.exe$' -and (Test-Path -LiteralPath $_ -PathType Container) })){
+        $m = Get-ChildItem -LiteralPath $d -Filter 'MilestonePSTools.psd1' -File -Recurse -Depth 4 -ErrorAction SilentlyContinue | Select-Object -First 1
+        if(-not $m){ continue }
+        $modDir = $m.Directory; if($modDir.Name -ne 'MilestonePSTools' -and $modDir.Parent){ $modDir = $modDir.Parent }   # <root>\MilestonePSTools[\<version>]\MilestonePSTools.psd1
+        $root = if($modDir.Parent){ $modDir.Parent.FullName } else { '' }
+        if($root -and (@($env:PSModulePath -split ';') -notcontains $root)){ $env:PSModulePath = "$root;$env:PSModulePath"; Write-Log "MilestonePSTools found below $root - added to the module path for this session." }
+        $script:HasPsTools = $null
+    }
+}
 $script:PsToolsConfirmLine = " - The admin account must be in the Milestone Administrators role - otherwise the change stops with 'not authorized' on the first server. (MilestonePSTools is not installed here, so this cannot be checked in advance.)"
 function Get-MilestoneAdminProblem {
     if(-not (Test-HasPsTools)){ Write-Log 'Milestone Administrators role: not checked (MilestonePSTools is not installed on this computer).'; return '' }
@@ -3723,7 +3784,7 @@ function Invoke-EsStage { param([bool]$Want)
     # (the certificate name still comes from Target, the name entered in step 1).
     $esConn = try { Get-ConnAddr $es.Addr $es.Cred } catch { $es.Addr }
     $P=@{ Target=$es.Target; Fqdn=$esConn; Cred=$es.Cred; SignerTp=$script:SignerTp; CaCer=$script:CaCer; Domain=$script:DomainName; OutputDir=$script:OutputDir
-          Guid=$script:CertGroupEvent; GroupName='Event Server'; Action=$(if($Want){'enable'}else{'disable'}); ExtraSans='' }
+          Guid=$script:CertGroupEvent; GroupName='Event Server'; Action=$(if($Want){'enable'}else{'disable'}); ExtraSans=''; ScPaths=$script:ScSearchPaths }
     $r = & $script:EsHostWorker $P
     Add-RunResult $r
     foreach($l in $r.Logs){ Write-Log "[$($r.Target)] $l" }
@@ -3766,7 +3827,7 @@ function Invoke-MsStage { param([bool]$Want)
     Set-StageStatus 'MS' 'Working...' 'Work'
     $P=@{ Target=$env:COMPUTERNAME; Fqdn=$script:MsFqdn; Cred=$script:AdminCred; SignerTp=$script:SignerTp; CaCer=$script:CaCer; Domain=$script:DomainName; OutputDir=$script:OutputDir
           Guids=$script:CertGroupServer; Names='Server (mgmt+recorder)'; Action=$(if($Want){'enable'}else{'disable'}); BindExpected=$true; GroupCount=1
-          ExtraSans=$script:MsExtraSans }
+          ExtraSans=$script:MsExtraSans; ScPaths=$script:ScSearchPaths }
     $r = & $script:HostWorker $P
     Add-RunResult $r
     foreach($l in $r.Logs){ Write-Log "[$($r.Target)] $l" }
@@ -3817,7 +3878,7 @@ function Invoke-RecStage { param([bool]$Want)
     if($ips.Count){ Ensure-TrustedHosts -Hosts $ips }
     Set-StageStatus 'REC' "Working on $($todo.Count) recording server(s)..." 'Work'
     $common=@{ Cred=$script:RecCred; SignerTp=$script:SignerTp; CaCer=$script:CaCer; Domain=$script:DomainName; OutputDir=$script:OutputDir
-               Guids=$script:CertGroupServer; Names='Server (recorder)' }
+               Guids=$script:CertGroupServer; Names='Server (recorder)'; ScPaths=$script:ScSearchPaths }
     # Order check again, right before the batch starts (the MS role may have moved or changed meanwhile).
     $gb2 = Get-MsGateBox
     if($gb2.Encrypted -ne $Want){
@@ -4523,7 +4584,24 @@ $recLbl=New-UiLabel 'Extra recording servers (optional, one per line):' 24 466 2
 $script:ManualRecBox=[Windows.Forms.TextBox]::new(); $script:ManualRecBox.Multiline=$true; $script:ManualRecBox.ScrollBars='Vertical'
 $script:ManualRecBox.Location=[Drawing.Point]::new(320,466); $script:ManualRecBox.Size=[Drawing.Size]::new(320,60); $p1.Controls.Add($script:ManualRecBox)
 $recHint=New-UiLabel 'Recording servers are found automatically. Add them here only if they are missing.' 656 466 320 60; $recHint.TextAlign='TopLeft'; $p1.Controls.Add($recHint)
-$script:ConnectStatus=New-UiLabel '' 24 540 760 30; $script:ConnectStatus.Font=$script:UiBold; $script:ConnectStatus.ForeColor=[Drawing.Color]::DarkOrange; $p1.Controls.Add($script:ConnectStatus)
+$script:ConnectStatus=New-UiLabel '' 24 540 570 30; $script:ConnectStatus.Font=$script:UiBold; $script:ConnectStatus.ForeColor=[Drawing.Color]::DarkOrange; $p1.Controls.Add($script:ConnectStatus)
+# Milestone installed outside C:\Program Files: folders to search for ServerConfigurator.exe (on every server)
+# and MilestonePSTools (on this computer). One folder per line.
+$searchBtn=New-UiButton 'Search folders...' 604 536 180 34; $p1.Controls.Add($searchBtn)
+$searchBtn.Add_Click({
+    $dlg=[Windows.Forms.Form]::new(); $dlg.Text='Search folders'; $dlg.Size=[Drawing.Size]::new(620,330); $dlg.StartPosition='CenterParent'; $dlg.FormBorderStyle='FixedDialog'; $dlg.MaximizeBox=$false; $dlg.MinimizeBox=$false
+    $lb=[Windows.Forms.Label]::new(); $lb.Text="Only needed if Milestone is NOT installed in C:\Program Files\Milestone.`r`nOne folder per line, for example D:\Milestone. The wizard looks there (and below) for`r`nServerConfigurator.exe on every server, and for MilestonePSTools on this computer.`r`nThe Milestone install folder is also found automatically from the Milestone services."; $lb.Location=[Drawing.Point]::new(12,10); $lb.Size=[Drawing.Size]::new(580,70); $dlg.Controls.Add($lb)
+    $tb=[Windows.Forms.TextBox]::new(); $tb.Multiline=$true; $tb.ScrollBars='Vertical'; $tb.Location=[Drawing.Point]::new(12,86); $tb.Size=[Drawing.Size]::new(580,150); $tb.Text=((([string]$script:ScSearchPaths) -split ';' | Where-Object { $_.Trim() }) -join "`r`n"); $dlg.Controls.Add($tb)
+    $ok=[Windows.Forms.Button]::new(); $ok.Text='OK'; $ok.DialogResult='OK'; $ok.Location=[Drawing.Point]::new(396,246); $ok.Size=[Drawing.Size]::new(95,30); $dlg.Controls.Add($ok); $dlg.AcceptButton=$null
+    $cn=[Windows.Forms.Button]::new(); $cn.Text='Cancel'; $cn.DialogResult='Cancel'; $cn.Location=[Drawing.Point]::new(497,246); $cn.Size=[Drawing.Size]::new(95,30); $dlg.Controls.Add($cn); $dlg.CancelButton=$cn
+    if($dlg.ShowDialog($script:Form) -eq 'OK'){
+        $script:ScSearchPaths = (@($tb.Text -split "[`r`n;]+" | ForEach-Object { $_.Trim().Trim('"') } | Where-Object { $_ }) -join ';')
+        Write-Log "Search folders: $(if($script:ScSearchPaths){$script:ScSearchPaths}else{'(none - automatic search only)'})"
+        Add-SearchPathModules
+        $this.Text = $(if($script:ScSearchPaths){ "Search folders ($(@($script:ScSearchPaths -split ';').Count))..." } else { 'Search folders...' })
+    }
+    $dlg.Dispose()
+})
 $openLogBtn=New-UiButton 'Open log' 794 536 180 34; $p1.Controls.Add($openLogBtn)
 $openLogBtn.Add_Click({ $lp = Save-UiLog; if($lp){ Start-Process notepad.exe -ArgumentList "`"$lp`"" } else { [Windows.Forms.MessageBox]::Show('The log could not be saved.','Log',0,'Warning')|Out-Null } })
 # Resolve-Signer (verbatim) reads these: store mode only in the wizard; the PFX controls are never shown.
@@ -4607,6 +4685,8 @@ $script:Form.Add_Shown({
 })
 
 $script:MsExtraSans = [string]$ExtraSans
+$script:ScSearchPaths = [string]$SearchPaths
+if($script:ScSearchPaths){ Write-Log "Search folders: $($script:ScSearchPaths)"; Add-SearchPathModules }
 $script:MsAddrValue = [string]$MsAddr
 $script:Page = 1
 Show-Page 1

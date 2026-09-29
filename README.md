@@ -67,7 +67,7 @@ wrong order, ServerConfigurator quits without changing anything and logs no reas
 Nothing is changed until every check passes:
 
 - every server is reachable and its current state can be read;
-- ServerConfigurator is in the default Milestone install folder on every server;
+- ServerConfigurator can be found on every server (see "Milestone installed in another folder");
 - the signing CA is present (when certificates must be issued);
 - on a cluster: every node of the role is Up, and the role is healthy;
 - every server is registered to the same management-server address the wizard works with.
@@ -125,6 +125,17 @@ skipped with a message.
   certificates must chain to the same CA. Use "Create signing CA" only if encryption was
   never set up in the system.
 
+## Milestone installed in another folder
+
+All scripts find `ServerConfigurator.exe` on each server by themselves. They look in the folder of
+the Milestone services that are installed on that server, then in
+`%ProgramFiles%\Milestone\Server Configurator`. If Milestone is installed somewhere unusual, give
+extra folders: **Search folders...** on the Connect page (one folder per line, for example
+`D:\Milestone`), or `-SearchPaths 'D:\Milestone;E:\Apps'` headless, or the `SearchPaths` key in
+the defaults file. Each folder is also searched below (4 levels), and MilestonePSTools found there
+is loaded as well. If ServerConfigurator still cannot be found, the pre-flight check says so for
+that server and lists every place it looked; nothing is changed.
+
 ## Optional defaults file
 
 To pre-fill the fields for one environment, put a `mrc.defaults.psd1` next to the script.
@@ -136,7 +147,7 @@ share: it is listed in `.gitignore`.
 ```powershell
 .\Mrc-Guided.ps1 -Action status|on|off -EsHost <event-server> -AdminUser <DOMAIN\user> `
     -AdminPwFile <path-to-password-file> -RootSubject '<signing-CA-subject>' `
-    [-TestFailover] [-FixRegistration]
+    [-TestFailover] [-FixRegistration] [-SearchPaths 'D:\Milestone']
 .\Mrc-Guided.ps1 -Action register -AdminUser <DOMAIN\user> -AdminPwFile <path>   # this cluster node
 .\Mrc-Guided.ps1 -Action rollback -Snapshot <run-...-snapshot.json> -AdminUser ... -AdminPwFile ...
 ```

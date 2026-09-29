@@ -514,9 +514,20 @@ function Invoke-RemoteRecorderInstall {
                 $Tp = ($Tp -replace '[^A-Fa-f0-9]', '').ToUpperInvariant()
                 $elog.Add("[$env:COMPUTERNAME] Running as: $([System.Security.Principal.WindowsIdentity]::GetCurrent().Name)")
                 $elog.Add("[$env:COMPUTERNAME] Thumbprint (sanitized): $Tp")
-                $scExe = if ([string]::IsNullOrWhiteSpace($ConfPath)) {
-                    'C:\Program Files\Milestone\Server Configurator\ServerConfigurator.exe'
-                } else { $ConfPath }
+                # ServerConfigurator.exe location on THIS computer (install folders differ per server): the search
+                # list in $ConfPath first (exe paths, or folders: <f>, <f>\Server Configurator, <f>\Milestone\Server
+                # Configurator), then <Milestone root>\Server Configurator derived from the Milestone service image
+                # paths, then %ProgramFiles%\Milestone; last, a bounded recursive search of the given folders.
+                $scExe = $null; $scLook = [System.Collections.Generic.List[string]]::new()
+                $scDirs = @(([string]$ConfPath) -split ';' | ForEach-Object { $_.Trim().Trim('"') } | Where-Object { $_ })
+                foreach ($scP in $scDirs) { if ($scP -match '\.exe$') { $scLook.Add($scP) } else { foreach ($scSub in @('', 'Server Configurator', 'Milestone\Server Configurator')) { $scLook.Add((Join-Path (Join-Path $scP $scSub) 'ServerConfigurator.exe')) } } }
+                foreach ($scSvc in @(Get-CimInstance Win32_Service -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like 'Milestone XProtect*' -or $_.Name -like 'MilestoneEventServer*' })) {
+                    try { if ([string]$scSvc.PathName -match '^\s*"?([^"]+?\.exe)') { $scUp = [IO.Path]::GetDirectoryName([IO.Path]::GetDirectoryName($Matches[1])); foreach ($scRoot in @($scUp, $(if ($scUp) { [IO.Path]::GetDirectoryName($scUp) }))) { if ($scRoot) { $scLook.Add((Join-Path $scRoot 'Server Configurator\ServerConfigurator.exe')) } } } } catch {}
+                }
+                $scLook.Add((Join-Path $env:ProgramFiles 'Milestone\Server Configurator\ServerConfigurator.exe'))
+                foreach ($scC in $scLook) { if (Test-Path -LiteralPath $scC -PathType Leaf) { $scExe = $scC; break } }
+                if (-not $scExe) { foreach ($scP in @($scDirs | Where-Object { $_ -notmatch '\.exe$' -and (Test-Path -LiteralPath $_ -PathType Container) })) { $scHit = Get-ChildItem -LiteralPath $scP -Filter 'ServerConfigurator.exe' -File -Recurse -Depth 4 -ErrorAction SilentlyContinue | Select-Object -First 1; if ($scHit) { $scExe = $scHit.FullName; break } } }
+                if (-not $scExe) { $scExe = '(not found - looked in: ' + ((@($scLook) | Select-Object -Unique) -join '; ') + $(if (@($scDirs).Count) { '; and searched below: ' + ($scDirs -join '; ') } else { '' }) + ')' }
                 if (-not (Test-Path -LiteralPath $scExe)) { throw "ServerConfigurator not found: $scExe" }
                 $scDir   = [System.IO.Path]::GetDirectoryName($scExe)
                 # Kill any stale ServerConfigurator first: its singleton lock makes the next run exit -4/1 silently.
@@ -577,7 +588,7 @@ function Invoke-RemoteRecorderInstall {
                 $elog.Add("[$env:COMPUTERNAME] SC stdout: $(if ($stdout -and $stdout.Trim()) { $stdout.Trim() } else { '(empty)' })")
                 $elog.Add("[$env:COMPUTERNAME] SC stderr: $(if ($stderr -and $stderr.Trim()) { $stderr.Trim() } else { '(empty)' })")
                 $elog.Add("[$env:COMPUTERNAME] SC exit code: $scExit")
-                $scLog = Get-ChildItem -Path 'C:\ProgramData\Milestone' -Recurse -Filter '*.log' -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match 'erver.?onfigurator' } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+                $scLog = Get-ChildItem -Path (Join-Path $env:ProgramData 'Milestone') -Recurse -Filter '*.log' -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match 'erver.?onfigurator' } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
                 $runLines = @()
                 if ($scLog) {
                     $allLog = @(Get-Content -LiteralPath $scLog.FullName -ErrorAction SilentlyContinue)
@@ -643,9 +654,20 @@ function Invoke-RemoteServerEncryption {
                 $certTp = $cert.Thumbprint
                 $elog.Add("[$env:COMPUTERNAME] Found cert: $($cert.Subject)")
             }
-            $scExe = if ([string]::IsNullOrWhiteSpace($ConfPath)) {
-                'C:\Program Files\Milestone\Server Configurator\ServerConfigurator.exe'
-            } else { $ConfPath }
+            # ServerConfigurator.exe location on THIS computer (install folders differ per server): the search
+            # list in $ConfPath first (exe paths, or folders: <f>, <f>\Server Configurator, <f>\Milestone\Server
+            # Configurator), then <Milestone root>\Server Configurator derived from the Milestone service image
+            # paths, then %ProgramFiles%\Milestone; last, a bounded recursive search of the given folders.
+            $scExe = $null; $scLook = [System.Collections.Generic.List[string]]::new()
+            $scDirs = @(([string]$ConfPath) -split ';' | ForEach-Object { $_.Trim().Trim('"') } | Where-Object { $_ })
+            foreach ($scP in $scDirs) { if ($scP -match '\.exe$') { $scLook.Add($scP) } else { foreach ($scSub in @('', 'Server Configurator', 'Milestone\Server Configurator')) { $scLook.Add((Join-Path (Join-Path $scP $scSub) 'ServerConfigurator.exe')) } } }
+            foreach ($scSvc in @(Get-CimInstance Win32_Service -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like 'Milestone XProtect*' -or $_.Name -like 'MilestoneEventServer*' })) {
+                try { if ([string]$scSvc.PathName -match '^\s*"?([^"]+?\.exe)') { $scUp = [IO.Path]::GetDirectoryName([IO.Path]::GetDirectoryName($Matches[1])); foreach ($scRoot in @($scUp, $(if ($scUp) { [IO.Path]::GetDirectoryName($scUp) }))) { if ($scRoot) { $scLook.Add((Join-Path $scRoot 'Server Configurator\ServerConfigurator.exe')) } } } } catch {}
+            }
+            $scLook.Add((Join-Path $env:ProgramFiles 'Milestone\Server Configurator\ServerConfigurator.exe'))
+            foreach ($scC in $scLook) { if (Test-Path -LiteralPath $scC -PathType Leaf) { $scExe = $scC; break } }
+            if (-not $scExe) { foreach ($scP in @($scDirs | Where-Object { $_ -notmatch '\.exe$' -and (Test-Path -LiteralPath $_ -PathType Container) })) { $scHit = Get-ChildItem -LiteralPath $scP -Filter 'ServerConfigurator.exe' -File -Recurse -Depth 4 -ErrorAction SilentlyContinue | Select-Object -First 1; if ($scHit) { $scExe = $scHit.FullName; break } } }
+            if (-not $scExe) { $scExe = '(not found - looked in: ' + ((@($scLook) | Select-Object -Unique) -join '; ') + $(if (@($scDirs).Count) { '; and searched below: ' + ($scDirs -join '; ') } else { '' }) + ')' }
             if (-not (Test-Path -LiteralPath $scExe)) { throw "ServerConfigurator not found: $scExe | $($elog.ToArray() -join ' | ')" }
             $scDir   = [System.IO.Path]::GetDirectoryName($scExe)
             # Kill any stale ServerConfigurator first: its singleton lock makes the next run exit -4/1 silently.
@@ -744,7 +766,7 @@ function Invoke-RemoteServerEncryption {
             $elog.Add("[$env:COMPUTERNAME] SC stdout: $(if ($stdout -and $stdout.Trim()) { $stdout.Trim() } else { '(empty)' })")
             $elog.Add("[$env:COMPUTERNAME] SC stderr: $(if ($stderr -and $stderr.Trim()) { $stderr.Trim() } else { '(empty)' })")
             $elog.Add("[$env:COMPUTERNAME] SC exit code: $scExit")
-            $scLog = Get-ChildItem -Path 'C:\ProgramData\Milestone' -Recurse -Filter '*.log' -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match 'erver.?onfigurator' } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            $scLog = Get-ChildItem -Path (Join-Path $env:ProgramData 'Milestone') -Recurse -Filter '*.log' -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match 'erver.?onfigurator' } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
             $runLines = @()
             if ($scLog) {
                 $allLog = @(Get-Content -LiteralPath $scLog.FullName -ErrorAction SilentlyContinue)
@@ -838,10 +860,10 @@ function Repair-WedgedService {
 function Invoke-ScWithWedgeRetry {
     param([string]$ComputerName,[pscredential]$Credential,[string]$Thumbprint,[string]$CertificateGroup,
           [ValidateSet('enableencryption','disableencryption')][string]$Action,
-          [System.Collections.Generic.List[string]]$WorkLog,[string]$GroupName)
+          [System.Collections.Generic.List[string]]$WorkLog,[string]$GroupName,[string]$ScPaths='')
     try {
         Invoke-RemoteServerEncryption -ComputerName $ComputerName -Credential $Credential -UseSsl:$false `
-            -Thumbprint $Thumbprint -ServerConfiguratorPath '' -ScCredential $Credential -CertificateGroup $CertificateGroup -Action $Action
+            -Thumbprint $Thumbprint -ServerConfiguratorPath $ScPaths -ScCredential $Credential -CertificateGroup $CertificateGroup -Action $Action
     } catch {
         $m=$_.Exception.Message
         if($m -notmatch 'cannot accept control messages|Unable to (?:stop|restart) the service|Could not stop service'){ throw }
@@ -1078,7 +1100,7 @@ $script:HostWorker = {
             for($i=0;$i -lt $guids.Count;$i++){
                 $g=$guids[$i]; $gn= if($i -lt $names.Count){ $names[$i] } else { $g }
                 $e=Invoke-ScWithWedgeRetry -ComputerName $P.Fqdn -Credential $P.Cred `
-                     -Thumbprint $pkg.Thumbprint -CertificateGroup $g -Action enableencryption -WorkLog $logs -GroupName $gn
+                     -Thumbprint $pkg.Thumbprint -CertificateGroup $g -Action enableencryption -WorkLog $logs -GroupName $gn -ScPaths ([string]$P.ScPaths)
                 foreach($l in $e.Logs){ $logs.Add("[$gn] $l") }
                 if($e.ExitCode -in 0,200000){ $okG+=$gn }
                 elseif($e.ExitCode -eq 100){ $failG+="$gn=exit100(not authorized)" }
@@ -1101,7 +1123,7 @@ $script:HostWorker = {
             for($i=0;$i -lt $guids.Count;$i++){
                 $g=$guids[$i]; $gn= if($i -lt $names.Count){ $names[$i] } else { $g }
                 $r=Invoke-ScWithWedgeRetry -ComputerName $P.Fqdn -Credential $P.Cred `
-                     -Thumbprint '' -CertificateGroup $g -Action disableencryption -WorkLog $logs -GroupName $gn
+                     -Thumbprint '' -CertificateGroup $g -Action disableencryption -WorkLog $logs -GroupName $gn -ScPaths ([string]$P.ScPaths)
                 foreach($l in $r.Logs){ $logs.Add($l) }
                 if($r.CertApplied -or ($r.ExitCode -in 0,100,200000)){ $okG+=$gn } else { $failG+="$gn=exit $($r.ExitCode)" }
             }
