@@ -1658,19 +1658,28 @@ function Test-NET3 { param($Result)
     $rows=@()
     foreach($b in @($Result.Boxes)){
         if(-not $b.Reachable){ continue }
-        $coreName = switch($b.Kind){ 'MS'{'Milestone XProtect Management Server'} 'ES'{'Milestone XProtect Event Server'} default {'Milestone XProtect Recording Server'} }
-        $svc = @($b.Common.Services) | Where-Object { $_.DisplayName -eq $coreName } | Select-Object -First 1
-        $coreRunning = [bool]($svc -and $svc.State -eq 'Running')
+        # Every port belongs to ONE Milestone service and only counts when that service runs on this box: a
+        # passive cluster node (services stopped) is never failed for closed ports. 9000 = Management Server,
+        # 9001 = Recording Server (on an MS box only when a local Recording Server runs there), 7563 = Recording
+        # Server clients, 22331 = Event Server; 80/443 = IIS in front of the Management Server.
+        $running = { param([string]$Dn) $s = @($b.Common.Services) | Where-Object { $_.DisplayName -eq $Dn } | Select-Object -First 1; [bool]($s -and $s.State -eq 'Running') }
+        $msSvc = 'Milestone XProtect Management Server'; $recSvc = 'Milestone XProtect Recording Server'; $esSvc = 'Milestone XProtect Event Server'
         $encOn = ((Get-BoxEncEnabled $b) -eq $true)
         foreach($pp in @($b.PortProbe)){
-            $relevant = $false
-            switch($b.Kind){
-                'MS' { if(($pp.Port -in 80,443) -and $coreRunning){ $relevant=$true } elseif(($pp.Port -in 9000,9001) -and $encOn){ $relevant=$true } }
-                'ES' { if($pp.Port -eq 22331 -and $coreRunning){ $relevant=$true } }
-                default { if($pp.Port -eq 7563 -and $coreRunning){ $relevant=$true } elseif($pp.Port -eq 9001 -and $encOn){ $relevant=$true } }
+            $owner = $null; $needEnc = $false
+            switch($pp.Port){
+                80    { if($b.Kind -eq 'MS'){ $owner = $msSvc } }
+                443   { if($b.Kind -eq 'MS'){ $owner = $msSvc } }
+                9000  { if($b.Kind -eq 'MS'){ $owner = $msSvc; $needEnc = $true } }
+                9001  { if($b.Kind -in 'MS','REC'){ $owner = $recSvc; $needEnc = $true } }
+                7563  { if($b.Kind -eq 'REC'){ $owner = $recSvc } }
+                22331 { if($b.Kind -eq 'ES'){ $owner = $esSvc } }
             }
-            if($relevant -and -not $pp.Open){
-                $rows += New-Row 'NET-3' 'NET' 'FAIL' $b.Name "Port $($pp.Port) reachability" "$($b.Name): port $($pp.Port) is closed from $($Result.MsComputer), but the matching service is running." 'Check the Windows Firewall on that computer, and that the service is actually listening on that port.'
+            if(-not $owner){ continue }
+            if($needEnc -and -not $encOn){ continue }
+            if(-not (& $running $owner)){ continue }
+            if(-not $pp.Open){
+                $rows += New-Row 'NET-3' 'NET' 'FAIL' $b.Name "Port $($pp.Port) reachability" "$($b.Name): port $($pp.Port) ($owner) is closed from $($Result.MsComputer), although '$owner' is running there." 'Check the Windows Firewall on that computer, and that the service is actually listening on that port.'
             }
         }
     }
