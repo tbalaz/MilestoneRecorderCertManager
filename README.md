@@ -13,6 +13,7 @@ run as Administrator.
 | Script | Use it for | Run it on |
 | --- | --- | --- |
 | **`Mrc-Guided.ps1`** | **Start here - this is all you need.** A 4-step wizard: Connect, Check, Turn encryption ON / OFF, Result. It handles the whole system in the right order: the Event Server, the Management Server and **all Recording Servers** (found automatically from the VMS and handled in parallel), failover clusters included, and it can undo a run. | The Management Server (any node of a cluster) |
+| **`Mrc-Doctor.ps1`** | **Health check (read-only).** Checks every server and writes an HTML report of PASS / WARN / FAIL findings, each with a "how to fix" line. It never changes anything. Run it before a change and whenever something looks wrong. | The Management Server (any node of a cluster) |
 | `Mrc-Ms-Gui.ps1` | Advanced / troubleshooting: the Management Server alone. | The Management Server |
 | `Mrc-Es-Gui.ps1` | Advanced / troubleshooting: a standalone Event Server alone. | The Event Server |
 | `Mrc-Rec-Gui.ps1` | Advanced / troubleshooting: Recording Servers alone (the guided script already includes them). | The Management Server or a workstation |
@@ -61,6 +62,34 @@ wrong order, ServerConfigurator quits without changing anything and logs no reas
 - It stops at the first real failure and explains in plain language what failed, the current
   state of every server, and what to do next.
 - It writes a CSV and TXT report to `%TEMP%\MilestoneRecorderCertManager-runs\`.
+
+## Health check: Mrc-Doctor.ps1
+
+```powershell
+# On the Management Server, in Windows PowerShell started "as Administrator":
+powershell -ExecutionPolicy Bypass -STA -File .\Mrc-Doctor.ps1
+```
+
+Fill in the same details as step 1 of the wizard, then click **Run checks**. When the checks
+finish, click **Open report**. It is **read-only**: it never changes anything on any server,
+including the WinRM TrustedHosts list. It checks every server with one connection each; recording
+servers are checked 32 at a time.
+
+| Area | What it checks |
+| --- | --- |
+| Inventory | Management Server (single or cluster), Event Server, all recording servers; the Milestone version on every server |
+| Reachability | WinRM (with the exact reason and fix), DNS forward and reverse, Milestone ports, clock differences |
+| Services | Milestone services, start type, state, accounts; ServerConfigurator can be found |
+| Registration | The management-server address that each component (Data Collector, Event Server, Log Server, Incident Manager, API Gateway, recording servers) is registered to |
+| Encryption | Real state per server, valid combinations, certificate expiry / names / trust / private-key access |
+| Cluster | Role and node health, resources, which Management Server node can take over after a failover |
+| IIS | Milestone applications, application pools and their identity, 80/443 bindings and the 443 certificate |
+| Config | Milestone config files that do not parse, database connection strings (server and database name only, never passwords), differences between cluster nodes |
+| Environment | SQL reachability and response time, free disk and memory, recent Milestone errors in the event log |
+
+The report is saved as HTML, CSV and TXT in `%TEMP%\MilestoneRecorderCertManager-runs\`.
+Headless: `.\Mrc-Doctor.ps1 -Run -Domain <domain> -EsHost <event-server> -AdminUser <DOMAIN\user>
+-AdminPwFile <path>` (exit code 0 = no FAIL, 1 = at least one FAIL, 2 = error, 3 = refused).
 
 ## Before any change: the pre-flight check
 
