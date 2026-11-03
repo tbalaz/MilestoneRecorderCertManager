@@ -1833,7 +1833,7 @@ $script:SessOpt = New-PSSessionOption -OpenTimeout 20000 -OperationTimeout 18000
 
 function New-Box { param([string]$Role,[string]$Name,[string]$Target,[string]$Addr,[pscredential]$Cred)
     [pscustomobject]@{ Role=$Role; Name=$Name; Target=$Target; Addr=$Addr; Cred=$Cred; Reachable=$false; Encrypted=$null; Detail='not checked yet'; Excluded=$false
-                       IsNode=$false; ClusterKey=''; Active=$false } }
+                       IsNode=$false; ClusterKey=''; Active=$false; Half=$false } }
 # Cluster state (WSFC). $script:MsCluster / $script:EsCluster are $null for a single (standalone) server.
 $script:MsCluster = $null; $script:MsNodeBoxes = @(); $script:MsDetectError = ''
 $script:EsCluster = $null; $script:EsNodeBoxes = @(); $script:EsDetectError = ''
@@ -1869,7 +1869,7 @@ function Test-InScope { param($Box)
 function Get-FirstLine { param([string]$Text) if(-not $Text){ return '' }; ($Text -split "`r?`n")[0].Trim() }
 function Test-IpAddress { param([string]$Value) $ip=$null; [System.Net.IPAddress]::TryParse(([string]$Value).Trim(),[ref]$ip) }
 function Get-StateText { param($Box)
-    if(-not $Box.Reachable){ 'Unknown (cannot connect)' } elseif($null -eq $Box.Encrypted){ 'Unknown' } elseif($Box.Encrypted){ 'Encrypted' } else { 'Not encrypted' } }
+    if(-not $Box.Reachable){ 'Unknown (cannot connect)' } elseif($null -eq $Box.Encrypted){ 'Unknown' } elseif($Box.Half){ 'Half-done (run again)' } elseif($Box.Encrypted){ 'Encrypted' } else { 'Not encrypted' } }
 
 # Ground truth readers. Management Server: netsh http sslcert bindings (443 = IIS and 5986 = WinRM
 # HTTPS are ignored); MS encrypted iff port 9000 or 9001 is bound. Recording server: RecorderConfig.xml
@@ -1886,16 +1886,27 @@ function Get-StateText { param($Box)
 # text travels to the target - a call to an outside function would fail there with "not recognized".
 $script:BindingsSb = {
     $addrRe = '(\d{1,3}(?:\.\d{1,3}){3}:\d+|\[[0-9A-Fa-f:]+\]:\d+)'
+    # IdpScheme: scheme of <AuthorizationServerUri> in the MS ServerConfig.xml ('' if not readable).
+    # ServerConfigurator writes https together with the 9000/9001 bindings and http without them; a run
+    # that does not finish (exit 2000, Mobile Server would not stop) can drop the bindings but keep https.
+    $idp = ''
+    try {
+        $scx = Join-Path $env:ProgramData 'Milestone\XProtect Management Server\ServerConfig.xml'
+        if (Test-Path -LiteralPath $scx) {
+            $u = ([xml](Get-Content -LiteralPath $scx -Raw)).SelectSingleNode('//AuthorizationServerUri')
+            if ($u -and ([string]$u.InnerText).Trim() -match '^(https?)://') { $idp = $Matches[1].ToLowerInvariant() }
+        }
+    } catch {}
     $raw = $null
-    try { $raw = @(netsh http show sslcert 2>&1) } catch { return [pscustomobject]@{ Ok=$false; Bindings=''; Count=0; Error=$_.Exception.Message } }
-    if ($LASTEXITCODE) { return [pscustomobject]@{ Ok=$false; Bindings=''; Count=0; Error="netsh exited $LASTEXITCODE" } }
+    try { $raw = @(netsh http show sslcert 2>&1) } catch { return [pscustomobject]@{ Ok=$false; Bindings=''; Count=0; IdpScheme=$idp; Error=$_.Exception.Message } }
+    if ($LASTEXITCODE) { return [pscustomobject]@{ Ok=$false; Bindings=''; Count=0; IdpScheme=$idp; Error="netsh exited $LASTEXITCODE" } }
     $b = @()
     foreach ($ln in $raw) {
         $m = [regex]::Match([string]$ln, $addrRe)
         if ($m.Success) { $b += $m.Groups[1].Value }
     }
     $b = @($b | Where-Object { $_ -notmatch ':(443|5986)$' })
-    [pscustomobject]@{ Ok=$true; Bindings=($b -join ','); Count=$b.Count }
+    [pscustomobject]@{ Ok=$true; Bindings=($b -join ','); Count=$b.Count; IdpScheme=$idp }
 }
 # W4: recorder ground truth is RecorderConfig.xml's <serverEncryption enabled="true|false"> element
 # (present on a 2025 R3 recorder at this path); the bindings are used ONLY when that element is missing
@@ -2161,6 +2172,16 @@ function Update-RecorderStates { param([object[]]$Boxes)
         else { $b.Reachable=$false; $b.Encrypted=$null; $b.Detail="cannot connect: $(if($errs.ContainsKey($conn)){$errs[$conn]}else{'no answer'})" }
     }
 }
+# MS state from one $script:BindingsSb result: encrypted iff 9000/9001 is bound. Half = the bindings and
+# the IDP address in ServerConfig.xml disagree (an earlier ServerConfigurator run did not finish): such a
+# node gets ServerConfigurator again in either direction, and the Event Server refuses changes meanwhile.
+function Set-MsBoxState { param($Box,$R)
+    $ms=@(([string]$R.Bindings) -split ',' | Where-Object { $_ -match ':900[01]$' })
+    $idp = if($R.PSObject.Properties['IdpScheme']){ [string]$R.IdpScheme } else { '' }
+    $Box.Reachable=$true; $Box.Encrypted=($ms.Count -gt 0)
+    $Box.Half = (($idp -eq 'https') -and -not $Box.Encrypted) -or (($idp -eq 'http') -and $Box.Encrypted)
+    $Box.Detail = "bindings: $(if($R.Bindings){$R.Bindings}else{'none'})$(if($idp){", IDP address $idp"})$(if($Box.Half){' - HALF-DONE: an earlier ServerConfigurator run did not finish on this server'})"
+}
 function Update-BoxStates { param([object[]]$Boxes)
     $recs=@()
     foreach($b in @($Boxes)){
@@ -2169,19 +2190,13 @@ function Update-BoxStates { param([object[]]$Boxes)
             try {
                 $r = Get-First -Items @(Invoke-OnNode -Node $b.Target -Cred $b.Cred -Sb $script:BindingsSb)
                 if(-not $r.Ok){ $b.Reachable=$true; $b.Encrypted=$null; $b.Detail="state unknown: $(if($r.Error){$r.Error}else{'netsh could not be read'})" }
-                else {
-                    $ms=@(([string]$r.Bindings) -split ',' | Where-Object { $_ -match ':900[01]$' })
-                    $b.Reachable=$true; $b.Encrypted=($ms.Count -gt 0); $b.Detail="bindings: $(if($r.Bindings){$r.Bindings}else{'none'})"
-                }
+                else { Set-MsBoxState $b $r }
             } catch { $b.Reachable=$false; $b.Encrypted=$null; $b.Detail="cannot connect: $(Get-FirstLine $_.Exception.Message)" }
         } elseif($b.Role -eq 'Management Server'){
             try {
                 $r = & $script:BindingsSb
                 if(-not $r.Ok){ $b.Reachable=$true; $b.Encrypted=$null; $b.Detail="state unknown: $(if($r.Error){$r.Error}else{'netsh could not be read'})" }
-                else {
-                    $ms=@(([string]$r.Bindings) -split ',' | Where-Object { $_ -match ':900[01]$' })
-                    $b.Reachable=$true; $b.Encrypted=($ms.Count -gt 0); $b.Detail="bindings: $(if($r.Bindings){$r.Bindings}else{'none'})"
-                }
+                else { Set-MsBoxState $b $r }
             } catch { $b.Reachable=$true; $b.Encrypted=$null; $b.Detail="netsh failed: $(Get-FirstLine $_.Exception.Message)" }
         } elseif($b.Role -eq 'Event Server'){
             try {
@@ -2208,7 +2223,7 @@ function Confirm-BoxStates { param([object[]]$Boxes,[bool]$Want,[int]$TotalSec=3
         $i++
         Update-BoxStates $Boxes
         foreach($b in @($Boxes)){ Write-Log "  real state [$(Get-RoleText $b)] $($b.Name): $(Get-StateText $b) ($($b.Detail))" }
-        $bad=@($Boxes | Where-Object { $_.Encrypted -ne $Want })
+        $bad=@($Boxes | Where-Object { $_.Encrypted -ne $Want -or $_.Half })
         if(-not $bad.Count){ return $true }
         if((Get-Date).AddSeconds($DelaySec) -gt $deadline){ break }
         Write-Log "  $($bad.Count) computer(s) not yet in the wanted state - checking again in ${DelaySec}s (check $i, up to $([int]($TotalSec/60)) min in total)"; Wait-Ui $DelaySec
@@ -3450,8 +3465,8 @@ function Invoke-ClusterStage { param([string]$Key,[bool]$Want,[object[]]$Todo)
         if(-not $isMs){
             # Order check again, right before THIS Event Server node: the Management Server must still be unencrypted.
             $gb = Get-MsGateBox
-            if($gb.Encrypted -ne $false){
-                $why = "Stopped before Event Server node $($n.Name): the Management Server is $(if($gb.Encrypted){'encrypted now'}else{'in an unknown state now'}) (checked on $($gb.Name)). The Event Server can only be changed while the Management Server is NOT encrypted."
+            if($gb.Encrypted -ne $false -or $gb.Half){
+                $why = "Stopped before Event Server node $($n.Name): the Management Server is $(if($gb.Half){'half-done (an earlier ServerConfigurator run did not finish there)'}elseif($gb.Encrypted){'encrypted now'}else{'in an unknown state now'}) (checked on $($gb.Name)). The Event Server can only be changed while the Management Server is NOT encrypted."
                 Add-GuidedRow $n $act $false 'blocked by order check' $why
                 $failed = [pscustomobject]@{ Box=$n; Why=$why; Tech=$gb.Detail }; break }
         }
@@ -3653,7 +3668,7 @@ function Get-PreFlightProblems { param([ValidateSet('on','off','register','rollb
     # actually run it in this action (register always runs it on the local node; on/off/rollback run it on
     # every reachable box that still needs to change). Otherwise refuse and change nothing.
     $scTargets = if($Mode -eq 'register'){ @($boxes | Where-Object { $_.Reachable }) }
-                 else { @($boxes | Where-Object { $_.Reachable -and (Test-InScope $_) -and $_.Encrypted -ne $Want }) }
+                 else { @($boxes | Where-Object { $_.Reachable -and (Test-InScope $_) -and ($_.Encrypted -ne $Want -or $_.Half) }) }
     foreach($m in @(Get-ScMissingProblem $scTargets)){ $p.Add($m) }
     # Registered to a different management server? Read-only here; Invoke-PreFlight offers the fix.
     $script:RegFindings = @(Get-RegistrationMismatches @($boxes | Where-Object { $_.Reachable }))
@@ -4102,9 +4117,11 @@ function Invoke-EsStage { param([bool]$Want)
     if(-not $todo.Count){ Set-StageStatus 'ES' $(if($null -ne $script:Scope){'Nothing to change back'}else{"Already $wt - skipped"}) 'Skip'; return $true }
     # Prerequisite (both directions): ServerConfigurator on the Event Server refuses while the MS is encrypted.
     $gb = Get-MsGateBox
-    if($gb.Encrypted -ne $false){
-        $why = if($gb.Encrypted){ "The Management Server is encrypted (checked on $($gb.Name)). The Event Server can only be changed while the Management Server is NOT encrypted." } else { "Could not read the Management Server's encryption state ($($gb.Name))." }
-        $next = if($Want -and $gb.Encrypted){ "Click 'Turn encryption OFF' and let it finish, then click 'Turn encryption ON'." } else { '' }
+    if($gb.Encrypted -ne $false -or $gb.Half){
+        $why = if($gb.Half){ "The Management Server on $($gb.Name) is half-done: an earlier ServerConfigurator run did not finish there, so the Event Server would refuse the change." }
+               elseif($gb.Encrypted){ "The Management Server is encrypted (checked on $($gb.Name)). The Event Server can only be changed while the Management Server is NOT encrypted." } else { "Could not read the Management Server's encryption state ($($gb.Name))." }
+        $next = if($gb.Half){ "Click 'Turn encryption OFF' and let it finish (it runs ServerConfigurator on that server again)$(if($Want){", then click 'Turn encryption ON'"})." }
+                elseif($Want -and $gb.Encrypted){ "Click 'Turn encryption OFF' and let it finish, then click 'Turn encryption ON'." } else { '' }
         Set-StageStatus 'ES' 'BLOCKED - wrong order' 'Bad'; foreach($b in $todo){ Add-GuidedRow $b $act $false 'blocked by order check' $why }
         Set-RunFailure 'Event Server' $todo[0].Name $why $gb.Detail $next; return $false }
     Write-Log "ORDER CHECK: the Management Server is not encrypted - OK to turn the Event Server $wt" 'Good'
@@ -4138,7 +4155,7 @@ function Invoke-MsStage { param([bool]$Want)
     if($unk.Count){ $u=$unk[0]
         Set-StageStatus 'MS' 'FAILED - cannot read its state' 'Bad'; Add-GuidedRow $u $act $false 'cannot read state' $u.Detail
         Set-RunFailure 'Management Server' $u.Name "Could not read the Management Server's encryption state on $($u.Name)." $u.Detail; return $false }
-    $todo=@($msBoxes | Where-Object { (Test-InScope $_) -and $_.Encrypted -ne $Want })
+    $todo=@($msBoxes | Where-Object { (Test-InScope $_) -and ($_.Encrypted -ne $Want -or $_.Half) })
     Add-SkipRows $msBoxes $todo $act $wt 'Management Server'
     if(-not $todo.Count){ Set-StageStatus 'MS' $(if($null -ne $script:Scope){'Nothing to change back'}else{"Already $wt - skipped"}) 'Skip'; return $true }
     $esBoxes=@(Get-EsBoxes)
@@ -4361,10 +4378,11 @@ function Invoke-GuidedRunCore { param([ValidateSet('on','off')][string]$Act)
     }
     $all=@(Get-AllBoxes); Update-BoxStates $all
     Write-StateLog "STATE AFTER (target: encryption $wt)" $all
-    foreach($b in $all){ Add-GuidedRow $b 'final-state' ($b.Encrypted -eq $want) "final state $(Get-StateText $b) (target $wt)" $(if($b.Encrypted -ne $want){$b.Detail}else{''}) }
-    $allMatch = (@($all | Where-Object { $_.Encrypted -ne $want }).Count -eq 0)
+    foreach($b in $all){ $fine = ($b.Encrypted -eq $want) -and -not $b.Half
+        Add-GuidedRow $b 'final-state' $fine "final state $(Get-StateText $b) (target $wt)" $(if(-not $fine){$b.Detail}else{''}) }
+    $allMatch = (@($all | Where-Object { $_.Encrypted -ne $want -or $_.Half }).Count -eq 0)
     if($ok -and -not $allMatch){
-        $bad=@($all | Where-Object { $_.Encrypted -ne $want } | ForEach-Object { $_.Name })
+        $bad=@($all | Where-Object { $_.Encrypted -ne $want -or $_.Half } | ForEach-Object { $_.Name })
         Set-RunFailure 'Final check' ($bad -join ', ') 'These computers are not in the wanted state (for example they could not be reached).' '' 'Make sure every computer is switched on and reachable, then run the same action again.'
     }
     $success = $ok -and $allMatch

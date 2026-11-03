@@ -338,7 +338,7 @@ $script:MsBox = $null; $script:EsBox = $null; $script:RecBoxes = @()
 $script:SessOpt = New-PSSessionOption -OpenTimeout 20000 -OperationTimeout 180000
 function New-Box { param([string]$Role,[string]$Name,[string]$Target,[string]$Addr,[pscredential]$Cred)
     [pscustomobject]@{ Role=$Role; Name=$Name; Target=$Target; Addr=$Addr; Cred=$Cred; Reachable=$false; Encrypted=$null; Detail='not checked yet'; Excluded=$false
-                       IsNode=$false; ClusterKey=''; Active=$false } }
+                       IsNode=$false; ClusterKey=''; Active=$false; Half=$false } }
 # Cluster state (WSFC). $script:MsCluster / $script:EsCluster are $null for a single (standalone) server.
 $script:MsCluster = $null; $script:MsNodeBoxes = @(); $script:MsDetectError = ''
 $script:EsCluster = $null; $script:EsNodeBoxes = @(); $script:EsDetectError = ''
@@ -359,16 +359,27 @@ function Test-IpAddress { param([string]$Value) $ip=$null; [System.Net.IPAddress
 # Ground truth readers (verbatim from Mrc-Guided.ps1). See that file for the W4 netsh-localization note.
 $script:BindingsSb = {
     $addrRe = '(\d{1,3}(?:\.\d{1,3}){3}:\d+|\[[0-9A-Fa-f:]+\]:\d+)'
+    # IdpScheme: scheme of <AuthorizationServerUri> in the MS ServerConfig.xml ('' if not readable).
+    # ServerConfigurator writes https together with the 9000/9001 bindings and http without them; a run
+    # that does not finish (exit 2000, Mobile Server would not stop) can drop the bindings but keep https.
+    $idp = ''
+    try {
+        $scx = Join-Path $env:ProgramData 'Milestone\XProtect Management Server\ServerConfig.xml'
+        if (Test-Path -LiteralPath $scx) {
+            $u = ([xml](Get-Content -LiteralPath $scx -Raw)).SelectSingleNode('//AuthorizationServerUri')
+            if ($u -and ([string]$u.InnerText).Trim() -match '^(https?)://') { $idp = $Matches[1].ToLowerInvariant() }
+        }
+    } catch {}
     $raw = $null
-    try { $raw = @(netsh http show sslcert 2>&1) } catch { return [pscustomobject]@{ Ok=$false; Bindings=''; Count=0; Error=$_.Exception.Message } }
-    if ($LASTEXITCODE) { return [pscustomobject]@{ Ok=$false; Bindings=''; Count=0; Error="netsh exited $LASTEXITCODE" } }
+    try { $raw = @(netsh http show sslcert 2>&1) } catch { return [pscustomobject]@{ Ok=$false; Bindings=''; Count=0; IdpScheme=$idp; Error=$_.Exception.Message } }
+    if ($LASTEXITCODE) { return [pscustomobject]@{ Ok=$false; Bindings=''; Count=0; IdpScheme=$idp; Error="netsh exited $LASTEXITCODE" } }
     $b = @()
     foreach ($ln in $raw) {
         $m = [regex]::Match([string]$ln, $addrRe)
         if ($m.Success) { $b += $m.Groups[1].Value }
     }
     $b = @($b | Where-Object { $_ -notmatch ':(443|5986)$' })
-    [pscustomobject]@{ Ok=$true; Bindings=($b -join ','); Count=$b.Count }
+    [pscustomobject]@{ Ok=$true; Bindings=($b -join ','); Count=$b.Count; IdpScheme=$idp }
 }
 $script:RecorderStateSb = {
     $cfgPath = Join-Path $env:ProgramData 'Milestone\XProtect Recording Server\RecorderConfig.xml'
@@ -1194,7 +1205,15 @@ $script:FactsMsSb = {
         $grp = $entries | Group-Object { ($_.Message -split "`r?`n")[0] } | Sort-Object Count -Descending | Select-Object -First 5
         $ev.Top = @($grp | ForEach-Object { [pscustomobject]@{ Line=[string]$_.Name; Count=$_.Count } })
         $txt = ($entries | ForEach-Object { $_.Message }) -join ' '
-        $ev.InvalidClient = [bool]($txt -match 'invalid_client')
+        # invalid_client counts only since the Management Server service last started: older events are from
+        # before a repair (Re-register this node) and no longer say anything.
+        $icFrom = $null
+        try {
+            $ws = Get-CimInstance Win32_Service -Filter "DisplayName='Milestone XProtect Management Server'" -ErrorAction Stop | Select-Object -First 1
+            if ($ws -and $ws.ProcessId) { $icFrom = (Get-Process -Id $ws.ProcessId -ErrorAction Stop).StartTime }
+        } catch {}
+        $icTxt = if ($icFrom) { ($entries | Where-Object { $_.TimeCreated -ge $icFrom } | ForEach-Object { $_.Message }) -join ' ' } else { $txt }
+        $ev.InvalidClient = [bool]($icTxt -match 'invalid_client')
         $ev.CertSsl = [bool]($txt -match 'certificate|SSL|TLS')
         $ev.CouldNotStop = [bool]($txt -match 'Could not stop service')
         $ev.Ok = $true
@@ -1985,6 +2004,14 @@ function Test-ENC2 { param($Result)
             }
         }
     }
+    # Half-done Management Server: the 9000/9001 bindings and the IDP address in ServerConfig.xml disagree.
+    foreach($b in $msBoxes){
+        $v = Get-BoxEncEnabled $b
+        $idp = if($b.Enc -and $b.Enc.PSObject.Properties['IdpScheme']){ [string]$b.Enc.IdpScheme } else { '' }
+        if($null -ne $v -and (($idp -eq 'https' -and -not $v) -or ($idp -eq 'http' -and $v))){
+            $rows += New-Row 'ENC-2' 'ENC' 'FAIL' $b.Name 'Management Server half-done' "$($b.Name): the certificate bindings say $(if($v){'encrypted'}else{'not encrypted'}) but ServerConfig.xml still has an $idp IDP address - an earlier ServerConfigurator run did not finish here, and the Event Server refuses changes while it is like this." "Run Mrc-Guided.ps1 'Turn encryption $(if($v){'ON'}else{'OFF'})' again: it runs ServerConfigurator on this server again."
+        }
+    }
     foreach($key in 'MS','ES'){
         $nodes = @($Result.Boxes | Where-Object { $_.ClusterKey -eq $key -and $_.Reachable })
         if(@($nodes).Count -lt 2){ continue }
@@ -2284,7 +2311,7 @@ function Test-ENV4 { param($Result)
         $ev = $b.Ms.EventLog
         if(-not $ev -or -not $ev.Ok){ continue }
         $isOwner = (-not $b.IsNode) -or $b.Active
-        if($ev.InvalidClient -and $isOwner){ $rows += New-Row 'ENV-4' 'ENV' 'FAIL' $b.Name 'Event log: invalid_client' "$($b.Name): the Application log shows 'invalid_client' in the last 24h - the Management Server cannot authenticate." 'Re-register this node with Mrc-Guided.ps1 (Re-register this node).' }
+        if($ev.InvalidClient -and $isOwner){ $rows += New-Row 'ENV-4' 'ENV' 'FAIL' $b.Name 'Event log: invalid_client' "$($b.Name): the Application log shows 'invalid_client' since the Management Server service last started (within 24h) - the Management Server cannot authenticate." 'Re-register this node with Mrc-Guided.ps1 (Re-register this node).' }
         if($ev.ErrorCount -gt 0 -or $ev.WarnCount -gt 0){
             $top = (@($ev.Top) | ForEach-Object { "$($_.Line) (x$($_.Count))" }) -join '; '
             $rows += New-Row 'ENV-4' 'ENV' 'WARN' $b.Name 'Event log: Milestone errors/warnings (24h)' "$($b.Name): $($ev.ErrorCount) error(s), $($ev.WarnCount) warning(s) in the last 24h. Top: $top" 'Review the Application event log for the root cause.'
