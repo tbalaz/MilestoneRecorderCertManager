@@ -476,7 +476,8 @@ function Invoke-RemoteRecorderInstall {
             $rlog = [System.Collections.Generic.List[string]]::new()
             $rlog.Add("[$env:COMPUTERNAME] Importing PFX -> Cert:\LocalMachine\My")
             $c = Import-PfxCertificate -FilePath $RPfx -CertStoreLocation 'Cert:\LocalMachine\My' -Password $RPw -Exportable:$false
-            if ($c -is [array]) { $c = $c | Select-Object -First 1 }
+            # A PFX that carries its chain imports several certificates: the one with the private key is the server's.
+            if ($c -is [array]) { $k = @($c | Where-Object { $_.HasPrivateKey }); $c = if ($k.Count) { $k[0] } else { $c[0] } }
             if ($null -eq $c) { throw 'Recorder PFX import returned no certificate.' }
             $rlog.Add("[$env:COMPUTERNAME] Imported  tp=$($c.Thumbprint)  subj=$($c.Subject)")
             # Grant NETWORK SERVICE Read on private key so VideoOS.Recorder.Service (Schannel on port 7563) can use it.
@@ -1215,34 +1216,52 @@ $script:HostWorker = {
         $names=@($P.Names -split ', ' | Where-Object { $_ })
         $guids=@($P.Guids -split ' '  | Where-Object { $_ })
         if($P.Action -eq 'enable'){
-            $signer = Get-ChildItem Cert:\LocalMachine\My,Cert:\CurrentUser\My -ErrorAction SilentlyContinue | Where-Object { $_.Thumbprint -eq $P.SignerTp -and $_.HasPrivateKey } | Select-Object -First 1
-            if(-not $signer){ throw "signer $($P.SignerTp) not found in cert store" }
-            $pfxPw=[securestring]::new(); foreach($ch in ([guid]::NewGuid().ToString('N')).ToCharArray()){$pfxPw.AppendChar($ch)}; $pfxPw.MakeReadOnly()
-            $certFqdn=Resolve-CertFqdn -Target $P.Target -Fqdn $P.Fqdn -DomainSuffix $P.Domain
-            $sans=@(ConvertTo-SanList ([string]$P.ExtraSans))
-            if($sans.Count){ $logs.Add("extra SANs: $($sans -join ', ')") }
-            $pkg=New-RecorderCertificatePackage -HostName $certFqdn -DomainSuffix $P.Domain -Signer $signer -PfxPassword $pfxPw -OutputDir $P.OutputDir -ExtraDnsNames $sans
-            $logs.Add("issued $($pkg.Fqdn) tp=$($pkg.Thumbprint)"); $res.Tp=$pkg.Thumbprint
+            if($P.PfxFile){
+                # A prepared certificate file (issued by the operator's own CA, matched to this computer and
+                # checked before the run) is imported as it is - no signer, no new certificate.
+                $pfxPw=$P.PfxPw
+                $pkg=[pscustomobject]@{ Fqdn=$P.PfxName; Thumbprint=$P.PfxTp; PfxPath=$P.PfxFile }
+                $logs.Add("prepared certificate $([IO.Path]::GetFileName($P.PfxFile)) for $($pkg.Fqdn) tp=$($pkg.Thumbprint)"); $res.Tp=$pkg.Thumbprint
+            } else {
+                $signer = Get-ChildItem Cert:\LocalMachine\My,Cert:\CurrentUser\My -ErrorAction SilentlyContinue | Where-Object { $_.Thumbprint -eq $P.SignerTp -and $_.HasPrivateKey } | Select-Object -First 1
+                if(-not $signer){ throw "signer $($P.SignerTp) not found in cert store" }
+                $pfxPw=[securestring]::new(); foreach($ch in ([guid]::NewGuid().ToString('N')).ToCharArray()){$pfxPw.AppendChar($ch)}; $pfxPw.MakeReadOnly()
+                $certFqdn=Resolve-CertFqdn -Target $P.Target -Fqdn $P.Fqdn -DomainSuffix $P.Domain
+                $sans=@(ConvertTo-SanList ([string]$P.ExtraSans))
+                if($sans.Count){ $logs.Add("extra SANs: $($sans -join ', ')") }
+                $pkg=New-RecorderCertificatePackage -HostName $certFqdn -DomainSuffix $P.Domain -Signer $signer -PfxPassword $pfxPw -OutputDir $P.OutputDir -ExtraDnsNames $sans
+                $logs.Add("issued $($pkg.Fqdn) tp=$($pkg.Thumbprint)"); $res.Tp=$pkg.Thumbprint
+            }
+            # The CA certificate goes to the Root store only when one is given (prepared files: optional).
             $r=Invoke-RemoteRecorderInstall -ComputerName $P.Fqdn -Credential $P.Cred -UseSsl:$false `
                  -PfxPath $pkg.PfxPath -PfxPassword $pfxPw -SignerCerPath $P.CaCer `
-                 -InstallSignerToRoot $true -InstallSignerToIntermediate $false `
+                 -InstallSignerToRoot ([bool]$P.CaCer) -InstallSignerToIntermediate $false `
                  -EnableEncryption $false -ServerConfiguratorPath '' -ScCredential $P.Cred -CertificateGroup ''
             foreach($l in $r.Logs){ $logs.Add($l) }
-            $okG=@(); $failG=@()
-            for($i=0;$i -lt $guids.Count;$i++){
-                $g=$guids[$i]; $gn= if($i -lt $names.Count){ $names[$i] } else { $g }
-                $e=Invoke-ScWithWedgeRetry -ComputerName $P.Fqdn -Credential $P.Cred `
-                     -Thumbprint $pkg.Thumbprint -CertificateGroup $g -Action enableencryption -WorkLog $logs -GroupName $gn -ScPaths ([string]$P.ScPaths)
-                foreach($l in $e.Logs){ $logs.Add("[$gn] $l") }
-                if($e.ExitCode -in 0,200000){ $okG+=$gn }
-                elseif($e.ExitCode -eq 100){ $failG+="$gn=exit100(not authorized)" }
-                elseif($e.ExitCode -eq 300000){ $failG+="$gn=exit300000(cert bound but registration failed - cert CN does not match server address; server may not start)" }
-                elseif($e.ExitCode -eq 100000){ $failG+="$gn=exit100000(IDP 403 VmsAdminCredentialsNeeded - mgmt reconfig forbidden; cert may be half-applied)" }
-                elseif($e.CertApplied){ $okG+=$gn }   # SC exit -4/267009 etc. with success markers in the SC log - tolerated (rule: 0 and -4 ok when markers present)
-                else { $failG+="$gn=exit $($e.ExitCode)" }
+            # Owner 2026-10-31: ServerConfigurator that could not reach the Management Server after applying (lab:
+            # a short network drop) leaves the box half set and its services do not start - run it once more.
+            for($try=1; $try -le 2; $try++){
+                $mark=$logs.Count
+                $okG=@(); $failG=@()
+                for($i=0;$i -lt $guids.Count;$i++){
+                    $g=$guids[$i]; $gn= if($i -lt $names.Count){ $names[$i] } else { $g }
+                    $e=Invoke-ScWithWedgeRetry -ComputerName $P.Fqdn -Credential $P.Cred `
+                         -Thumbprint $pkg.Thumbprint -CertificateGroup $g -Action enableencryption -WorkLog $logs -GroupName $gn -ScPaths ([string]$P.ScPaths)
+                    foreach($l in $e.Logs){ $logs.Add("[$gn] $l") }
+                    if($e.ExitCode -in 0,200000){ $okG+=$gn }
+                    elseif($e.ExitCode -eq 100){ $failG+="$gn=exit100(not authorized)" }
+                    elseif($e.ExitCode -eq 300000){ $failG+="$gn=exit300000(cert bound but registration failed - cert CN does not match server address; server may not start)" }
+                    elseif($e.ExitCode -eq 100000){ $failG+="$gn=exit100000(IDP 403 VmsAdminCredentialsNeeded - mgmt reconfig forbidden; cert may be half-applied)" }
+                    elseif($e.CertApplied){ $okG+=$gn }   # SC exit -4/267009 etc. with success markers in the SC log - tolerated (rule: 0 and -4 ok when markers present)
+                    else { $failG+="$gn=exit $($e.ExitCode)" }
+                }
+                $conf=Confirm-ServerEncryption -ComputerName $P.Fqdn -Credential $P.Cred -UseSsl:$false -Thumbprint $pkg.Thumbprint
+                foreach($l in $conf.Logs){ $logs.Add($l) }
+                $unreach=@($logs | Select-Object -Skip $mark | Where-Object { $_ -match 'Unable to verify the presence of the management server' }).Count
+                if($try -eq 2 -or $conf.AllServicesRunning -or -not $unreach){ break }
+                $logs.Add("ServerConfigurator could not reach the Management Server - running it once more in 30 s")
+                Start-Sleep -Seconds 30
             }
-            $conf=Confirm-ServerEncryption -ComputerName $P.Fqdn -Credential $P.Cred -UseSsl:$false -Thumbprint $pkg.Thumbprint
-            foreach($l in $conf.Logs){ $logs.Add($l) }
             # W5: the certificate/registration verdict is not enough - the Milestone services must also be
             # back up. A cert applied but services not running is a FAILURE (offers rollback), never a green row.
             $certOk = ($failG.Count -eq 0) -and ((-not $P.BindExpected) -or $conf.Bound)
@@ -1251,16 +1270,25 @@ $script:HostWorker = {
                           elseif($certOk){ "certificate applied but the Milestone services did not start again on $($P.Target)" }
                           else { "FAILED ok=[$($okG -join '+')] fail=[$($failG -join '+')] bound=$($conf.Bound)" }
         } else {
-            $okG=@(); $failG=@()
-            for($i=0;$i -lt $guids.Count;$i++){
-                $g=$guids[$i]; $gn= if($i -lt $names.Count){ $names[$i] } else { $g }
-                $r=Invoke-ScWithWedgeRetry -ComputerName $P.Fqdn -Credential $P.Cred `
-                     -Thumbprint '' -CertificateGroup $g -Action disableencryption -WorkLog $logs -GroupName $gn -ScPaths ([string]$P.ScPaths)
-                foreach($l in $r.Logs){ $logs.Add($l) }
-                if($r.CertApplied -or ($r.ExitCode -in 0,100,200000)){ $okG+=$gn } else { $failG+="$gn=exit $($r.ExitCode)" }
+            # Owner 2026-10-31: ServerConfigurator that could not reach the Management Server after applying (lab:
+            # a short network drop) leaves the box half set and its services do not start - run it once more.
+            for($try=1; $try -le 2; $try++){
+                $mark=$logs.Count
+                $okG=@(); $failG=@()
+                for($i=0;$i -lt $guids.Count;$i++){
+                    $g=$guids[$i]; $gn= if($i -lt $names.Count){ $names[$i] } else { $g }
+                    $r=Invoke-ScWithWedgeRetry -ComputerName $P.Fqdn -Credential $P.Cred `
+                         -Thumbprint '' -CertificateGroup $g -Action disableencryption -WorkLog $logs -GroupName $gn -ScPaths ([string]$P.ScPaths)
+                    foreach($l in $r.Logs){ $logs.Add($l) }
+                    if($r.CertApplied -or ($r.ExitCode -in 0,100,200000)){ $okG+=$gn } else { $failG+="$gn=exit $($r.ExitCode)" }
+                }
+                $conf=Confirm-ServerEncryption -ComputerName $P.Fqdn -Credential $P.Cred -UseSsl:$false -Thumbprint '0'
+                foreach($l in $conf.Logs){ $logs.Add($l) }
+                $unreach=@($logs | Select-Object -Skip $mark | Where-Object { $_ -match 'Unable to verify the presence of the management server' }).Count
+                if($try -eq 2 -or $conf.AllServicesRunning -or -not $unreach){ break }
+                $logs.Add("ServerConfigurator could not reach the Management Server - running it once more in 30 s")
+                Start-Sleep -Seconds 30
             }
-            $conf=Confirm-ServerEncryption -ComputerName $P.Fqdn -Credential $P.Cred -UseSsl:$false -Thumbprint '0'
-            foreach($l in $conf.Logs){ $logs.Add($l) }
             $certOk = ($failG.Count -eq 0)
             $res.Ok = $certOk -and $conf.AllServicesRunning
             $res.Status = if($res.Ok){ "Disabled: $($okG -join '+') (svc up)" }

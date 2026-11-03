@@ -24,6 +24,12 @@
                     account, an optional separate recording-server account, the signing CA.
                     Recording servers are found automatically from the VMS (the recording server
                     that runs on this Management Server is covered by the Management Server step).
+                    Optional 'Certificate files...': every server gets a PREPARED certificate issued by
+                    your own CA instead of a new one signed by the signing CA (then no signing CA at all):
+                    one .p12/.pfx per recording server (<computer-fqdn>.p12), one for the Management
+                    Server and one for the Event Server, each named after the address the role is
+                    registered under (clustered: the cluster address; the same file goes on every node),
+                    plus an optional root CA file added to LocalMachine\Root on every server that gets one.
         2 Check   - every computer: reachable or not, and its REAL encryption state.
         3 Action  - 'Turn encryption ON' / 'Turn encryption OFF', with live progress per step and a
                     'Show details' technical log.
@@ -90,6 +96,11 @@
     self-test after an on/off run on clustered roles. -FixRegistration lets the pre-flight check
     register computers that point to a different management-server address (Server Configurator
     /register); without it such a computer fails the pre-flight check (status only reports it).
+    -CertFolder <dir> -CertPwFile <file> [-RootCaFile <cer>] gives every server a prepared certificate
+    (<recorder-fqdn>.p12 per recorder, <ms-address>.p12 and <es-address>.p12 for the roles, .p12 or .pfx in
+    <dir>, one password for all, read from <file>) instead of a new one; the pre-flight check names every
+    missing file and opens and checks every file (password, private key, name, validity,
+    Server Authentication, issued by the root CA) before anything is changed.
         -Action register                      re-register THIS Management Server cluster node
                                               (it must own the role now; needs -AdminUser/-AdminPwFile)
         -Action rollback -Snapshot <file>     undo what the run that wrote <file> changed
@@ -116,6 +127,9 @@ param(
     [string]$RootSubject = '<signer-subject>',          # signing CA subject (store lookup by CN)
     [string]$ExtraSans = '',                            # extra SAN DNS names for the Management Server certificate
     [string]$SearchPaths = '',                          # ';' list of folders (or exe paths) to search for ServerConfigurator.exe / MilestonePSTools when not installed in the default folder
+    [string]$CertFolder = '',                        # prepared certificates (own CA): folder of <recorder-fqdn>.p12 + <ms-address>.p12 + <es-address>.p12 (empty = sign new ones with the signing CA)
+    [string]$CertPwFile,                             # file holding the password of those certificate files (headless only)
+    [string]$RootCaFile = '',                           # optional root CA certificate (.cer / .crt) installed on every server that gets a prepared certificate
     [string]$LogFile,                                   # optional: tee the log here
     [string]$MsAddr = '',                               # VMS address for recorder discovery (default: this machine)
     [string]$Domain = ''                                # DNS domain suffix (default: this machine's primary DNS suffix)
@@ -143,6 +157,8 @@ $script:Defaults = @{
     EsHost        = '<event-server-host>'             # standalone Event Server host
     ExtraSans     = ''                                # extra SAN names for the Management Server certificate
     SearchPaths   = ''                                # extra folders to search for ServerConfigurator.exe / MilestonePSTools ('D:\Milestone;E:\Apps')
+    CertFolder    = ''                                # folder of prepared certificates (<recorder-fqdn>.p12, <ms-address>.p12, <es-address>.p12)
+    RootCaFile    = ''                                # root CA certificate installed with those certificates
 }
 $script:DefaultsLoaded = @()
 $script:DefaultsLoadError = $null
@@ -167,6 +183,8 @@ $RootSubject = Resolve-Default $RootSubject 'SignerSubject'
 $ExtraSans   = Resolve-Default $ExtraSans   'ExtraSans'
 $SearchPaths = Resolve-Default $SearchPaths 'SearchPaths'
 $MsAddr      = Resolve-Default $MsAddr      'MsAddr'
+$CertFolder = Resolve-Default $CertFolder 'CertFolder'
+$RootCaFile    = Resolve-Default $RootCaFile    'RootCaFile'
 if (-not $NoEventServer) { $EsHost = Resolve-Default $EsHost 'EsHost' }
 
 # ===================== INLINED ENGINE (verbatim from Mrc-Es-Gui.ps1 / Mrc-Ms-Gui.ps1) =====================
@@ -510,7 +528,8 @@ function Invoke-RemoteRecorderInstall {
             $rlog = [System.Collections.Generic.List[string]]::new()
             $rlog.Add("[$env:COMPUTERNAME] Importing PFX -> Cert:\LocalMachine\My")
             $c = Import-PfxCertificate -FilePath $RPfx -CertStoreLocation 'Cert:\LocalMachine\My' -Password $RPw -Exportable:$false
-            if ($c -is [array]) { $c = $c | Select-Object -First 1 }
+            # A PFX that carries its chain imports several certificates: the one with the private key is the server's.
+            if ($c -is [array]) { $k = @($c | Where-Object { $_.HasPrivateKey }); $c = if ($k.Count) { $k[0] } else { $c[0] } }
             if ($null -eq $c) { throw 'Recorder PFX import returned no certificate.' }
             $rlog.Add("[$env:COMPUTERNAME] Imported  tp=$($c.Thumbprint)  subj=$($c.Subject)")
             # Grant NETWORK SERVICE Read on private key so VideoOS.Recorder.Service (Schannel on port 7563) can use it.
@@ -1170,6 +1189,156 @@ function Resolve-Signer {
     }
 }
 
+# -- Prepared certificate files (issued by the operator's own CA) --------------------------------------
+# One folder, one password, one file per certificate: <recorder-fqdn>.p12 (or .pfx) per recording server,
+# and one per Management Server / Event Server ROLE, named after the name the role is registered under
+# (Get-RoleCertSpec) and installed on every node of a clustered role. An optional root CA file goes to
+# LocalMachine\Root on every computer that gets a file. Used INSTEAD of the signing CA - never mixed with it.
+# Every file is matched and checked in the pre-flight check, before anything is changed.
+$script:CertFilesOn = $false; $script:CertFilesDir = ''; $script:CertFilesPw = $null; $script:CertRootCa = ''
+$script:RecCertMap = @{}; $script:RoleCertMap = @{}; $script:CertRootCer = ''
+function Get-CertNames { param([System.Security.Cryptography.X509Certificates.X509Certificate2]$Cert)
+    # Every SAN entry plus the subject CN, lowercased. The SAN text is localized ('DNS Name=' /
+    # 'DNS-Name='), so only the value after '=' is taken.
+    $n=[System.Collections.Generic.List[string]]::new()
+    foreach($e in $Cert.Extensions){ if($e.Oid.Value -eq '2.5.29.17'){ foreach($m in [regex]::Matches($e.Format($false),'(?:^|,)\s*[^=,]+=\s*([^,]+)')){ [void]$n.Add($m.Groups[1].Value.Trim().ToLowerInvariant()) } } }
+    $cn=$Cert.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName,$false)
+    if($cn){ [void]$n.Add($cn.Trim().ToLowerInvariant()) }
+    @($n | Select-Object -Unique)
+}
+function Test-CertNameMatch { param([string[]]$CertNames,[string[]]$Wanted)
+    foreach($w in @($Wanted | ForEach-Object { ([string]$_).ToLowerInvariant() })){
+        foreach($x in @($CertNames)){
+            if($x -eq $w){ return $true }
+            if($x.StartsWith('*.') -and $w.Contains('.') -and $w.Substring($w.IndexOf('.')) -eq $x.Substring(1)){ return $true }
+        }
+    }
+    $false
+}
+function Find-CertFile { param([string]$Folder,[string]$Fqdn)
+    # '<fqdn>.p12' / '.pfx' (any case); else the ONE file whose first label is the short name (the same
+    # computer under another DNS suffix). '' = none. Several candidates = refuse, never guess.
+    $f=([string]$Fqdn).Trim().TrimEnd('.').ToLowerInvariant()
+    $files=@(Get-ChildItem -LiteralPath $Folder -File -ErrorAction Stop | Where-Object { $_.Extension -in '.p12','.pfx' })
+    $hit=@($files | Where-Object { $_.BaseName.ToLowerInvariant() -eq $f })
+    if(-not $hit.Count){ $short=($f -split '\.')[0]; $hit=@($files | Where-Object { ($_.BaseName.ToLowerInvariant() -split '\.')[0] -eq $short }) }
+    if($hit.Count -gt 1){ throw "more than one certificate file fits $f ($((@($hit | ForEach-Object { $_.Name })) -join ', ')). Keep only $f.p12 in the folder." }
+    if($hit.Count){ $hit[0].FullName } else { '' }
+}
+function Read-RootCaFile { param([string]$Path)
+    if(-not (Test-Path -LiteralPath $Path -PathType Leaf)){ throw "The root CA file was not found: $Path" }
+    try { $c=[System.Security.Cryptography.X509Certificates.X509Certificate2]::new($Path) }
+    catch { throw "The root CA file $Path could not be read as a certificate (.cer / .crt, DER or Base64): $(Get-FirstLine $_.Exception.Message)" }
+    $bc=Get-First -Items @($c.Extensions | Where-Object { $_ -is [System.Security.Cryptography.X509Certificates.X509BasicConstraintsExtension] })
+    if($bc -and -not $bc.CertificateAuthority){ throw "The root CA file holds '$($c.Subject)', which is not a certificate authority. Pick the root CA certificate of the CA that issued the server certificates." }
+    if($c.Subject -ne $c.Issuer){ throw "The root CA file holds '$($c.Subject)', which was issued by '$($c.Issuer)' - it is not a root CA. Pick the top (root) certificate of that CA." }
+    $c
+}
+function Test-CertFile { param([string]$Path,[securestring]$Password,[string[]]$Names,$RootCa)
+    # Opens the file on THIS computer and checks it. Returns Thumbprint/Subject/NotAfter of the certificate
+    # to install; throws a plain-language reason.
+    $leaf=[IO.Path]::GetFileName($Path)
+    $col=[System.Security.Cryptography.X509Certificates.X509Certificate2Collection]::new()
+    $pw=if($Password){ [System.Net.NetworkCredential]::new('',$Password).Password } else { '' }
+    try { $col.Import($Path,$pw,[System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::DefaultKeySet) }
+    catch { throw "$leaf could not be opened - wrong password, a damaged file, or not a .p12/.pfx file ($(Get-FirstLine $_.Exception.Message))." }
+    try {
+        $keyed=@($col | Where-Object { $_.HasPrivateKey })
+        if(-not $keyed.Count){ throw "$leaf has no private key. Export the certificate WITH its private key (.p12 / .pfx)." }
+        $named=@($keyed | Where-Object { Test-CertNameMatch (Get-CertNames $_) $Names })
+        if(-not $named.Count){
+            $has=if($keyed.Count -eq 1){ "is for $((Get-CertNames $keyed[0]) -join ', ')" } else { "holds $($keyed.Count) certificates with a private key" }
+            throw "$leaf $has - not for $($Names[0]). A certificate must carry the name the server is known by." }
+        $c=$named[0]; $now=Get-Date
+        if($c.NotAfter -lt $now){ throw "$leaf expired on $($c.NotAfter.ToString('yyyy-MM-dd'))." }
+        if($c.NotBefore -gt $now){ throw "$leaf is valid only from $($c.NotBefore.ToString('yyyy-MM-dd HH:mm')). Check the clock of this computer, or wait." }
+        $eku=Get-First -Items @($c.Extensions | Where-Object { $_ -is [System.Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension] })
+        if($eku -and $eku.EnhancedKeyUsages.Count -and -not @($eku.EnhancedKeyUsages | Where-Object { $_.Value -eq '1.3.6.1.5.5.7.3.1' }).Count){
+            throw "$leaf is not a server certificate (its purposes do not include Server Authentication)." }
+        if($RootCa){
+            $ch=[System.Security.Cryptography.X509Certificates.X509Chain]::new()
+            $ch.ChainPolicy.RevocationMode='NoCheck'; $ch.ChainPolicy.VerificationFlags='AllowUnknownCertificateAuthority'
+            $ch.ChainPolicy.UrlRetrievalTimeout=[TimeSpan]::FromSeconds(5)
+            [void]$ch.ChainPolicy.ExtraStore.AddRange($col); [void]$ch.ChainPolicy.ExtraStore.Add($RootCa)
+            [void]$ch.Build($c)
+            $topTp=$ch.ChainElements[$ch.ChainElements.Count-1].Certificate.Thumbprint; $ch.Reset()
+            if($topTp -ne $RootCa.Thumbprint){ throw "$leaf was not issued by the root CA '$($RootCa.Subject)' (issuer: '$($c.Issuer)'). Pick the right root CA file, or add the missing intermediate CA certificate to the .p12." }
+        }
+        [pscustomobject]@{ Thumbprint=$c.Thumbprint; Subject=$c.Subject; NotAfter=$c.NotAfter; Names=@(Get-CertNames $c) }
+    } finally { foreach($x in $col){ $x.Reset() } }
+}
+# The certificate file of the Management Server ('MS') or Event Server ('ES') role: Name = the name the role
+# is registered under (the CN the wizard would mint, the one name the certificate MUST carry), Lookup = file
+# names tried in order, Also = names it should carry too (cluster nodes, MS extra SANs; missing = warning).
+function Get-RoleCertSpec { param([string]$Key)
+    $cl = Get-ClusterObj $Key; $also = @()
+    if($Key -eq 'MS'){
+        if($cl -and -not $cl.Address){ throw "The cluster role '$($cl.Group)' has no network name (cluster address), so the certificate name is unknown." }
+        $name = if($cl){ [string]$cl.Address } else { [string]$script:MsFqdn }
+        $lookup = @($name); $also += @(ConvertTo-SanList $script:MsExtraSans)
+    } else {
+        $name = Resolve-CertFqdn -Target $script:EsAddr -Fqdn '' -DomainSuffix $script:DomainName
+        $lookup = @($name) + @(if($cl -and $cl.Address){ [string]$cl.Address })
+    }
+    if($cl){ $also += @(@($cl.Nodes) | ForEach-Object { [string]$_.Fqdn }) }
+    $name = $name.Trim().TrimEnd('.').ToLowerInvariant()
+    [pscustomobject]@{ Key=$Key; Name=$name; Lookup=@($lookup | ForEach-Object { ([string]$_).ToLowerInvariant() } | Select-Object -Unique)
+                       Also=@($also | Where-Object { $_ } | ForEach-Object { ([string]$_).ToLowerInvariant() } | Where-Object { $_ -ne $name } | Select-Object -Unique) }
+}
+# A standalone MS / ES job (HostWorker / EsHostWorker) gets its role's checked certificate file instead of a
+# new certificate. In file mode a role without a checked file is refused, never signed by a CA.
+function Set-RoleCertParams { param([hashtable]$P,[string]$Key)
+    if(-not ($script:CertFilesOn -and $P.Action -eq 'enable')){ return }
+    $rc = $script:RoleCertMap[$Key]
+    if(-not $rc){ throw "No checked certificate file for the $(Get-StageName $Key) - nothing was changed on it. Click Check again, then run the same action again." }
+    $P.PfxFile=$rc.File; $P.PfxTp=$rc.Tp; $P.PfxName=$rc.Name; $P.PfxPw=$script:CertFilesPw; $P.CaCer=[string]$script:CertRootCer
+}
+# Pre-flight part for prepared files: fills $script:RoleCertMap (key 'MS' / 'ES'), $script:RecCertMap (key =
+# recorder Target, upper case) and $script:CertRootCer (the root CA as DER, for every computer that gets a
+# file). Returns the problems (none = empty).
+function Get-CertFileProblems { param([object[]]$Boxes,[string[]]$Roles=@())
+    $p=[System.Collections.Generic.List[string]]::new()
+    $script:RecCertMap=@{}; $script:RoleCertMap=@{}; $script:CertRootCer=''
+    $dir=[string]$script:CertFilesDir
+    if(-not $dir -or -not (Test-Path -LiteralPath $dir -PathType Container)){
+        $p.Add("The folder with the certificate files was not found: '$dir'. In step 1 click 'Certificate files...' and pick it."); return $p.ToArray() }
+    $root=$null
+    if($script:CertRootCa){
+        try { $root=Read-RootCaFile $script:CertRootCa
+              $script:CertRootCer=Join-Path $script:OutputDir 'ServerRootCA.cer'; [IO.File]::WriteAllBytes($script:CertRootCer,$root.RawData)
+              Write-Log "Root CA for the certificate files: $($root.Subject) [$($root.Thumbprint)]" }
+        catch { $p.Add($_.Exception.Message); $root=$null }
+    } else { Write-Log 'No root CA file given - every server must already trust the CA that issued its certificate.' }
+    foreach($k in @($Roles)){
+        $what = Get-StageName $k
+        try {
+            $spec = Get-RoleCertSpec $k
+            $file = ''; foreach($n in $spec.Lookup){ $file = Find-CertFile $dir $n; if($file){ break } }
+            if(-not $file){ $p.Add("No certificate file for the $what ($($spec.Name)): expected $(Join-Path $dir "$($spec.Name).p12")."); continue }
+            $c = Test-CertFile -Path $file -Password $script:CertFilesPw -Names @($spec.Name) -RootCa $root
+            $miss = @($spec.Also | Where-Object { -not (Test-CertNameMatch $c.Names @($_)) })
+            if($miss.Count){ Write-Log "WARNING: $([IO.Path]::GetFileName($file)) ($what) does not carry $($miss -join ', '). It is used anyway; add these names to the certificate if clients or the other node(s) reach the $what by them." 'Err' }
+            $script:RoleCertMap[$k] = [pscustomobject]@{ File=$file; Tp=$c.Thumbprint; Name=$spec.Name }
+            Write-Log "[$what] certificate file $([IO.Path]::GetFileName($file)): $($c.Subject), valid until $($c.NotAfter.ToString('yyyy-MM-dd')) [$($c.Thumbprint)]" 'Good'
+        } catch { $p.Add("$($what): $($_.Exception.Message)") }
+    }
+    foreach($b in @($Boxes)){
+        try {
+            $fq=Resolve-CertFqdn -Target $b.Target -Fqdn $b.Addr -DomainSuffix $script:DomainName
+            $file=Find-CertFile $dir $fq
+            if(-not $file){ $p.Add("No certificate file for recording server $($b.Name): expected $(Join-Path $dir "$fq.p12")."); continue }
+            # A recorder the VMS knows only by short name or IP: its FQDN here is a guess from the domain box,
+            # so the name in the file it was matched by (same short name) is accepted too.
+            $names=@($fq); $base=[IO.Path]::GetFileNameWithoutExtension($file).ToLowerInvariant()
+            if($base -ne $fq -and -not (([string]$b.Addr -match '\.') -and -not (Test-IpAddress $b.Addr))){ $names+=$base }
+            $c=Test-CertFile -Path $file -Password $script:CertFilesPw -Names $names -RootCa $root
+            $script:RecCertMap[([string]$b.Target).ToUpperInvariant()]=[pscustomobject]@{ File=$file; Tp=$c.Thumbprint; Name=$fq }
+            Write-Log "[$($b.Name)] certificate file $([IO.Path]::GetFileName($file)): $($c.Subject), valid until $($c.NotAfter.ToString('yyyy-MM-dd')) [$($c.Thumbprint)]" 'Good'
+        } catch { $p.Add("Recording server $($b.Name): $($_.Exception.Message)") }
+    }
+    $p.ToArray()
+}
+
 function Format-Err { param($ErrRec)
     $ex=$ErrRec.Exception; $s=$ex.ToString()
     if([string]::IsNullOrWhiteSpace($s)){ $s="$($ErrRec)" }
@@ -1217,34 +1386,52 @@ $script:HostWorker = {
         $names=@($P.Names -split ', ' | Where-Object { $_ })
         $guids=@($P.Guids -split ' '  | Where-Object { $_ })
         if($P.Action -eq 'enable'){
-            $signer = Get-ChildItem Cert:\LocalMachine\My,Cert:\CurrentUser\My -ErrorAction SilentlyContinue | Where-Object { $_.Thumbprint -eq $P.SignerTp -and $_.HasPrivateKey } | Select-Object -First 1
-            if(-not $signer){ throw "signer $($P.SignerTp) not found in cert store" }
-            $pfxPw=[securestring]::new(); foreach($ch in ([guid]::NewGuid().ToString('N')).ToCharArray()){$pfxPw.AppendChar($ch)}; $pfxPw.MakeReadOnly()
-            $certFqdn=Resolve-CertFqdn -Target $P.Target -Fqdn $P.Fqdn -DomainSuffix $P.Domain
-            $sans=@(ConvertTo-SanList ([string]$P.ExtraSans))
-            if($sans.Count){ $logs.Add("extra SANs: $($sans -join ', ')") }
-            $pkg=New-RecorderCertificatePackage -HostName $certFqdn -DomainSuffix $P.Domain -Signer $signer -PfxPassword $pfxPw -OutputDir $P.OutputDir -ExtraDnsNames $sans
-            $logs.Add("issued $($pkg.Fqdn) tp=$($pkg.Thumbprint)"); $res.Tp=$pkg.Thumbprint
+            if($P.PfxFile){
+                # A prepared certificate file (issued by the operator's own CA, matched to this computer and
+                # checked before the run) is imported as it is - no signer, no new certificate.
+                $pfxPw=$P.PfxPw
+                $pkg=[pscustomobject]@{ Fqdn=$P.PfxName; Thumbprint=$P.PfxTp; PfxPath=$P.PfxFile }
+                $logs.Add("prepared certificate $([IO.Path]::GetFileName($P.PfxFile)) for $($pkg.Fqdn) tp=$($pkg.Thumbprint)"); $res.Tp=$pkg.Thumbprint
+            } else {
+                $signer = Get-ChildItem Cert:\LocalMachine\My,Cert:\CurrentUser\My -ErrorAction SilentlyContinue | Where-Object { $_.Thumbprint -eq $P.SignerTp -and $_.HasPrivateKey } | Select-Object -First 1
+                if(-not $signer){ throw "signer $($P.SignerTp) not found in cert store" }
+                $pfxPw=[securestring]::new(); foreach($ch in ([guid]::NewGuid().ToString('N')).ToCharArray()){$pfxPw.AppendChar($ch)}; $pfxPw.MakeReadOnly()
+                $certFqdn=Resolve-CertFqdn -Target $P.Target -Fqdn $P.Fqdn -DomainSuffix $P.Domain
+                $sans=@(ConvertTo-SanList ([string]$P.ExtraSans))
+                if($sans.Count){ $logs.Add("extra SANs: $($sans -join ', ')") }
+                $pkg=New-RecorderCertificatePackage -HostName $certFqdn -DomainSuffix $P.Domain -Signer $signer -PfxPassword $pfxPw -OutputDir $P.OutputDir -ExtraDnsNames $sans
+                $logs.Add("issued $($pkg.Fqdn) tp=$($pkg.Thumbprint)"); $res.Tp=$pkg.Thumbprint
+            }
+            # The CA certificate goes to the Root store only when one is given (prepared files: optional).
             $r=Invoke-RemoteRecorderInstall -ComputerName $P.Fqdn -Credential $P.Cred -UseSsl:$false `
                  -PfxPath $pkg.PfxPath -PfxPassword $pfxPw -SignerCerPath $P.CaCer `
-                 -InstallSignerToRoot $true -InstallSignerToIntermediate $false `
+                 -InstallSignerToRoot ([bool]$P.CaCer) -InstallSignerToIntermediate $false `
                  -EnableEncryption $false -ServerConfiguratorPath '' -ScCredential $P.Cred -CertificateGroup ''
             foreach($l in $r.Logs){ $logs.Add($l) }
-            $okG=@(); $failG=@()
-            for($i=0;$i -lt $guids.Count;$i++){
-                $g=$guids[$i]; $gn= if($i -lt $names.Count){ $names[$i] } else { $g }
-                $e=Invoke-ScWithWedgeRetry -ComputerName $P.Fqdn -Credential $P.Cred `
-                     -Thumbprint $pkg.Thumbprint -CertificateGroup $g -Action enableencryption -WorkLog $logs -GroupName $gn -ScPaths ([string]$P.ScPaths)
-                foreach($l in $e.Logs){ $logs.Add("[$gn] $l") }
-                if($e.ExitCode -in 0,200000){ $okG+=$gn }
-                elseif($e.ExitCode -eq 100){ $failG+="$gn=exit100(not authorized)" }
-                elseif($e.ExitCode -eq 300000){ $failG+="$gn=exit300000(cert bound but registration failed - cert CN does not match server address; server may not start)" }
-                elseif($e.ExitCode -eq 100000){ $failG+="$gn=exit100000(IDP 403 VmsAdminCredentialsNeeded - mgmt reconfig forbidden; cert may be half-applied)" }
-                elseif($e.CertApplied){ $okG+=$gn }   # SC exit -4/267009 etc. with success markers in the SC log - tolerated (rule: 0 and -4 ok when markers present)
-                else { $failG+="$gn=exit $($e.ExitCode)" }
+            # Owner 2026-10-31: ServerConfigurator that could not reach the Management Server after applying (lab:
+            # a short network drop) leaves the box half set and its services do not start - run it once more.
+            for($try=1; $try -le 2; $try++){
+                $mark=$logs.Count
+                $okG=@(); $failG=@()
+                for($i=0;$i -lt $guids.Count;$i++){
+                    $g=$guids[$i]; $gn= if($i -lt $names.Count){ $names[$i] } else { $g }
+                    $e=Invoke-ScWithWedgeRetry -ComputerName $P.Fqdn -Credential $P.Cred `
+                         -Thumbprint $pkg.Thumbprint -CertificateGroup $g -Action enableencryption -WorkLog $logs -GroupName $gn -ScPaths ([string]$P.ScPaths)
+                    foreach($l in $e.Logs){ $logs.Add("[$gn] $l") }
+                    if($e.ExitCode -in 0,200000){ $okG+=$gn }
+                    elseif($e.ExitCode -eq 100){ $failG+="$gn=exit100(not authorized)" }
+                    elseif($e.ExitCode -eq 300000){ $failG+="$gn=exit300000(cert bound but registration failed - cert CN does not match server address; server may not start)" }
+                    elseif($e.ExitCode -eq 100000){ $failG+="$gn=exit100000(IDP 403 VmsAdminCredentialsNeeded - mgmt reconfig forbidden; cert may be half-applied)" }
+                    elseif($e.CertApplied){ $okG+=$gn }   # SC exit -4/267009 etc. with success markers in the SC log - tolerated (rule: 0 and -4 ok when markers present)
+                    else { $failG+="$gn=exit $($e.ExitCode)" }
+                }
+                $conf=Confirm-ServerEncryption -ComputerName $P.Fqdn -Credential $P.Cred -UseSsl:$false -Thumbprint $pkg.Thumbprint
+                foreach($l in $conf.Logs){ $logs.Add($l) }
+                $unreach=@($logs | Select-Object -Skip $mark | Where-Object { $_ -match 'Unable to verify the presence of the management server' }).Count
+                if($try -eq 2 -or $conf.AllServicesRunning -or -not $unreach){ break }
+                $logs.Add("ServerConfigurator could not reach the Management Server - running it once more in 30 s")
+                Start-Sleep -Seconds 30
             }
-            $conf=Confirm-ServerEncryption -ComputerName $P.Fqdn -Credential $P.Cred -UseSsl:$false -Thumbprint $pkg.Thumbprint
-            foreach($l in $conf.Logs){ $logs.Add($l) }
             # W5: the certificate/registration verdict is not enough - the Milestone services must also be
             # back up. A cert applied but services not running is a FAILURE (offers rollback), never a green row.
             $certOk = ($failG.Count -eq 0) -and ((-not $P.BindExpected) -or $conf.Bound)
@@ -1253,16 +1440,25 @@ $script:HostWorker = {
                           elseif($certOk){ "certificate applied but the Milestone services did not start again on $($P.Target)" }
                           else { "FAILED ok=[$($okG -join '+')] fail=[$($failG -join '+')] bound=$($conf.Bound)" }
         } else {
-            $okG=@(); $failG=@()
-            for($i=0;$i -lt $guids.Count;$i++){
-                $g=$guids[$i]; $gn= if($i -lt $names.Count){ $names[$i] } else { $g }
-                $r=Invoke-ScWithWedgeRetry -ComputerName $P.Fqdn -Credential $P.Cred `
-                     -Thumbprint '' -CertificateGroup $g -Action disableencryption -WorkLog $logs -GroupName $gn -ScPaths ([string]$P.ScPaths)
-                foreach($l in $r.Logs){ $logs.Add($l) }
-                if($r.CertApplied -or ($r.ExitCode -in 0,100,200000)){ $okG+=$gn } else { $failG+="$gn=exit $($r.ExitCode)" }
+            # Owner 2026-10-31: ServerConfigurator that could not reach the Management Server after applying (lab:
+            # a short network drop) leaves the box half set and its services do not start - run it once more.
+            for($try=1; $try -le 2; $try++){
+                $mark=$logs.Count
+                $okG=@(); $failG=@()
+                for($i=0;$i -lt $guids.Count;$i++){
+                    $g=$guids[$i]; $gn= if($i -lt $names.Count){ $names[$i] } else { $g }
+                    $r=Invoke-ScWithWedgeRetry -ComputerName $P.Fqdn -Credential $P.Cred `
+                         -Thumbprint '' -CertificateGroup $g -Action disableencryption -WorkLog $logs -GroupName $gn -ScPaths ([string]$P.ScPaths)
+                    foreach($l in $r.Logs){ $logs.Add($l) }
+                    if($r.CertApplied -or ($r.ExitCode -in 0,100,200000)){ $okG+=$gn } else { $failG+="$gn=exit $($r.ExitCode)" }
+                }
+                $conf=Confirm-ServerEncryption -ComputerName $P.Fqdn -Credential $P.Cred -UseSsl:$false -Thumbprint '0'
+                foreach($l in $conf.Logs){ $logs.Add($l) }
+                $unreach=@($logs | Select-Object -Skip $mark | Where-Object { $_ -match 'Unable to verify the presence of the management server' }).Count
+                if($try -eq 2 -or $conf.AllServicesRunning -or -not $unreach){ break }
+                $logs.Add("ServerConfigurator could not reach the Management Server - running it once more in 30 s")
+                Start-Sleep -Seconds 30
             }
-            $conf=Confirm-ServerEncryption -ComputerName $P.Fqdn -Credential $P.Cred -UseSsl:$false -Thumbprint '0'
-            foreach($l in $conf.Logs){ $logs.Add($l) }
             $certOk = ($failG.Count -eq 0)
             $res.Ok = $certOk -and $conf.AllServicesRunning
             $res.Status = if($res.Ok){ "Disabled: $($okG -join '+') (svc up)" }
@@ -1284,20 +1480,28 @@ $script:EsHostWorker = {
     try {
         Import-Module PKI -ErrorAction SilentlyContinue   # New-SelfSignedCertificate / Import-PfxCertificate (not always auto-loaded)
         if($P.Action -eq 'enable'){
-            $signer = Get-ChildItem Cert:\LocalMachine\My,Cert:\CurrentUser\My -ErrorAction SilentlyContinue | Where-Object { $_.Thumbprint -eq $P.SignerTp -and $_.HasPrivateKey } | Select-Object -First 1
-            if(-not $signer){ throw "signer $($P.SignerTp) not found in cert store" }
-            $pfxPw=[securestring]::new(); foreach($ch in ([guid]::NewGuid().ToString('N')).ToCharArray()){$pfxPw.AppendChar($ch)}; $pfxPw.MakeReadOnly()
-            $certFqdn=Resolve-CertFqdn -Target $P.Target -Fqdn $P.Fqdn -DomainSuffix $P.Domain
-            $sans=@(ConvertTo-SanList ([string]$P.ExtraSans))
-            if($sans.Count){ $logs.Add("extra SANs: $($sans -join ', ')") }
-            $pkg=New-RecorderCertificatePackage -HostName $certFqdn -DomainSuffix $P.Domain -Signer $signer -PfxPassword $pfxPw -OutputDir $P.OutputDir -ExtraDnsNames $sans
-            $logs.Add("issued $($pkg.Fqdn) tp=$($pkg.Thumbprint)"); $res.Tp=$pkg.Thumbprint
+            if($P.PfxFile){
+                # A prepared certificate file (issued by the operator's own CA, checked before the run) is
+                # imported as it is - no signer, no new certificate.
+                $pfxPw=$P.PfxPw
+                $pkg=[pscustomobject]@{ Fqdn=$P.PfxName; Thumbprint=$P.PfxTp; PfxPath=$P.PfxFile }
+                $logs.Add("prepared certificate $([IO.Path]::GetFileName($P.PfxFile)) for $($pkg.Fqdn) tp=$($pkg.Thumbprint)"); $res.Tp=$pkg.Thumbprint
+            } else {
+                $signer = Get-ChildItem Cert:\LocalMachine\My,Cert:\CurrentUser\My -ErrorAction SilentlyContinue | Where-Object { $_.Thumbprint -eq $P.SignerTp -and $_.HasPrivateKey } | Select-Object -First 1
+                if(-not $signer){ throw "signer $($P.SignerTp) not found in cert store" }
+                $pfxPw=[securestring]::new(); foreach($ch in ([guid]::NewGuid().ToString('N')).ToCharArray()){$pfxPw.AppendChar($ch)}; $pfxPw.MakeReadOnly()
+                $certFqdn=Resolve-CertFqdn -Target $P.Target -Fqdn $P.Fqdn -DomainSuffix $P.Domain
+                $sans=@(ConvertTo-SanList ([string]$P.ExtraSans))
+                if($sans.Count){ $logs.Add("extra SANs: $($sans -join ', ')") }
+                $pkg=New-RecorderCertificatePackage -HostName $certFqdn -DomainSuffix $P.Domain -Signer $signer -PfxPassword $pfxPw -OutputDir $P.OutputDir -ExtraDnsNames $sans
+                $logs.Add("issued $($pkg.Fqdn) tp=$($pkg.Thumbprint)"); $res.Tp=$pkg.Thumbprint
+            }
             # Invoke-RemoteRecorderInstall is reused verbatim: despite its name it is not
             # role-specific - it imports the PFX to LocalMachine\My and (optionally) trusts the
-            # signer CA, and is exactly what Mrc-Gui.ps1's MS-role rows call too.
+            # CA certificate, and is exactly what Mrc-Gui.ps1's MS-role rows call too.
             $r=Invoke-RemoteRecorderInstall -ComputerName $P.Fqdn -Credential $P.Cred -UseSsl:$false `
                  -PfxPath $pkg.PfxPath -PfxPassword $pfxPw -SignerCerPath $P.CaCer `
-                 -InstallSignerToRoot $true -InstallSignerToIntermediate $false `
+                 -InstallSignerToRoot ([bool]$P.CaCer) -InstallSignerToIntermediate $false `
                  -EnableEncryption $false -ServerConfiguratorPath '' -ScCredential $P.Cred -CertificateGroup ''
             foreach($l in $r.Logs){ $logs.Add($l) }
             $e=Invoke-ScWithWedgeRetry -ComputerName $P.Fqdn -Credential $P.Cred `
@@ -1466,6 +1670,10 @@ function Invoke-RecordersParallel { param([object[]]$Boxes,[string]$Action,[hash
         # so a workgroup recorder addressed by name must already be resolved by the time it gets there.
         $conn = try { Get-ConnAddr $box.Addr $Common.Cred } catch { $box.Addr }
         $P=@{Target=$box.Target;Fqdn=$conn;Cred=$Common.Cred;SignerTp=$Common.SignerTp;CaCer=$Common.CaCer;Domain=$Common.Domain;OutputDir=$Common.OutputDir;Guids=$Common.Guids;Names=$Common.Names;Action=$Action;BindExpected=$true;ExtraSans='';ScPaths=[string]$Common.ScPaths}
+        # Prepared certificate file for this recorder (checked in the pre-flight check): HostWorker imports it
+        # instead of signing a new one, and installs the operator's root CA (if given) instead of the signer.
+        $cf=if($Common.ContainsKey('CertFiles') -and $Common.CertFiles){ $Common.CertFiles[([string]$box.Target).ToUpperInvariant()] }else{ $null }
+        if($cf){ $P.PfxFile=$cf.File; $P.PfxTp=$cf.Tp; $P.PfxName=$cf.Name; $P.PfxPw=$Common.CertPw; $P.CaCer=[string]$Common.RootCer }
         $ps=[powershell]::Create(); $ps.RunspacePool=$pool
         [void]$ps.AddScript($script:HostWorker).AddArgument($P)
         $jobs += [pscustomobject]@{Box=$box;PS=$ps;Handle=$ps.BeginInvoke();Done=$false}
@@ -1744,6 +1952,24 @@ $script:NodeConn     = @{}   # NODE path: upper-case node name -> verified addre
 $script:NodeInfo     = @{}   # upper-case node name -> Name, Fqdn, own Ips, ClusterKey
 $script:ClusterIpSet = @{}   # every cluster / role 'IP Address' resource address (all groups, both clusters)
 function Test-KerberosError { param([string]$Msg) ([string]$Msg) -match '0x80090322|0x8009030e|0x80090311|Kerberos' }
+# Lab 2026-10-31: a LOCAL account sent from this domain computer to a workgroup computer's NAME (not in
+# TrustedHosts) is refused on the Kerberos path with 'user name or password is incorrect'; its IP (NTLM)
+# works. Only for local credentials: a domain account would get a second failed logon at the domain.
+function Test-LocalLogonRefusal { param([string]$Msg,[pscredential]$Cred,[string]$Computer)
+    if(([string]$Msg) -notmatch 'user name or password is incorrect|0x8009030c' -or (Test-IpAddress $Computer)){ return $false }
+    Test-LocalCred $Cred $Computer }
+# A local (non-domain) credential for $Computer: no domain part, '.', or the computer's own short name.
+function Test-LocalCred { param([pscredential]$Cred,[string]$Computer)
+    if(-not $Cred){ return $false }
+    $u=[string]$Cred.UserName
+    if($u -match '@'){ return $false }
+    $d=if($u -match '^([^\\]+)\\'){ $Matches[1] } else { '' }
+    (-not $d) -or $d -eq '.' -or $d -ieq (([string]$Computer -split '\.')[0]) }
+# COMPUTERNAME (NetBIOS, at most 15 characters) vs a typed name or FQDN: same short name.
+function Test-SameHostName { param([string]$Answer,[string]$Name)
+    $s=(([string]$Name).Trim() -split '\.')[0]
+    if(-not $Answer -or -not $s){ return $false }
+    ($Answer -ieq $s) -or ($s.Length -gt 15 -and $Answer -ieq $s.Substring(0,15)) }
 function Get-IdentityErrorText { param([string]$Actual,[string]$Node) "Connected to $Actual instead of cluster node $Node; nothing was changed on $Node." }
 function Test-IdentityError { param([string]$Msg) ([string]$Msg) -match 'instead of cluster node' }
 function Get-IdentityMessage { param([string]$Msg) if(([string]$Msg) -match '(Connected to \S+ instead of cluster node \S+; nothing was changed on [^.\s]+\.)'){ $Matches[1] } else { [string]$Msg } }
@@ -1782,7 +2008,7 @@ function Invoke-GuardedOnAddress { param([string]$Address,[pscredential]$Cred,[s
 # W14: the "belongs to a cluster" wording is kept ONLY when $Computer is actually a known cluster name
 # (the standalone Event Server address IS often a WSFC role Network Name); a plain host with no Kerberos
 # realm (a workgroup recorder, for instance) gets the accurate, generic reason instead.
-function Find-IpConnection { param([string]$Computer,[pscredential]$Cred,[string]$Why)
+function Find-IpConnection { param([string]$Computer,[pscredential]$Cred,[string]$Why,[switch]$SameName)
     $k=([string]$Computer).Trim().ToLowerInvariant()
     $isKnownClusterName = [bool]($script:EsCluster -and (@($script:EsCluster.NetName,$script:EsCluster.Address) | Where-Object { $_ } | ForEach-Object { ([string]$_).ToLowerInvariant() } | Where-Object { $_ -eq $k }))
     foreach($ip in @(Resolve-HostIPv4 $Computer)){
@@ -1790,6 +2016,12 @@ function Find-IpConnection { param([string]$Computer,[pscredential]$Cred,[string
         Ensure-TrustedHosts -Hosts @($ip)
         try {
             $cn = Get-AnsweringComputer $ip $Cred
+            # -SameName (local account): the address must answer as the computer asked for - recorders may all
+            # share that account, so stale DNS must not lead to another one. A cluster name: one of its nodes.
+            if($SameName){
+                $okName = if($isKnownClusterName){ @($script:EsCluster.Nodes | ForEach-Object { [string]$_.Name }) -icontains $cn } else { Test-SameHostName $cn $Computer }
+                if(-not $okName){ Write-Log "[$Computer] address ${ip} answers as $cn, not as $Computer$(if($isKnownClusterName){' or one of its cluster nodes'}) - not used." 'Err'; continue }
+            }
             $script:ConnCache[$k]=$ip
             $because = if($isKnownClusterName){ "because the name belongs to a cluster ($Why)" } else { "because Kerberos could not be used for the name ($Why)" }
             Write-Log "[$Computer] connected by IP address $ip (answers as $cn) $because." 'Good'
@@ -1805,8 +2037,8 @@ function Get-ConnAddr { param([string]$Computer,[pscredential]$Cred)
     try { [void](Invoke-OnBoxRaw -Computer $Computer -Cred $Cred -Sb { 1 }); $script:ConnCache[$k]=$Computer; return $Computer }
     catch {
         $m=$_.Exception.Message
-        if(-not (Test-KerberosError $m)){ throw }
-        $ip = Find-IpConnection $Computer $Cred (Get-FirstLine $m)
+        if(-not (Test-KerberosError $m) -and -not (Test-LocalLogonRefusal $m $Cred $Computer)){ throw }
+        $ip = Find-IpConnection $Computer $Cred (Get-FirstLine $m) -SameName:(Test-LocalCred $Cred $Computer)
         if($ip){ return $ip }
         throw
     }
@@ -1820,7 +2052,7 @@ function Invoke-OnBox { param([string]$Computer,[pscredential]$Cred,[scriptblock
         # A name that worked before can stop working when a cluster role moves: fall back once.
         if($conn -ne $Computer -or -not (Test-KerberosError $_.Exception.Message)){ throw }
         $k=([string]$Computer).Trim().ToLowerInvariant(); [void]$script:ConnCache.Remove($k)
-        $ip = Find-IpConnection $Computer $Cred (Get-FirstLine $_.Exception.Message)
+        $ip = Find-IpConnection $Computer $Cred (Get-FirstLine $_.Exception.Message) -SameName:(Test-LocalCred $Cred $Computer)
         if(-not $ip){ throw }
         Invoke-OnBoxRaw -Computer $ip -Cred $Cred -Sb $Sb -ArgumentList $ArgumentList
     }
@@ -2682,6 +2914,37 @@ function Get-MsNodeConfirmLogs { param([object[]]$Lines)
 function Test-MsNodeServicesUp { param($Conf)
     if($Conf.AllServicesRunning){ return $true }
     (@(@($Conf.Stopped) | Where-Object { [string]$_ -and [string]$_ -notmatch 'EventServer' }).Count -eq 0) }
+# Owner 2026-10-31 ("shorten it to 30s"): ServerConfigurator on a Management Server stops IIS three times and
+# each time waits the full shutdownTimeLimit (00:01:30) for 'VideoOS ApiGateway AppPool', which does not stop
+# (lab: WAS 5138, ANCM 1005). The wizard sets 00:00:30 around that run and puts the old value back.
+$script:GatewayPool = 'VideoOS ApiGateway AppPool'; $script:GatewayStopLimit = '00:00:30'
+$script:GatewayLimitSb = { param([string]$Pool,[string]$Value)
+    $ErrorActionPreference = 'Continue'
+    $ac = Join-Path $env:windir 'system32\inetsrv\appcmd.exe'
+    if(-not (Test-Path -LiteralPath $ac)){ return [pscustomobject]@{ Old=''; Set=$false; Note='IIS appcmd.exe not found' } }
+    $old = ([string](@(& $ac list apppool $Pool '/text:processModel.shutdownTimeLimit' 2>$null) | Select-Object -First 1)).Trim()
+    if($LASTEXITCODE -ne 0 -or $old -notmatch '^\d+:\d\d:\d\d'){ return [pscustomobject]@{ Old=''; Set=$false; Note="app pool '$Pool' not found" } }
+    if($old -eq $Value){ return [pscustomobject]@{ Old=$old; Set=$false; Note='' } }
+    $msg = [string](@(& $ac set apppool $Pool "/processModel.shutdownTimeLimit:$Value" 2>&1) | Select-Object -First 1)
+    [pscustomobject]@{ Old=$old; Set=($LASTEXITCODE -eq 0); Note=$(if($LASTEXITCODE -ne 0){ "appcmd exit ${LASTEXITCODE}: $msg" } else { '' }) } }
+# Returns the value to put back afterwards, or '' when nothing was changed. Never throws: a failure is logged
+# and ServerConfigurator runs as before.
+function Set-GatewayStopLimit { param($Box,[string]$Value,[switch]$Restore)
+    $p = $script:GatewayPool; $old = ''; $set = $false; $note = ''
+    try {
+        $r = if(Test-NodeIsLocal $Box.Target){ & $script:GatewayLimitSb $p $Value }
+             else { Invoke-OnNode -Node $Box.Target -Cred $Box.Cred -Sb $script:GatewayLimitSb -ArgumentList $p,$Value }
+        $r = @($r) | Select-Object -Last 1
+        $old = [string]$r.Old; $set = [bool]$r.Set; $note = [string]$r.Note
+    } catch { $note = Get-FirstLine $_.Exception.Message }
+    if($Restore){
+        if($note){ Write-Log "[$($Box.Name)] IIS: the stop wait of '$p' could NOT be put back to $Value ($note). Run on $($Box.Name): %windir%\system32\inetsrv\appcmd.exe set apppool `"$p`" /processModel.shutdownTimeLimit:$Value" 'Err' }
+        elseif($set){ Write-Log "[$($Box.Name)] IIS: stop wait of '$p' put back to $Value." }
+        return '' }
+    if($set){ Write-Log "[$($Box.Name)] IIS: stop wait of '$p' set to $Value for ServerConfigurator (was $old; put back afterwards)."; return $old }
+    if($note){ Write-Log "[$($Box.Name)] IIS: stop wait of '$p' left as it is ($note)." }
+    ''
+}
 # ServerConfigurator on ONE cluster node with an already imported certificate. ADAPTED from
 # $script:HostWorker (MS) / $script:EsHostWorker (ES): the same engine calls and the same verdict
 # mapping, minus the per-host certificate issue/import (a clustered role shares one certificate).
@@ -2742,6 +3005,26 @@ function Invoke-NodeSc { param([string]$Key,$Box,[bool]$Want,[string]$Thumbprint
 # ONE certificate for a clustered role, imported on the given nodes. Returns the thumbprint.
 function New-ClusterCertificate { param([string]$Key,[object[]]$Nodes)
     $cl = Get-ClusterObj $Key; $isMs = ($Key -eq 'MS')
+    $dn = if($isMs){ $script:MsSvcDisplay } else { $script:EsSvcDisplay }
+    if($script:CertFilesOn){
+        # Prepared certificate file of this role (checked in the pre-flight check): the same file on every
+        # node, the root CA (if given) to LocalMachine\Root, no signing CA.
+        $rc = $script:RoleCertMap[$Key]
+        if(-not $rc){ throw "No checked certificate file for the $(Get-StageName $Key) - nothing was changed. Click Check again, then run the same action again." }
+        Write-Log "Certificate file for '$($cl.Group)': $([IO.Path]::GetFileName($rc.File)) [tp $($rc.Tp)]" 'Good'
+        foreach($n in @($Nodes)){
+            Write-Log "[$($n.Name)] installing the certificate file$(if($script:CertRootCer){' (and the root CA)'})..."
+            $nAddr = Get-VerifiedNodeAddr $n
+            if($nAddr -ne $n.Addr){ Write-Log "[$($n.Name)] importing on its own address $nAddr (verified: it answers as $($n.Target))" }
+            $r = Invoke-RemoteRecorderInstall -ComputerName $nAddr -Credential $n.Cred -UseSsl:$false `
+                     -PfxPath $rc.File -PfxPassword $script:CertFilesPw -SignerCerPath $script:CertRootCer `
+                     -InstallSignerToRoot ([bool]$script:CertRootCer) -InstallSignerToIntermediate $false `
+                     -EnableEncryption $false -ServerConfiguratorPath '' -ScCredential $n.Cred -CertificateGroup ''
+            foreach($l in $r.Logs){ Write-Log "[$($n.Name)] $l" }
+            foreach($l in @(Invoke-OnNode -Node $n.Target -Cred $n.Cred -Sb $script:KeyGrantSb -ArgumentList @($rc.Tp,$dn))){ Write-Log ([string]$l) $(if([string]$l -match 'WARNING'){'Err'}else{'Info'}) }
+        }
+        return $rc.Tp
+    }
     $signer = Get-First -Items @(Get-ChildItem Cert:\LocalMachine\My,Cert:\CurrentUser\My -ErrorAction SilentlyContinue | Where-Object { $_.Thumbprint -eq $script:SignerTp -and $_.HasPrivateKey })
     if(-not $signer){ throw "signer $($script:SignerTp) not found in cert store" }
     $cn = if($isMs){
@@ -2757,7 +3040,6 @@ function New-ClusterCertificate { param([string]$Key,[object[]]$Nodes)
     $pfxPw = [securestring]::new(); foreach($ch in ([guid]::NewGuid().ToString('N')).ToCharArray()){ $pfxPw.AppendChar($ch) }; $pfxPw.MakeReadOnly()
     $pkg = New-RecorderCertificatePackage -HostName $cn -DomainSuffix $script:DomainName -Signer $signer -PfxPassword $pfxPw -OutputDir $script:OutputDir -ExtraDnsNames $sans.ToArray()
     Write-Log "Cluster certificate for '$($cl.Group)': CN=$($pkg.Fqdn), also valid for: $($sans -join ', ') [tp $($pkg.Thumbprint)]" 'Good'
-    $dn = if($isMs){ $script:MsSvcDisplay } else { $script:EsSvcDisplay }
     foreach($n in @($Nodes)){
         Write-Log "[$($n.Name)] installing the cluster certificate (and trusting the signing CA)..."
         $nAddr = Get-VerifiedNodeAddr $n   # identity-checked right before the import
@@ -3089,7 +3371,7 @@ function Invoke-ClusterNodeStep { param([string]$Key,$Box,[bool]$Want,[string]$T
     if(-not $mv.Ok){
         $out.Why = "The cluster role could not be moved to $($Box.Name), so nothing was changed on that node."; $out.Tech = $mv.Detail
         Add-GuidedRow $Box $act $false 'the cluster role could not be moved here - nothing changed' $mv.Detail; return $out }
-    $r = $null
+    $r = $null; $gwOld = ''
     $sus = Invoke-ClusterOp $Key 'suspend'
     try {
         if(-not $sus.Ok){ throw "Not every cluster node could be paused, so ServerConfigurator was NOT run on $($Box.Name). $($sus.Detail)" }
@@ -3099,6 +3381,7 @@ function Invoke-ClusterNodeStep { param([string]$Key,$Box,[bool]$Want,[string]$T
             Set-StageStatus 'MS' "$($Box.Name): making sure the Management Server service is stopped..." 'Work'
             if(Test-NodeIsLocal $Box.Target){ [void](Wait-MsIdpReady -MsFqdn $Box.Addr) }
             else { [void](Wait-NodeMsSettled -Box $Box -WantRunning $false) }
+            $gwOld = Set-GatewayStopLimit $Box $script:GatewayStopLimit
         }
         Set-StageStatus $Key "$($Box.Name): ServerConfigurator is running (turn encryption $($act.ToUpper()))..." 'Work'
         $r = Invoke-NodeSc -Key $Key -Box $Box -Want $Want -Thumbprint $Thumbprint
@@ -3107,6 +3390,7 @@ function Invoke-ClusterNodeStep { param([string]$Key,$Box,[bool]$Want,[string]$T
         if($isMs -and ($r.Ok -or @(@($r.Logs) | Where-Object { [string]$_ -match 'Registration done with result = Success' }).Count)){ Set-MsRegistered ([string]$Box.Target) }
     } catch { $out.Why = Get-PlainReason (Format-Err $_); $out.Tech = Format-Err $_ }
     finally {
+        if($gwOld){ [void](Set-GatewayStopLimit $Box $gwOld -Restore) }
         $rs = Invoke-ClusterOp $Key 'resume'
         $resumeFail = ''
         if(-not $rs.Ok){
@@ -3271,6 +3555,7 @@ function Get-MilestoneAdminProblem {
         foreach($r in $roles){ foreach($m in @(Get-VmsRoleMember -Role $r -ErrorAction Stop)){ if($m.PSObject.Properties['Sid'] -and $m.Sid){ $memSids += [string]$m.Sid } } }
     } catch { Write-Log "Milestone Administrators role: members could not be read ($(Get-FirstLine $_.Exception.Message)) - not checked." 'Err'; return '' }
     finally { Disconnect-ManagementServer -ErrorAction SilentlyContinue }
+    $script:AdminRoleSids = @($memSids)   # Get-RecAccountProblem checks the recording-server account against the same list
     if(-not $memSids.Count){ Write-Log 'Milestone Administrators role: no members could be read - not checked.' 'Err'; return '' }
     if(@($sids | Where-Object { $memSids -contains $_ }).Count){ Write-Log "Milestone Administrators role: $user is a member (directly or through a group)." 'Good'; return '' }
     if($memSids -contains 'S-1-5-32-544'){
@@ -3280,6 +3565,44 @@ function Get-MilestoneAdminProblem {
         } catch { Write-Log "Milestone Administrators role: the local Administrators group could not be read - not checked." 'Err'; return '' }
     }
     "The admin account $user is not in the Milestone Administrators role. ServerConfigurator would stop with 'not authorized' on the first server. Add the account (or a group it is in) in Management Client > Security > Roles > Administrators, then try again."
+}
+
+# Recording servers outside the domain: ServerConfigurator on a recorder logs on to the Management Server as
+# the recording-server account (NTLM). The MS accepts that account only as a local account of the same name
+# (and password) on the MS node, or as a domain account of that name - and only when it is in the Milestone
+# Administrators role, directly or through the local Administrators group the role holds. Checked on THIS
+# node against the role members Get-MilestoneAdminProblem read ($script:AdminRoleSids). '' = OK / not checked.
+$script:AdminRoleSids = @()
+function Get-RecAccountProblem {
+    if(-not $script:RecCred -or [string]$script:RecCred.UserName -eq [string]$script:AdminCred.UserName){ return '' }
+    $n = ([string]$script:RecCred.UserName -split '\\')[-1]
+    if($n -match '@'){ return '' }
+    if(-not @($script:AdminRoleSids).Count){ Write-Log "Recording-server account ${n}: not checked against the Milestone Administrators role (its members could not be read)." 'Err'; return '' }
+    $dom = if([string]$script:AdminCred.UserName -match '^([^\\]+)\\'){ $Matches[1] } else { '' }
+    $local = $null; $sids = @()
+    foreach($acct in @("$env:COMPUTERNAME\$n", $(if($dom -and $dom -ne '.'){ "$dom\$n" }))){
+        if(-not $acct){ continue }
+        try { $s = (New-Object Security.Principal.NTAccount($acct)).Translate([Security.Principal.SecurityIdentifier]).Value; $sids += $s; if($acct -like "$env:COMPUTERNAME\*"){ $local = $s } } catch {}
+    }
+    if(@($sids | Where-Object { $script:AdminRoleSids -contains $_ }).Count){ Write-Log "Recording-server account ${n}: in the Milestone Administrators role." 'Good'; return '' }
+    if($local -and $script:AdminRoleSids -contains 'S-1-5-32-544'){
+        try { if(@(Get-LocalGroupMember -SID 'S-1-5-32-544' -ErrorAction Stop | Where-Object { [string]$_.SID.Value -eq $local }).Count){ Write-Log "Recording-server account ${n}: in the Milestone Administrators role through the local Administrators group of $env:COMPUTERNAME." 'Good'; return '' } }
+        catch { Write-Log "Recording-server account ${n}: not checked (the local Administrators group could not be read: $(Get-FirstLine $_.Exception.Message))." 'Err'; return '' }
+    }
+    $have = if($local){ "$env:COMPUTERNAME\$n exists but is not in the role" } else { "there is no account '$n' on $env:COMPUTERNAME$(if($dom){" or in the domain $dom"})" }
+    # The local Administrators group only helps when the role holds it (lab 2026-10-31: it did not).
+    $fix = if($script:AdminRoleSids -contains 'S-1-5-32-544'){ "add it to the local Administrators group of that node (the Milestone Administrators role holds that group) or to Management Client > Security > Roles > Administrators" } else { "add it to Management Client > Security > Roles > Administrators (that role does not hold the local Administrators group here, so that group does not help) - the account of each node is a separate entry there" }
+    "The recording servers' account '$n' would be refused by the Management Server ($have). Recording servers outside the domain log on to the Management Server with it when their encryption changes, and ServerConfigurator would stop with 'not authorized'. On every Management Server node create a local account '$n' with the same password as on the recording servers, $fix, then try again."
+}
+# A recording server that cannot be reached with a LOCAL recording-server account: the two causes the lab
+# showed (2026-10-31), as one sentence the operator can act on. '' = no hint (domain account / other error).
+function Get-RecConnectHint { param([string]$Detail)
+    $u = if($script:RecCred){ [string]$script:RecCred.UserName } else { '' }
+    if(-not $u -or $u -match '@' -or ($u -match '^([^\\]+)\\' -and $Matches[1] -ne '.')){ return '' }
+    $n = ($u -split '\\')[-1]
+    if($Detail -match 'Access is denied'){ return "If '$n' is a local administrator other than the built-in Administrator, Windows removes its administrator rights over the network (remote UAC). On that computer run as administrator: reg add HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System /v LocalAccountTokenFilterPolicy /t REG_DWORD /d 1 /f (and Enable-PSRemoting -Force if remote management is off), then check again." }
+    if($Detail -match 'user name or password is incorrect|logon failure'){ return "Check that the account '$n' exists on that computer with the same password as on the other recording servers." }
+    ''
 }
 
 # -- pre-flight: before ANY change. Returns plain-language problems; empty = OK to go. -------------
@@ -3311,7 +3634,9 @@ function Get-PreFlightProblems { param([ValidateSet('on','off','register','rollb
         # need the Management Server itself to be running.
         if($Mode -ne 'register' -and $Mode -ne 'rollback'){ $h = Get-ClusterHealthProblem $cl; if($h){ $p.Add($h) } }
     }
-    if($Mode -ne 'register'){ $a = Get-MilestoneAdminProblem; if($a){ $p.Add($a) } }
+    if($Mode -ne 'register'){ $script:AdminRoleSids = @(); $a = Get-MilestoneAdminProblem; if($a){ $p.Add($a) } }
+    if($Want -and $Mode -ne 'register' -and @($script:RecBoxes | Where-Object { -not $_.Excluded -and (Test-InScope $_) -and $_.Encrypted -ne $true }).Count){
+        $ra = Get-RecAccountProblem; if($ra){ $p.Add($ra) } }
     # Register touches THIS node only (a peer may be Paused or Down); every other mode checks all boxes.
     $boxes = @(if($Mode -eq 'register'){ @(Get-MsBoxes | Where-Object { -not $_.IsNode -or (Test-NodeIsLocal ([string]$_.Target)) }) } else { @(Get-MsBoxes) })
     if($Mode -ne 'register'){ $boxes += @(Get-EsBoxes); $boxes += @($script:RecBoxes | Where-Object { -not $_.Excluded -and (Test-InScope $_) }) }
@@ -3340,7 +3665,13 @@ function Get-PreFlightProblems { param([ValidateSet('on','off','register','rollb
     foreach($x in @($script:RegFindings)){ $p.Add((Get-RegFindingText $x)) }
     if($Want -and $Mode -ne 'register'){
         $needs = @($boxes | Where-Object { (Test-InScope $_) -and $_.Encrypted -ne $true })
-        if($needs.Count){
+        if($script:CertFilesOn){
+            # Prepared certificate files: every computer that needs a certificate gets its file (one per MS / ES
+            # role, one per recorder) - no signing CA. The files are matched and checked here.
+            $roles = @(@('MS','ES') | Where-Object { $k = $_; @($needs | Where-Object { (Get-BoxKind $_) -eq $k }).Count })
+            $recTodo = @($needs | Where-Object { (Get-BoxKind $_) -eq 'REC' -and $_.Reachable })
+            if($roles.Count -or $recTodo.Count){ foreach($m in @(Get-CertFileProblems -Boxes $recTodo -Roles $roles)){ $p.Add($m) } }
+        } elseif($needs.Count){
             $script:SignerStoreRadio.Checked = $true
             try {
                 $signer = Resolve-Signer; Write-Log "Signer: $($signer.Subject) [$($signer.Thumbprint)]"
@@ -3598,6 +3929,7 @@ function Read-Inputs {
     $mf=[string]$script:Defaults.MsFqdn
     $script:MsFqdn = if($mf -and $mf -notmatch '<[^>]+>'){ $mf.Trim().ToLowerInvariant() } else { (Get-RecorderFqdn -HostName $env:COMPUTERNAME -DomainSuffix $script:DomainName).ToLowerInvariant() }
     [void](ConvertTo-SanList $script:MsExtraSans)   # validate early: an invalid SAN would only fail mid-run
+    if($script:CertFilesOn -and -not ($script:CertFilesDir -and (Test-Path -LiteralPath $script:CertFilesDir -PathType Container))){ throw "The folder with the certificate files was not found: '$($script:CertFilesDir)'. Click 'Certificate files...' and pick it." }
 }
 # Build the box list: this Management Server, the Event Server (unless none), and the recorders
 # (discovered from the VMS and/or listed by hand; 'name=address' allowed). Returns the discovery
@@ -3785,6 +4117,7 @@ function Invoke-EsStage { param([bool]$Want)
     $esConn = try { Get-ConnAddr $es.Addr $es.Cred } catch { $es.Addr }
     $P=@{ Target=$es.Target; Fqdn=$esConn; Cred=$es.Cred; SignerTp=$script:SignerTp; CaCer=$script:CaCer; Domain=$script:DomainName; OutputDir=$script:OutputDir
           Guid=$script:CertGroupEvent; GroupName='Event Server'; Action=$(if($Want){'enable'}else{'disable'}); ExtraSans=''; ScPaths=$script:ScSearchPaths }
+    Set-RoleCertParams $P 'ES'
     $r = & $script:EsHostWorker $P
     Add-RunResult $r
     foreach($l in $r.Logs){ Write-Log "[$($r.Target)] $l" }
@@ -3828,7 +4161,10 @@ function Invoke-MsStage { param([bool]$Want)
     $P=@{ Target=$env:COMPUTERNAME; Fqdn=$script:MsFqdn; Cred=$script:AdminCred; SignerTp=$script:SignerTp; CaCer=$script:CaCer; Domain=$script:DomainName; OutputDir=$script:OutputDir
           Guids=$script:CertGroupServer; Names='Server (mgmt+recorder)'; Action=$(if($Want){'enable'}else{'disable'}); BindExpected=$true; GroupCount=1
           ExtraSans=$script:MsExtraSans; ScPaths=$script:ScSearchPaths }
-    $r = & $script:HostWorker $P
+    Set-RoleCertParams $P 'MS'
+    $gwOld = Set-GatewayStopLimit $ms $script:GatewayStopLimit
+    try { $r = & $script:HostWorker $P }
+    finally { if($gwOld){ [void](Set-GatewayStopLimit $ms $gwOld -Restore) } }
     Add-RunResult $r
     foreach($l in $r.Logs){ Write-Log "[$($r.Target)] $l" }
     Write-Log "[$($r.Target)] $(if($r.Ok){'OK'}else{'FAILED'}): $($r.Status)" $(if($r.Ok){'Good'}else{'Err'})
@@ -3878,7 +4214,17 @@ function Invoke-RecStage { param([bool]$Want)
     if($ips.Count){ Ensure-TrustedHosts -Hosts $ips }
     Set-StageStatus 'REC' "Working on $($todo.Count) recording server(s)..." 'Work'
     $common=@{ Cred=$script:RecCred; SignerTp=$script:SignerTp; CaCer=$script:CaCer; Domain=$script:DomainName; OutputDir=$script:OutputDir
-               Guids=$script:CertGroupServer; Names='Server (recorder)'; ScPaths=$script:ScSearchPaths }
+               Guids=$script:CertGroupServer; Names='Server (recorder)'; ScPaths=$script:ScSearchPaths
+               CertFiles=$(if($Want -and $script:CertFilesOn){ $script:RecCertMap }else{ $null }); CertPw=$script:CertFilesPw; RootCer=$script:CertRootCer }
+    if($common.CertFiles){
+        # Every recorder to change was matched to its file in the pre-flight check; a gap here is refused.
+        $nofile=@($todo | Where-Object { -not $common.CertFiles.ContainsKey(([string]$_.Target).ToUpperInvariant()) })
+        if($nofile.Count){
+            $why="No checked certificate file for: $((@($nofile | ForEach-Object { $_.Name })) -join ', '). Nothing was changed on the recording servers."
+            Set-StageStatus 'REC' 'FAILED - certificate file missing' 'Bad'
+            foreach($b in $todo){ Add-GuidedRow $b $act $false 'certificate file missing' $why }
+            Set-RunFailure 'Recording servers' "$($nofile.Count) computer(s)" $why '' 'Click Check again, then run the same action again.'; return $false }
+    }
     # Order check again, right before the batch starts (the MS role may have moved or changed meanwhile).
     $gb2 = Get-MsGateBox
     if($gb2.Encrypted -ne $Want){
@@ -3914,6 +4260,7 @@ function Invoke-StageSequence { param([string[]]$Keys,[bool]$Want)
 }
 function Reset-RunState {
     $script:RunFailure=$null; $script:SignerTp=''; $script:CaCer=''; $script:RunStart=Get-Date; $script:LastReportPath=''
+    $script:RecCertMap=@{}; $script:RoleCertMap=@{}; $script:CertRootCer=''
     $script:FailoverResults=@(); $script:Scope=$null; $script:FinalOwners=@{}
     $script:MsTouched=$false; $script:MsLive=$null; $script:PausedByRun=@{}; $script:PausedBeforeNote=''
 }
@@ -3990,6 +4337,7 @@ function Invoke-GuidedRunCore { param([ValidateSet('on','off')][string]$Act)
         foreach($b in @($script:RecBoxes | Where-Object { -not $_.Reachable })){
             $b.Excluded=$true
             Write-Log "[$($b.Name)] cannot be reached - it will be left as it is" 'Err'
+            $h = Get-RecConnectHint $b.Detail; if($h){ Write-Log "[$($b.Name)] $h" 'Err' }
             Add-GuidedRow $b $Act $false 'not reachable - left as it is' $b.Detail
         }
         # No state file = no rollback: then nothing may be changed (counts as a failed pre-flight check).
@@ -4267,9 +4615,61 @@ function Update-CaStatus {
     if(-not $s -or $s -match '<[^>]+>'){ $script:CaStatus.Text='Type the name (subject) of your signing CA, for example: CN=Company VMS CA'; $script:CaStatus.ForeColor=[Drawing.Color]::DarkRed; return $null }
     try { $ca=@(Find-ExistingCa $s) } catch { $script:CaStatus.Text="Not a valid CA name: $($_.Exception.Message)"; $script:CaStatus.ForeColor=[Drawing.Color]::DarkRed; return $null }
     if($ca.Count){ $script:CaStatus.Text="Found on this computer: $($ca[0].Subject)  (valid until $($ca[0].NotAfter.ToString('yyyy-MM-dd')))"; $script:CaStatus.ForeColor=[Drawing.Color]::DarkGreen; return $ca[0] }
-    $script:CaStatus.Text="Not found on this computer. It is needed only to turn encryption ON. If encryption was never set up, click 'Create signing CA'."
+    $script:CaStatus.Text=$(if($script:CertFilesOn){ "Not needed: the servers get their certificate files (Certificate files... below)." } else { "Not found on this computer. It is needed only to turn encryption ON. If encryption was never set up, click 'Create signing CA'." })
     $script:CaStatus.ForeColor=[Drawing.Color]::DarkOrange
     $null
+}
+# 'Certificate files...' on the Connect page: prepared certificates (your own CA) instead of signing new ones.
+function Update-CertFilesStatus {
+    if(-not (Test-Path variable:script:CertFilesStatus)){ return }
+    if(-not $script:CertFilesOn){ $script:CertFilesStatus.Text='New certificates, signed by the signing CA above.'; $script:CertFilesStatus.ForeColor=[Drawing.Color]::Black; return }
+    $n=@(Get-ChildItem -LiteralPath $script:CertFilesDir -File -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in '.p12','.pfx' }).Count
+    $script:CertFilesStatus.Text="From $n file(s) in $($script:CertFilesDir)$(if($script:CertRootCa){', root CA ' + [IO.Path]::GetFileName($script:CertRootCa)}else{' (no root CA file)'})"
+    $script:CertFilesStatus.ForeColor=$(if($n){[Drawing.Color]::DarkGreen}else{[Drawing.Color]::DarkRed})
+}
+function Show-CertFilesDialog {
+    $dlg=[Windows.Forms.Form]::new(); $dlg.Text='Certificate files'; $dlg.Size=[Drawing.Size]::new(690,410); $dlg.StartPosition='CenterParent'; $dlg.FormBorderStyle='FixedDialog'; $dlg.MaximizeBox=$false; $dlg.MinimizeBox=$false
+    $lbl={ param([string]$T,[int]$Y,[int]$H) $x=[Windows.Forms.Label]::new(); $x.Text=$T; $x.Location=[Drawing.Point]::new(12,$Y); $x.Size=[Drawing.Size]::new(650,$H); $dlg.Controls.Add($x) }
+    $box={ param([int]$Y,[int]$W,[string]$T) $x=[Windows.Forms.TextBox]::new(); $x.Location=[Drawing.Point]::new(12,$Y); $x.Size=[Drawing.Size]::new($W,24); $x.Text=$T; $dlg.Controls.Add($x); $x }
+    $btn={ param([string]$T,[int]$X,[int]$Y) $x=[Windows.Forms.Button]::new(); $x.Text=$T; $x.Location=[Drawing.Point]::new($X,$Y); $x.Size=[Drawing.Size]::new(95,30); $dlg.Controls.Add($x); $x }
+    $script:RcUse=[Windows.Forms.CheckBox]::new(); $script:RcUse.Text='Use prepared certificate files from your own CA (no signing CA, no new certificates)'
+    $script:RcUse.Location=[Drawing.Point]::new(12,12); $script:RcUse.Size=[Drawing.Size]::new(650,24); $script:RcUse.Checked=$script:CertFilesOn; $dlg.Controls.Add($script:RcUse)
+    & $lbl 'Folder with one .p12 (or .pfx) per certificate: one per recording server (rec01.company.local.p12), one for the Management Server and one for the Event Server, each named after the address it is registered under (a cluster: the cluster address):' 40 42
+    $script:RcFolder = & $box 84 545 $script:CertFilesDir
+    $script:RcFolderBtn = & $btn 'Browse...' 567 81
+    & $lbl 'Password of the certificate files (the same for all files):' 122 22
+    $script:RcPw = & $box 146 300 $(if($script:CertFilesPw){ [System.Net.NetworkCredential]::new('',$script:CertFilesPw).Password }else{ '' }); $script:RcPw.UseSystemPasswordChar=$true
+    & $lbl 'Root CA certificate to add to the trusted roots of every server that gets a file (optional, .cer / .crt) - for computers that do not trust your CA yet:' 184 36
+    $script:RcRoot = & $box 222 545 $script:CertRootCa
+    $script:RcRootBtn = & $btn 'Browse...' 567 219
+    & $lbl 'A clustered role uses ONE file on all its nodes; it must name the cluster address and every node. Every file is checked before anything is changed; the pre-flight check names any file that is missing.' 262 40
+    $ok = & $btn 'OK' 462 322; $cn = & $btn 'Cancel' 567 322; $cn.DialogResult='Cancel'; $dlg.CancelButton=$cn
+    $sync={ foreach($c in @($script:RcFolder,$script:RcFolderBtn,$script:RcPw,$script:RcRoot,$script:RcRootBtn)){ $c.Enabled=$script:RcUse.Checked } }
+    & $sync; $script:RcUse.Add_CheckedChanged($sync)
+    $script:RcFolderBtn.Add_Click({
+        $fd=[Windows.Forms.FolderBrowserDialog]::new(); $fd.Description='Folder with the certificate files (.p12 / .pfx)'
+        if($script:RcFolder.Text -and (Test-Path -LiteralPath $script:RcFolder.Text)){ $fd.SelectedPath=$script:RcFolder.Text }
+        if($fd.ShowDialog() -eq 'OK'){ $script:RcFolder.Text=$fd.SelectedPath }; $fd.Dispose() })
+    $script:RcRootBtn.Add_Click({
+        $od=[Windows.Forms.OpenFileDialog]::new(); $od.Title='Root CA certificate'; $od.Filter='Certificate (*.cer;*.crt;*.der;*.pem)|*.cer;*.crt;*.der;*.pem|All files (*.*)|*.*'
+        if($od.ShowDialog() -eq 'OK'){ $script:RcRoot.Text=$od.FileName }; $od.Dispose() })
+    $ok.Add_Click({
+        $msg=''
+        if($script:RcUse.Checked){
+            $f=$script:RcFolder.Text.Trim().Trim('"'); $r=$script:RcRoot.Text.Trim().Trim('"')
+            if(-not $f -or -not (Test-Path -LiteralPath $f -PathType Container)){ $msg="The folder was not found: '$f'." }
+            elseif(-not @(Get-ChildItem -LiteralPath $f -File -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in '.p12','.pfx' }).Count){ $msg="There are no .p12 or .pfx files in $f." }
+            elseif($r){ try { [void](Read-RootCaFile $r) } catch { $msg=$_.Exception.Message } }
+        }
+        if($msg){ [Windows.Forms.MessageBox]::Show($msg,'Recording server certificates',0,'Warning')|Out-Null; return }
+        $this.FindForm().DialogResult='OK' })
+    if($dlg.ShowDialog($script:Form) -eq 'OK'){
+        $script:CertFilesOn=$script:RcUse.Checked
+        $script:CertFilesDir=$script:RcFolder.Text.Trim().Trim('"'); $script:CertRootCa=$script:RcRoot.Text.Trim().Trim('"'); $script:CertFilesPw=Get-SecurePw $script:RcPw.Text
+        Write-Log "Recording server certificates: $(if($script:CertFilesOn){"prepared files in $($script:CertFilesDir)$(if($script:CertRootCa){", root CA $($script:CertRootCa)"})"}else{'signed by the signing CA'})"
+        Update-CertFilesStatus; [void](Update-CaStatus)
+    }
+    $dlg.Dispose()
 }
 # Adapted from the role GUIs' 'Create root CA' button (same duplicate-name guard, same New-RootCa).
 function New-SigningCaInteractive {
@@ -4360,6 +4760,7 @@ function Get-ConfirmText { param([string]$Act)
          ' - Every computer is checked first. If something is wrong, nothing is changed and you get a list of what to fix.',
          " - The steps run in this order: $order. Computers that are already $wt are skipped.")
     $l += @(Get-ClusterConfirmLines)
+    if($want -and $script:CertFilesOn){ $l += " - Every server gets its certificate file from $($script:CertFilesDir) (no signing CA, no new certificates)$(if($script:CertRootCa){', and the root CA ' + [IO.Path]::GetFileName($script:CertRootCa) + ' is added to their trusted roots'})." }
     if(-not (Test-HasPsTools)){ $l += $script:PsToolsConfirmLine }
     if($script:MsCluster){ $l += " - Known Milestone limitation: after the Management Server is changed, only the node that was configured last ($($script:MsCluster.Owner)) can run it. The other Management Server node(s) need 'Re-register this node' after a failover. The result page explains it." }
     if($script:TestFailoverOn -and ($script:MsCluster -or $script:EsCluster)){ $l += ' - Failover test afterwards: each cluster role is moved to every other node and back, to see whether each node can take over. This adds several minutes of interruption.' }
@@ -4394,7 +4795,8 @@ function Start-GuidedAction { param([ValidateSet('on','off')][string]$Act)
         Update-RecorderStates @($script:RecBoxes)
         $un=@($script:RecBoxes | Where-Object { -not $_.Reachable })
         if($un.Count){
-            $q2="These recording servers cannot be reached:`r`n$((@($un | ForEach-Object { ' - ' + $_.Name }) -join "`r`n"))`r`n`r`nThey will be left as they are, and the result will show 'not complete'. Continue anyway?"
+            $ul=@(); foreach($x in $un){ $h=Get-RecConnectHint $x.Detail; $ul += ' - ' + $x.Name + $(if($h){": $h"}else{''}) }
+            $q2="These recording servers cannot be reached:`r`n$($ul -join "`r`n")`r`n`r`nThey will be left as they are, and the result will show 'not complete'. Continue anyway?"
             if([Windows.Forms.MessageBox]::Show($q2,'Some computers cannot be reached',4,'Warning',[Windows.Forms.MessageBoxDefaultButton]::Button2) -ne 'Yes'){ return }
         }
         $script:BusyLabel.Visible=$true; [Windows.Forms.Application]::DoEvents()
@@ -4424,7 +4826,12 @@ function Get-RollbackCommand {
     if(-not $script:LastSnapshotPath){ return '' }
     $u = if($script:AdminCred){ [string]$script:AdminCred.UserName } else { '<DOMAIN>\<admin>' }
     $rec = if($script:RecSepChk -and $script:RecSepChk.Checked -and $script:RecCred){ " -RecUser '$($script:RecCred.UserName)' -RecPwFile <file-with-the-recording-server-password>" } else { '' }
-    "powershell -ExecutionPolicy Bypass -File `"$($script:SelfPath)`" -Action rollback -Snapshot `"$($script:LastSnapshotPath)`" -AdminUser '$u' -AdminPwFile <file-with-the-admin-password>$rec"
+    $cert = ''
+    if($script:CertFilesOn){
+        $cert = ' -CertFolder "' + $script:CertFilesDir + '" -CertPwFile <file-with-the-certificate-password>'
+        if($script:CertRootCa){ $cert += ' -RootCaFile "' + $script:CertRootCa + '"' }
+    }
+    "powershell -ExecutionPolicy Bypass -File `"$($script:SelfPath)`" -Action rollback -Snapshot `"$($script:LastSnapshotPath)`" -AdminUser '$u' -AdminPwFile <file-with-the-admin-password>$rec$cert"
 }
 # Window closed while a change runs: resume paused nodes (best effort), then say how to roll back.
 function Invoke-CloseCleanup {
@@ -4584,10 +4991,13 @@ $recLbl=New-UiLabel 'Extra recording servers (optional, one per line):' 24 466 2
 $script:ManualRecBox=[Windows.Forms.TextBox]::new(); $script:ManualRecBox.Multiline=$true; $script:ManualRecBox.ScrollBars='Vertical'
 $script:ManualRecBox.Location=[Drawing.Point]::new(320,466); $script:ManualRecBox.Size=[Drawing.Size]::new(320,60); $p1.Controls.Add($script:ManualRecBox)
 $recHint=New-UiLabel 'Recording servers are found automatically. Add them here only if they are missing.' 656 466 320 60; $recHint.TextAlign='TopLeft'; $p1.Controls.Add($recHint)
-$script:ConnectStatus=New-UiLabel '' 24 540 570 30; $script:ConnectStatus.Font=$script:UiBold; $script:ConnectStatus.ForeColor=[Drawing.Color]::DarkOrange; $p1.Controls.Add($script:ConnectStatus)
+$p1.Controls.Add((New-UiLabel 'Recording server certificates:' 24 534))
+$script:CertFilesBtn=New-UiButton 'Certificate files...' 320 530 320 34; $p1.Controls.Add($script:CertFilesBtn); $script:CertFilesBtn.Add_Click({ Show-CertFilesDialog })
+$script:CertFilesStatus=New-UiLabel '' 656 528 320 44; $script:CertFilesStatus.TextAlign='TopLeft'; $p1.Controls.Add($script:CertFilesStatus)
+$script:ConnectStatus=New-UiLabel '' 24 580 570 30; $script:ConnectStatus.Font=$script:UiBold; $script:ConnectStatus.ForeColor=[Drawing.Color]::DarkOrange; $p1.Controls.Add($script:ConnectStatus)
 # Milestone installed outside C:\Program Files: folders to search for ServerConfigurator.exe (on every server)
 # and MilestonePSTools (on this computer). One folder per line.
-$searchBtn=New-UiButton 'Search folders...' 604 536 180 34; $p1.Controls.Add($searchBtn)
+$searchBtn=New-UiButton 'Search folders...' 604 576 180 34; $p1.Controls.Add($searchBtn)
 $searchBtn.Add_Click({
     $dlg=[Windows.Forms.Form]::new(); $dlg.Text='Search folders'; $dlg.Size=[Drawing.Size]::new(620,330); $dlg.StartPosition='CenterParent'; $dlg.FormBorderStyle='FixedDialog'; $dlg.MaximizeBox=$false; $dlg.MinimizeBox=$false
     $lb=[Windows.Forms.Label]::new(); $lb.Text="Only needed if Milestone is NOT installed in C:\Program Files\Milestone.`r`nOne folder per line, for example D:\Milestone. The wizard looks there (and below) for`r`nServerConfigurator.exe on every server, and for MilestonePSTools on this computer.`r`nThe Milestone install folder is also found automatically from the Milestone services."; $lb.Location=[Drawing.Point]::new(12,10); $lb.Size=[Drawing.Size]::new(580,70); $dlg.Controls.Add($lb)
@@ -4602,7 +5012,7 @@ $searchBtn.Add_Click({
     }
     $dlg.Dispose()
 })
-$openLogBtn=New-UiButton 'Open log' 794 536 180 34; $p1.Controls.Add($openLogBtn)
+$openLogBtn=New-UiButton 'Open log' 794 576 180 34; $p1.Controls.Add($openLogBtn)
 $openLogBtn.Add_Click({ $lp = Save-UiLog; if($lp){ Start-Process notepad.exe -ArgumentList "`"$lp`"" } else { [Windows.Forms.MessageBox]::Show('The log could not be saved.','Log',0,'Warning')|Out-Null } })
 # Resolve-Signer (verbatim) reads these: store mode only in the wizard; the PFX controls are never shown.
 $script:SignerStoreRadio=[Windows.Forms.RadioButton]::new(); $script:SignerStoreRadio.Checked=$true
@@ -4663,7 +5073,7 @@ $rbHint=New-UiLabel 'Changes back only what the last run changed. Available only
 $script:BackBtn.Add_Click({ if($script:Page -gt 1){ Show-Page ($script:Page - 1) } })
 $script:NextBtn.Add_Click({ switch($script:Page){ 1 { Do-Connect } 2 { Show-Page 3 } 3 { Show-Page 4 } default { $script:Form.Close() } } })
 
-$script:BusyCtrls=@($script:BackBtn,$script:NextBtn,$onBtn,$offBtn,$recheckBtn,$findCaBtn,$createCaBtn,$script:RegBtn,$undoOldBtn,$script:FailoverChk)   # RollbackBtn: Update-RollbackButton decides
+$script:BusyCtrls=@($script:BackBtn,$script:NextBtn,$onBtn,$offBtn,$recheckBtn,$findCaBtn,$createCaBtn,$script:CertFilesBtn,$script:RegBtn,$undoOldBtn,$script:FailoverChk)   # RollbackBtn: Update-RollbackButton decides
 
 # Closing the window in the middle of a change can leave cluster nodes paused or a role elsewhere.
 $script:Form.Add_FormClosing({
@@ -4688,6 +5098,8 @@ $script:MsExtraSans = [string]$ExtraSans
 $script:ScSearchPaths = [string]$SearchPaths
 if($script:ScSearchPaths){ Write-Log "Search folders: $($script:ScSearchPaths)"; Add-SearchPathModules }
 $script:MsAddrValue = [string]$MsAddr
+if($CertFolder){ $script:CertFilesOn=$true; $script:CertFilesDir=[string]$CertFolder; $script:CertRootCa=[string]$RootCaFile; $script:CertFilesPw=Get-SecurePw '' }
+Update-CertFilesStatus
 $script:Page = 1
 Show-Page 1
 Write-Log "Output dir: $script:OutputDir" 'Good'
@@ -4716,6 +5128,11 @@ if($script:Headless){
             if(-not (Test-Path -LiteralPath $RecPwFile)){ Write-Log "REFUSED: -RecPwFile not found: $RecPwFile" 'Err'; exit 3 }
             if([string]::IsNullOrWhiteSpace($RecUser)){ Write-Log 'REFUSED: -RecPwFile given without -RecUser' 'Err'; exit 3 }
             $script:RecSepChk.Checked=$true; $script:RecUserBox.Text=$RecUser; $script:RecPwBox.Text=(Get-Content -Raw -LiteralPath $RecPwFile).Trim()
+        }
+        if($CertPwFile){
+            if(-not $CertFolder){ Write-Log 'REFUSED: -CertPwFile given without -CertFolder' 'Err'; exit 3 }
+            if(-not (Test-Path -LiteralPath $CertPwFile)){ Write-Log "REFUSED: -CertPwFile not found: $CertPwFile" 'Err'; exit 3 }
+            $script:CertFilesPw=Get-SecurePw (([string](Get-Content -Raw -LiteralPath $CertPwFile)).Trim())
         }
         $script:SignerSubjectBox.Text=$RootSubject; $script:RootSubjectForRun=$RootSubject
         try { Read-Inputs } catch { Write-Log "REFUSED: $($_.Exception.Message)" 'Err'; exit 3 }

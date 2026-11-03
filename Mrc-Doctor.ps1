@@ -45,6 +45,11 @@
     SearchPaths / MsAddr when the matching parameter is left at its placeholder or empty.
     Exit codes: 0 = no FAIL (WARN allowed), 1 = at least one FAIL, 2 = error, 3 = refused (not a
     Management Server / not elevated / missing input).
+
+    Install precheck for IT42 Estate Monitor (headless only): add -Gate EstateMonitor to -Run. Findings are
+    then classified Blocking (a FAIL that breaks Estate Monitor on the Management Server or Event Server)
+    or Client (everything else, reported but not blocking); verdict PASS / FAIL / INCOMPLETE; exit codes
+    0 = PASS, 1 = FAIL, 4 = INCOMPLETE (2 error and 3 refused unchanged). Without -Gate nothing changes.
 #>
 [CmdletBinding()]
 param(
@@ -60,6 +65,7 @@ param(
     [string]$SearchPaths = '',                            # ';' list of folders (or exe paths) to search for ServerConfigurator.exe / MilestonePSTools
     [string]$MsAddr = '',                                 # VMS address for recorder discovery (default: this machine)
     [string]$ReportDir = '',                              # headless: where to write the report (default %TEMP%\MilestoneRecorderCertManager-runs)
+    [ValidateSet('','EstateMonitor')][string]$Gate = '',  # headless install gate: classify findings Blocking/Client, verdict PASS/FAIL/INCOMPLETE, exit 0/1/4
     [string]$LogFile                                     # optional: tee the log here
 )
 
@@ -103,6 +109,8 @@ $SearchPaths = Resolve-Default $SearchPaths 'SearchPaths'
 $MsAddr      = Resolve-Default $MsAddr      'MsAddr'
 
 $script:Headless    = [bool]$Run
+$script:GateName    = [string]$Gate
+if ($Gate -and -not $Run) { Write-Warning '-Gate applies to headless -Run only; ignored here.'; $script:GateName = '' }
 $script:LogFilePath = $LogFile
 
 function Stop-DoctorRefused { param([string]$Msg)
@@ -402,6 +410,24 @@ $script:NodeConn     = @{}   # NODE path: upper-case node name -> verified addre
 $script:NodeInfo     = @{}   # upper-case node name -> Name, Fqdn, own Ips, ClusterKey
 $script:ClusterIpSet = @{}   # every cluster / role 'IP Address' resource address (all groups, both clusters)
 function Test-KerberosError { param([string]$Msg) ([string]$Msg) -match '0x80090322|0x8009030e|0x80090311|Kerberos' }
+# Lab 2026-10-31: a LOCAL account sent from this domain computer to a workgroup computer's NAME (not in
+# TrustedHosts) is refused on the Kerberos path with 'user name or password is incorrect'; its IP (NTLM)
+# works. Only for local credentials: a domain account would get a second failed logon at the domain.
+function Test-LocalLogonRefusal { param([string]$Msg,[pscredential]$Cred,[string]$Computer)
+    if(([string]$Msg) -notmatch 'user name or password is incorrect|0x8009030c' -or (Test-IpAddress $Computer)){ return $false }
+    Test-LocalCred $Cred $Computer }
+# A local (non-domain) credential for $Computer: no domain part, '.', or the computer's own short name.
+function Test-LocalCred { param([pscredential]$Cred,[string]$Computer)
+    if(-not $Cred){ return $false }
+    $u=[string]$Cred.UserName
+    if($u -match '@'){ return $false }
+    $d=if($u -match '^([^\\]+)\\'){ $Matches[1] } else { '' }
+    (-not $d) -or $d -eq '.' -or $d -ieq (([string]$Computer -split '\.')[0]) }
+# COMPUTERNAME (NetBIOS, at most 15 characters) vs a typed name or FQDN: same short name.
+function Test-SameHostName { param([string]$Answer,[string]$Name)
+    $s=(([string]$Name).Trim() -split '\.')[0]
+    if(-not $Answer -or -not $s){ return $false }
+    ($Answer -ieq $s) -or ($s.Length -gt 15 -and $Answer -ieq $s.Substring(0,15)) }
 function Get-IdentityErrorText { param([string]$Actual,[string]$Node) "Connected to $Actual instead of cluster node $Node; nothing was changed on $Node." }
 function Test-IdentityError { param([string]$Msg) ([string]$Msg) -match 'instead of cluster node' }
 function Get-IdentityMessage { param([string]$Msg) if(([string]$Msg) -match '(Connected to \S+ instead of cluster node \S+; nothing was changed on [^.\s]+\.)'){ $Matches[1] } else { [string]$Msg } }
@@ -437,7 +463,7 @@ function Invoke-GuardedOnAddress { param([string]$Address,[pscredential]$Cred,[s
 }
 
 # ---- HOST path ----
-function Find-IpConnection { param([string]$Computer,[pscredential]$Cred,[string]$Why)
+function Find-IpConnection { param([string]$Computer,[pscredential]$Cred,[string]$Why,[switch]$SameName)
     $k=([string]$Computer).Trim().ToLowerInvariant()
     $isKnownClusterName = [bool]($script:EsCluster -and (@($script:EsCluster.NetName,$script:EsCluster.Address) | Where-Object { $_ } | ForEach-Object { ([string]$_).ToLowerInvariant() } | Where-Object { $_ -eq $k }))
     foreach($ip in @(Resolve-HostIPv4 $Computer)){
@@ -445,6 +471,12 @@ function Find-IpConnection { param([string]$Computer,[pscredential]$Cred,[string
         Ensure-TrustedHosts -Hosts @($ip)
         try {
             $cn = Get-AnsweringComputer $ip $Cred
+            # -SameName (local account): the address must answer as the computer asked for - recorders may all
+            # share that account, so stale DNS must not lead to another one. A cluster name: one of its nodes.
+            if($SameName){
+                $okName = if($isKnownClusterName){ @($script:EsCluster.Nodes | ForEach-Object { [string]$_.Name }) -icontains $cn } else { Test-SameHostName $cn $Computer }
+                if(-not $okName){ Write-Log "[$Computer] address ${ip} answers as $cn, not as $Computer$(if($isKnownClusterName){' or one of its cluster nodes'}) - not used." 'Err'; continue }
+            }
             $script:ConnCache[$k]=$ip
             $because = if($isKnownClusterName){ "because the name belongs to a cluster ($Why)" } else { "because Kerberos could not be used for the name ($Why)" }
             Write-Log "[$Computer] connected by IP address $ip (answers as $cn) $because." 'Good'
@@ -460,8 +492,8 @@ function Get-ConnAddr { param([string]$Computer,[pscredential]$Cred)
     try { [void](Invoke-OnBoxRaw -Computer $Computer -Cred $Cred -Sb { 1 }); $script:ConnCache[$k]=$Computer; return $Computer }
     catch {
         $m=$_.Exception.Message
-        if(-not (Test-KerberosError $m)){ throw }
-        $ip = Find-IpConnection $Computer $Cred (Get-FirstLine $m)
+        if(-not (Test-KerberosError $m) -and -not (Test-LocalLogonRefusal $m $Cred $Computer)){ throw }
+        $ip = Find-IpConnection $Computer $Cred (Get-FirstLine $m) -SameName:(Test-LocalCred $Cred $Computer)
         if($ip){ return $ip }
         throw
     }
@@ -475,7 +507,7 @@ function Invoke-OnBox { param([string]$Computer,[pscredential]$Cred,[scriptblock
         # A name that worked before can stop working when a cluster role moves: fall back once.
         if($conn -ne $Computer -or -not (Test-KerberosError $_.Exception.Message)){ throw }
         $k=([string]$Computer).Trim().ToLowerInvariant(); [void]$script:ConnCache.Remove($k)
-        $ip = Find-IpConnection $Computer $Cred (Get-FirstLine $_.Exception.Message)
+        $ip = Find-IpConnection $Computer $Cred (Get-FirstLine $_.Exception.Message) -SameName:(Test-LocalCred $Cred $Computer)
         if(-not $ip){ throw }
         Invoke-OnBoxRaw -Computer $ip -Cred $Cred -Sb $Sb -ArgumentList $ArgumentList
     }
@@ -1497,6 +1529,76 @@ function Get-ClusterFacts { param([string]$Key)
     }
 }
 
+# ---- REG-3 collect: IDP token + GET /API/rest/v1/alarms through the API Gateway (read-only, from THIS computer) ----
+# One HTTP call. Never throws. Status 0 = no HTTP answer (Error says why; Tls=$true when the TLS handshake or
+# certificate was the problem). Certificate validation is NOT relaxed: a self-signed MS certificate is a TLS
+# error here and becomes "could not check", never a gateway verdict.
+function Invoke-GatewayHttp { param([string]$Method,[string]$Url,[string]$Body='',[string]$Bearer='',$Credential=$null,[int]$TimeoutSec=20)
+    $res = [pscustomobject]@{ Status=0; Body=''; Error=''; Tls=$false }
+    $resp = $null
+    try {
+        $req = [System.Net.HttpWebRequest][System.Net.WebRequest]::Create($Url)
+        $req.Method = $Method; $req.Timeout = $TimeoutSec * 1000; $req.ReadWriteTimeout = $TimeoutSec * 1000
+        $req.AllowAutoRedirect = $false; $req.UserAgent = 'Mrc-Doctor'
+        if ($Bearer) { $req.Headers.Add('Authorization', "Bearer $Bearer") }
+        if ($Credential) { $req.Credentials = $Credential; $req.PreAuthenticate = $false }
+        if ($Method -eq 'POST') {
+            $bytes = [Text.Encoding]::ASCII.GetBytes($Body)
+            $req.ContentType = 'application/x-www-form-urlencoded'; $req.ContentLength = $bytes.Length
+            $st = $req.GetRequestStream()
+            try { $st.Write($bytes, 0, $bytes.Length) } finally { $st.Dispose() }
+        }
+        $resp = $req.GetResponse()
+    } catch [System.Net.WebException] {
+        $we = $_.Exception
+        if ($we.Response) { $resp = $we.Response }
+        else {
+            $res.Error = (Get-FirstLine $we.Message)
+            $res.Tls = ([string]$we.Status -match 'TrustFailure|SecureChannelFailure|CertificateError')
+        }
+    } catch { $res.Error = (Get-FirstLine $_.Exception.Message) }
+    if ($resp) {
+        try {
+            $res.Status = [int]$resp.StatusCode
+            $sr = New-Object System.IO.StreamReader($resp.GetResponseStream())
+            try { $res.Body = $sr.ReadToEnd() } finally { $sr.Dispose() }
+        } catch {} finally { $resp.Close() }
+    }
+    $res
+}
+# IDP token with the admin credential (windows_credentials grant, Negotiate), then the alarms route. The
+# token and the credential are never logged or stored in the result. Schemes are tried in the given order;
+# the next one is tried only when the first gave no HTTP answer or a redirect.
+function Get-GatewayFacts { param([string]$HostName,[pscredential]$Cred,[string[]]$Schemes=@('https','http'))
+    $g = [ordered]@{ Checked=$true; Host=$HostName; Scheme=''; TokenOk=$false; TokenStatus=0; TokenError=''; Status=0; Error='' }
+    if (-not $Cred) { $g.TokenError = 'no admin credential available'; return [pscustomobject]$g }
+    $nc = $Cred.GetNetworkCredential()
+    $token = ''
+    $base = ''
+    foreach ($scheme in $Schemes) {
+        $base = "${scheme}://$HostName"
+        $g.Scheme = $scheme
+        $cc = New-Object System.Net.CredentialCache
+        $cc.Add([uri]"$base/", 'Negotiate', $nc)
+        $tok = Invoke-GatewayHttp -Method 'POST' -Url "$base/IDP/connect/token" -Body 'grant_type=windows_credentials&client_id=GrantValidatorClient' -Credential $cc
+        $g.TokenStatus = $tok.Status
+        if ($tok.Status -eq 200) {
+            try { $token = [string](ConvertFrom-Json $tok.Body).access_token } catch { $token = '' }
+            if ($token) { $g.TokenOk = $true; $g.TokenError = ''; break }
+            $g.TokenError = 'the IDP answered 200 without an access_token'; break
+        }
+        $g.TokenError = if ($tok.Status) { "the IDP answered HTTP $($tok.Status)" } else { "no answer ($($tok.Error))" }
+        if ($tok.Status -ge 400) { break }
+    }
+    if ($g.TokenOk) {
+        $al = Invoke-GatewayHttp -Method 'GET' -Url "${base}/API/rest/v1/alarms?page=0&size=1" -Bearer $token
+        $g.Status = $al.Status
+        $g.Error = if ($al.Status) { '' } else { $al.Error }
+    }
+    $token = ''
+    [pscustomobject]$g
+}
+
 # Collect facts for every known box (MS/ES/cluster nodes: one round trip each; recorders: fanned out
 # together) and both cluster roles.
 function Invoke-DoctorCollect {
@@ -1510,6 +1612,15 @@ function Invoke-DoctorCollect {
         Write-Log "Collecting facts: $($recBoxes.Count) recording server(s), fanned out (ThrottleLimit 32)..."
         foreach ($rf in @(Invoke-CollectBundleFanOut $recBoxes)) { $boxes.Add($rf) }
     }
+    # REG-3: from THIS computer, against the address Estate Monitor will use (access point when clustered).
+    # https first when any Management Server box has 443 open, else http first.
+    $gw = $null
+    try {
+        $has443 = [bool](@($boxes | Where-Object { $_.Kind -eq 'MS' -and @($_.PortProbe | Where-Object { $_.Port -eq 443 -and $_.Open }).Count }).Count)
+        $order = if ($has443) { @('https','http') } else { @('http','https') }
+        $gw = Get-GatewayFacts -HostName (Get-TargetMsHost) -Cred $script:AdminCred -Schemes $order
+        Write-Log "REG-3: token $(if($gw.TokenOk){'ok'}else{'not obtained (' + $gw.TokenError + ')'}); alarms route HTTP $($gw.Status) via $($gw.Scheme)://$($gw.Host)"
+    } catch { $gw = [pscustomobject]@{ Checked=$true; Host=(Get-TargetMsHost); Scheme=''; TokenOk=$false; TokenStatus=0; TokenError=(Get-FirstLine $_.Exception.Message); Status=0; Error='' } }
     [pscustomobject]@{
         GeneratedUtc=[DateTime]::UtcNow.ToString('o')
         MsComputer=$env:COMPUTERNAME
@@ -1519,6 +1630,7 @@ function Invoke-DoctorCollect {
         ClusterMs=(Get-ClusterFacts 'MS')
         ClusterEs=(Get-ClusterFacts 'ES')
         TrustedHostsGaps=@($script:TrustedHostsGaps.ToArray())
+        Gateway=$gw
     }
 }
 
@@ -1811,6 +1923,32 @@ function Test-REG2 { param($Result)
             }
         }
     }
+    $rows
+}
+
+# REG-3 (pure): the API Gateway must route /API/rest/v1/alarms to the Event Server. After a Server
+# Configurator 'Register' on a management node it can point at a wrong address (502/503) while REST
+# inventory still answers 200 - and Estate Monitor then shows every camera 'unknown'. Facts: $Result.Gateway
+# (see Get-GatewayFacts). No token / 401 / 403 / anything unexpected = WARN 'could not check', never FAIL.
+function Test-REG3 { param($Result)
+    $rows=@()
+    $g = if($Result.PSObject.Properties['Gateway']){ $Result.Gateway } else { $null }
+    if(-not $g -or -not $g.Checked){ return $rows }
+    $where = "$($g.Scheme)://$($g.Host)"
+    $chk = 'Event Server API Gateway route'
+    $fixFail = "The API Gateway cannot reach the Event Server. Run Server Configurator 'Register' on the Event Server host, start the Event Server (cluster role if clustered), re-run the doctor."
+    $fixWarn = 'Check that the admin account can sign in to the XProtect IDP (it needs the Administrators role in XProtect), then re-run the doctor.'
+    if(-not $g.TokenOk){
+        $why = if($g.TokenStatus -eq 401 -or $g.TokenStatus -eq 403){ "the IDP refused the admin account (HTTP $($g.TokenStatus))" } elseif($g.TokenError){ [string]$g.TokenError } else { 'no token' }
+        $rows += New-Row 'REG-3' 'REG' 'WARN' $g.Host $chk "Could not check the alarms route: no IDP token from $where ($why)." $fixWarn
+        return $rows
+    }
+    $st = [int]$g.Status
+    if($st -eq 200){ $rows += New-Row 'REG-3' 'REG' 'PASS' $g.Host $chk "GET $where/API/rest/v1/alarms answered 200 - the API Gateway reaches the Event Server." '' }
+    elseif($st -ge 500){ $rows += New-Row 'REG-3' 'REG' 'FAIL' $g.Host $chk "GET $where/API/rest/v1/alarms answered HTTP $st - the API Gateway cannot reach the Event Server, so Estate Monitor would show every camera and recorder as unknown." $fixFail }
+    elseif($st -eq 0){ $rows += New-Row 'REG-3' 'REG' 'FAIL' $g.Host $chk "GET $where/API/rest/v1/alarms got no answer ($($g.Error))." $fixFail }
+    elseif($st -eq 401 -or $st -eq 403){ $rows += New-Row 'REG-3' 'REG' 'WARN' $g.Host $chk "Could not check the alarms route: $where refused the token (HTTP $st)." $fixWarn }
+    else { $rows += New-Row 'REG-3' 'REG' 'WARN' $g.Host $chk "Could not check the alarms route: GET $where/API/rest/v1/alarms answered an unexpected HTTP $st." 'Open the URL with an XProtect client or check the API Gateway log, then re-run the doctor.' }
     $rows
 }
 
@@ -2160,7 +2298,7 @@ $script:AllEvaluators = @(
     'Test-INV1','Test-INV2',
     'Test-NET1','Test-NET2','Test-NET3','Test-NET4',
     'Test-SVC1','Test-SVC2','Test-SVC3',
-    'Test-REG1','Test-REG2',
+    'Test-REG1','Test-REG2','Test-REG3',
     'Test-ENC1','Test-ENC2','Test-ENC3','Test-ENC4',
     'Test-CLU1','Test-CLU2','Test-CLU3','Test-CLU4','Test-CLU5',
     'Test-IIS1','Test-IIS2','Test-IIS3',
@@ -2174,6 +2312,75 @@ function Invoke-DoctorEvaluate { param($Result)
     $rows.ToArray()
 }
 
+# ===================== DOCTOR: INSTALL GATE (pure: rows -> Blocking / Client + verdict) =====================
+# One data table per gate - edit the id list here. A FAIL is BLOCKING when its check id is listed AND the
+# finding's box is one of BlockingKinds (a row with no box, or for an estate-level thing such as REG-3 or a
+# cluster role, always counts). Every other FAIL and every WARN is CLIENT (reported, does not block).
+# Recorder findings never block: Estate Monitor shows a broken recorder, that is its job.
+# INCOMPLETE (when nothing blocks): the doctor could not look at a Management Server / Event Server box that
+# serves - standalone, or the current role owner node - (NET-1 FAIL, COL-1 WARN) or could not check the API
+# Gateway route (REG-3 WARN). A cluster node that is Down/Paused or not the owner is Client only; so is a CLU-1
+# row about a node (the role is served elsewhere). A CLU-1 row about the ROLE still blocks.
+$script:GateTables = @{
+    EstateMonitor = @{
+        Title        = 'Estate Monitor precheck'
+        BlockingIds  = @('SVC-1','REG-1','REG-2','REG-3','ENC-2','ENC-3','IIS-1','IIS-2','IIS-3','CLU-1','CLU-3','NET-2','NET-3','NET-4','ENV-1','ENV-4','INV-2','CFG-1')
+        BlockingKinds= @('MS','ES')
+    }
+}
+function Get-RowBox { param($Result,[string]$Computer)
+    if(-not $Computer){ return $null }
+    foreach($b in @($Result.Boxes)){ if(([string]$b.Name) -ieq $Computer){ return $b } }
+    $null
+}
+# Does the cluster facts report this node Down or Paused (a node that is not serving; the role runs elsewhere)?
+function Test-ClusterNodeDown { param($Result,[string]$Name)
+    foreach($cl in @($Result.ClusterMs,$Result.ClusterEs)){
+        if(-not $cl){ continue }
+        foreach($n in @($cl.Nodes)){ if((([string]$n.Name) -ieq $Name) -and (@('Down','Paused') -contains [string]$n.State)){ return $true } }
+    }
+    $false
+}
+# A row about one cluster NODE (CLU-1 node state) as opposed to the ROLE (no computer): its Computer is a node of a cluster.
+function Test-ClusterNodeName { param($Result,[string]$Name)
+    if(-not $Name){ return $false }
+    foreach($cl in @($Result.ClusterMs,$Result.ClusterEs)){
+        if(-not $cl){ continue }
+        foreach($n in @($cl.Nodes)){ if(([string]$n.Name) -ieq $Name){ return $true } }
+    }
+    $false
+}
+function Get-GateExitCode { param([string]$Verdict) switch($Verdict){ 'PASS'{0} 'FAIL'{1} 'INCOMPLETE'{4} default{2} } }
+function Get-DoctorGate { param($Result,[object[]]$Rows,[string]$Name='EstateMonitor')
+    $t = $script:GateTables[$Name]
+    $out = New-Object System.Collections.Generic.List[object]
+    $blocking = New-Object System.Collections.Generic.List[object]
+    $client = New-Object System.Collections.Generic.List[object]
+    $incomplete = New-Object System.Collections.Generic.List[object]
+    foreach($r in @($Rows)){
+        $box = Get-RowBox $Result $r.Computer
+        $kind = if($box){ [string]$box.Kind } else { '' }
+        $gate = ''
+        if($r.Status -eq 'FAIL'){
+            $gate = if(($t.BlockingIds -contains $r.Id) -and ((-not $kind) -or ($t.BlockingKinds -contains $kind))){ 'Blocking' } else { 'Client' }
+            # A cluster NODE that is Down/Paused does not stop Estate Monitor while the role runs on another node
+            # (it only removes failover). Role rows (no computer) keep blocking.
+            if($r.Id -eq 'CLU-1' -and (Test-ClusterNodeName $Result $r.Computer)){ $gate = 'Client' }
+        } elseif($r.Status -eq 'WARN'){ $gate = 'Client' }
+        $c = [pscustomobject]@{ Id=$r.Id; Area=$r.Area; Status=$r.Status; Computer=$r.Computer; Check=$r.Check; Finding=$r.Finding; Fix=$r.Fix; Gate=$gate }
+        $out.Add($c)
+        if($gate -eq 'Blocking'){ $blocking.Add($c) } elseif($gate -eq 'Client'){ $client.Add($c) }
+        # Could-not-look matters only for a box that serves: a standalone MS/ES or the current role OWNER. A cluster node
+        # that is not the owner, or that the cluster reports Down/Paused, is known not to be serving.
+        $isBoxCore = ($t.BlockingKinds -contains $kind)
+        if($isBoxCore -and $box -and $box.IsNode -and ((-not $box.Active) -or (Test-ClusterNodeDown $Result $r.Computer))){ $isBoxCore = $false }
+        if(($r.Id -eq 'NET-1' -and $r.Status -eq 'FAIL' -and $isBoxCore) -or ($r.Id -eq 'COL-1' -and $r.Status -eq 'WARN' -and $isBoxCore) -or ($r.Id -eq 'REG-3' -and $r.Status -eq 'WARN')){ $incomplete.Add($c) }
+    }
+    $verdict = if($blocking.Count){ 'FAIL' } elseif($incomplete.Count){ 'INCOMPLETE' } else { 'PASS' }
+    [pscustomobject]@{ Name=$Name; Title=$t.Title; Verdict=$verdict; ExitCode=(Get-GateExitCode $verdict); Rows=$out.ToArray()
+                       Blocking=$blocking.ToArray(); Client=$client.ToArray(); Incomplete=$incomplete.ToArray() }
+}
+
 # ===================== DOCTOR: RENDER (HTML + CSV + TXT) =====================
 function Get-HtmlEsc { param([string]$Text) if($null -eq $Text){ return '' }; ([string]$Text) -replace '&','&amp;' -replace '<','&lt;' -replace '>','&gt;' -replace '"','&quot;' }
 function Get-StatusRank { param([string]$Status) switch($Status){ 'FAIL'{0} 'WARN'{1} 'PASS'{2} 'INFO'{3} default{4} } }
@@ -2183,7 +2390,7 @@ $script:AreaTitles = [ordered]@{
     CLU='Cluster'; IIS='IIS'; CFG='Config'; ENV='Environment'; COL='Collection (parts that could not be read)'
 }
 
-function New-DoctorHtml { param($Result,[object[]]$Rows)
+function New-DoctorHtml { param($Result,[object[]]$Rows,$Gate=$null)
     $fail = @($Rows | Where-Object { $_.Status -eq 'FAIL' }).Count
     $warn = @($Rows | Where-Object { $_.Status -eq 'WARN' }).Count
     $pass = @($Rows | Where-Object { $_.Status -eq 'PASS' }).Count
@@ -2206,6 +2413,26 @@ function New-DoctorHtml { param($Result,[object[]]$Rows)
     [void]$sb.Append("<b>Account used:</b> $(Get-HtmlEsc $Result.Account)<br>")
     [void]$sb.Append("<b>Counts:</b> FAIL $fail, WARN $warn, PASS $pass, INFO $info<br>")
     [void]$sb.Append("<b>Overall verdict:</b> <span class='badge' style='background:$verdictColor'>$verdict</span></p>")
+    if ($Gate) {
+        $gateColor = switch ($Gate.Verdict) { 'PASS' { '#1b7a1b' } 'FAIL' { '#b00020' } default { '#b8860b' } }
+        [void]$sb.Append("<h2 style='color:$gateColor'>$(Get-HtmlEsc $Gate.Title): $($Gate.Verdict)</h2>")
+        if (@($Gate.Blocking).Count) {
+            [void]$sb.Append('<table><tr><th>Id</th><th>Computer</th><th>Finding</th><th>Fix</th></tr>')
+            foreach ($r in @($Gate.Blocking)) { [void]$sb.Append("<tr class='FAIL'><td>$(Get-HtmlEsc $r.Id)</td><td>$(Get-HtmlEsc $r.Computer)</td><td>$(Get-HtmlEsc $r.Finding)</td><td>$(Get-HtmlEsc $r.Fix)</td></tr>") }
+            [void]$sb.Append('</table>')
+        } else { [void]$sb.Append('<p>No blocking findings.</p>') }
+        if ($Gate.Verdict -eq 'INCOMPLETE') {
+            [void]$sb.Append('<p>The doctor could not look at everything that matters, so it cannot say PASS:</p><ul>')
+            foreach ($r in @($Gate.Incomplete)) { [void]$sb.Append("<li>$(Get-HtmlEsc $r.Id) $(Get-HtmlEsc $r.Computer): $(Get-HtmlEsc $r.Finding)</li>") }
+            [void]$sb.Append('</ul>')
+        }
+        [void]$sb.Append('<h2>Report to the client (does not block Estate Monitor)</h2>')
+        if (@($Gate.Client).Count) {
+            [void]$sb.Append('<table><tr><th>Id</th><th>Status</th><th>Computer</th><th>Finding</th><th>Fix</th></tr>')
+            foreach ($r in @($Gate.Client | Sort-Object { Get-StatusRank $_.Status })) { [void]$sb.Append("<tr class='$($r.Status)'><td>$(Get-HtmlEsc $r.Id)</td><td><span class='badge badge-$($r.Status)'>$($r.Status)</span></td><td>$(Get-HtmlEsc $r.Computer)</td><td>$(Get-HtmlEsc $r.Finding)</td><td>$(Get-HtmlEsc $r.Fix)</td></tr>") }
+            [void]$sb.Append('</table>')
+        } else { [void]$sb.Append('<p>Nothing to report.</p>') }
+    }
     foreach ($area in $script:AreaTitles.Keys) {
         $areaRows = @($Rows | Where-Object { $_.Area -eq $area } | Sort-Object { Get-StatusRank $_.Status })
         if (-not $areaRows.Count) { continue }
@@ -2231,17 +2458,21 @@ function New-DoctorHtml { param($Result,[object[]]$Rows)
     $sb.ToString()
 }
 
-function New-DoctorCsv { param([object[]]$Rows)
+function New-DoctorCsv { param([object[]]$Rows,$Gate=$null)
     $lines = New-Object System.Collections.Generic.List[string]
-    $lines.Add('Id,Area,Status,Computer,Check,Finding,Fix')
+    $lines.Add($(if ($Gate) { 'Id,Area,Status,Computer,Check,Finding,Fix,Gate' } else { 'Id,Area,Status,Computer,Check,Finding,Fix' }))
     $esc = { param($v) '"' + (([string]$v) -replace '"','""') + '"' }
+    if ($Gate) { $Rows = @($Gate.Rows) }
     foreach ($r in ($Rows | Sort-Object { Get-StatusRank $_.Status })) {
-        $lines.Add((@($r.Id,$r.Area,$r.Status,$r.Computer,$r.Check,$r.Finding,$r.Fix) | ForEach-Object { & $esc $_ }) -join ',')
+        $vals = @($r.Id,$r.Area,$r.Status,$r.Computer,$r.Check,$r.Finding,$r.Fix)
+        if ($Gate) { $vals += $r.Gate }
+        $lines.Add((@($vals) | ForEach-Object { & $esc $_ }) -join ',')
     }
     ($lines.ToArray() -join "`r`n")
 }
-function New-DoctorTxt { param($Result,[object[]]$Rows)
+function New-DoctorTxt { param($Result,[object[]]$Rows,$Gate=$null)
     $lines = New-Object System.Collections.Generic.List[string]
+    if ($Gate) { $lines.Add("$($Gate.Title.ToUpperInvariant()): $($Gate.Verdict)") }
     $lines.Add('MILESTONE XPROTECT DOCTOR REPORT')
     $lines.Add("Generated (UTC): $($Result.GeneratedUtc)")
     $lines.Add("Management Server: $($Result.MsComputer) (target: $($Result.TargetMsHost))")
@@ -2250,6 +2481,20 @@ function New-DoctorTxt { param($Result,[object[]]$Rows)
     $warn = @($Rows | Where-Object { $_.Status -eq 'WARN' }).Count
     $lines.Add("Counts: FAIL $fail, WARN $warn, PASS $(@($Rows | Where-Object { $_.Status -eq 'PASS' }).Count), INFO $(@($Rows | Where-Object { $_.Status -eq 'INFO' }).Count)")
     $lines.Add('')
+    if ($Gate) {
+        $lines.Add("--- $($Gate.Title): $($Gate.Verdict) ---")
+        $lines.Add('Blocking:')
+        foreach ($r in @($Gate.Blocking)) { $lines.Add("  [$($r.Status)] $($r.Id) $($r.Computer): $($r.Finding)$(if($r.Fix){" FIX: $($r.Fix)"})") }
+        if (-not @($Gate.Blocking).Count) { $lines.Add('  (none)') }
+        if ($Gate.Verdict -eq 'INCOMPLETE') {
+            $lines.Add('Could not look at (so no PASS):')
+            foreach ($r in @($Gate.Incomplete)) { $lines.Add("  [$($r.Status)] $($r.Id) $($r.Computer): $($r.Finding)") }
+        }
+        $lines.Add('Report to the client (does not block Estate Monitor):')
+        foreach ($r in @($Gate.Client)) { $lines.Add("  [$($r.Status)] $($r.Id) $($r.Computer): $($r.Finding)$(if($r.Fix){" FIX: $($r.Fix)"})") }
+        if (-not @($Gate.Client).Count) { $lines.Add('  (none)') }
+        $lines.Add('')
+    }
     foreach ($area in $script:AreaTitles.Keys) {
         $areaRows = @($Rows | Where-Object { $_.Area -eq $area } | Sort-Object { Get-StatusRank $_.Status })
         if (-not $areaRows.Count) { continue }
@@ -2265,16 +2510,16 @@ function New-DoctorTxt { param($Result,[object[]]$Rows)
 # Report-writer: the ONLY place in this file allowed to create a folder / write a file - allowlisted by
 # name in tools/Test-Doctor.ps1's read-only AST scan (New-Item here only ever creates the LOCAL report
 # folder; nothing on any other computer is ever written).
-function Save-DoctorReport { param($Result,[object[]]$Rows)
+function Save-DoctorReport { param($Result,[object[]]$Rows,$Gate=$null)
     if (-not (Test-Path -LiteralPath $script:RunsDir)) { [void](New-Item -ItemType Directory -Path $script:RunsDir -Force) }
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
     $htmlPath = Join-Path $script:RunsDir "doctor-$stamp.html"
     $csvPath  = Join-Path $script:RunsDir "doctor-$stamp.csv"
     $txtPath  = Join-Path $script:RunsDir "doctor-$stamp.txt"
     $utf8 = [Text.UTF8Encoding]::new($false)
-    [IO.File]::WriteAllText($htmlPath, (New-DoctorHtml $Result $Rows), $utf8)
-    [IO.File]::WriteAllText($csvPath, (New-DoctorCsv $Rows), $utf8)
-    [IO.File]::WriteAllText($txtPath, (New-DoctorTxt $Result $Rows), $utf8)
+    [IO.File]::WriteAllText($htmlPath, (New-DoctorHtml $Result $Rows $Gate), $utf8)
+    [IO.File]::WriteAllText($csvPath, (New-DoctorCsv $Rows $Gate), $utf8)
+    [IO.File]::WriteAllText($txtPath, (New-DoctorTxt $Result $Rows $Gate), $utf8)
     $script:LastReportPath = $txtPath
     $script:LastReportHtml = $htmlPath
     [pscustomobject]@{ Html=$htmlPath; Csv=$csvPath; Txt=$txtPath }
@@ -2293,12 +2538,15 @@ function Invoke-DoctorRun {
     $result = Invoke-DoctorCollect
     Write-Log 'Evaluating...'
     $rows = Invoke-DoctorEvaluate $result
-    $paths = Save-DoctorReport $result $rows
+    $gate = $null
+    if ($script:GateName) { $gate = Get-DoctorGate $result $rows $script:GateName }
+    $paths = Save-DoctorReport $result $rows $gate
     $fail = @($rows | Where-Object { $_.Status -eq 'FAIL' }).Count
     $warn = @($rows | Where-Object { $_.Status -eq 'WARN' }).Count
     Write-Log "Report: $($paths.Html)" 'Good'
     Write-Log "OVERALL: FAIL=$fail WARN=$warn" $(if($fail -or $warn){'Err'}else{'Good'})
-    [pscustomobject]@{ Result=$result; Rows=$rows; Paths=$paths; Fail=$fail; Warn=$warn }
+    if ($gate) { Write-Log "$($gate.Title.ToUpperInvariant()): $($gate.Verdict) (blocking $(@($gate.Blocking).Count), client $(@($gate.Client).Count), exit $($gate.ExitCode))" $(if($gate.Verdict -eq 'PASS'){'Good'}else{'Err'}) }
+    [pscustomobject]@{ Result=$result; Rows=$rows; Paths=$paths; Fail=$fail; Warn=$warn; Gate=$gate }
 }
 
 # ===================== DOCTOR: WINDOW (Connect page, reused fields, + Run checks) =====================
@@ -2380,6 +2628,7 @@ if ($script:Headless) {
         if ($script:DefaultsLoadError) { Write-Log "WARNING: mrc.defaults.psd1 failed to parse: $script:DefaultsLoadError - using built-in placeholders" 'Err' }
         elseif ($script:DefaultsLoaded.Count) { Write-Log "Loaded defaults from mrc.defaults.psd1: $($script:DefaultsLoaded -join ', ')" }
         $r = Invoke-DoctorRun
+        if ($r.Gate) { exit ([int]$r.Gate.ExitCode) }
         exit ([int]([bool]$r.Fail))
     } catch { Write-Log "DOCTOR FATAL: $(Format-Err $_)" 'Err'; exit 2 }
 } else {

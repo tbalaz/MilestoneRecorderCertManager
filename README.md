@@ -3,7 +3,8 @@
 PowerShell tools to turn Milestone XProtect server encryption ON and OFF across the
 Management Server, the Event Server and the Recording Servers, including a Management
 Server and/or Event Server running as a Windows Server Failover Cluster role. They issue the
-certificates, import them, and drive Milestone's ServerConfigurator.
+certificates (or install certificate files from your own CA), import them, and drive Milestone's
+ServerConfigurator.
 
 Each script is a single self-contained file: copy it and run it. Windows PowerShell 5.1,
 run as Administrator.
@@ -29,7 +30,8 @@ powershell -ExecutionPolicy Bypass -STA -File .\Mrc-Guided.ps1
 ```
 
 1. **Connect**: enter the Event Server name (or tick "The Event Server is on this computer, or
-   not installed"), an admin account, and the signing CA. Recording Servers are found
+   not installed"), an admin account, and the signing CA - or click **Certificate files...** to use
+   certificates from your own CA instead (see below). Recording Servers are found
    automatically from the VMS (needs MilestonePSTools on the Management Server); add any
    missing ones in "Extra recording servers". Tick "Recording servers use a different account"
    if they need their own login. If something on this page fails, click **Open log**: it shows
@@ -59,8 +61,32 @@ wrong order, ServerConfigurator quits without changing anything and logs no reas
 - It skips servers that are already in the wanted state, so running it twice is safe.
 - It recovers automatically when a Milestone service will not stop or restart (a known
   cause of ServerConfigurator exit codes 10000 and 20000), with up to 3 attempts.
+- When ServerConfigurator applied the change but could not reach the Management Server afterwards
+  (a short network drop) and the services did not come back, it runs ServerConfigurator once
+  more by itself.
+- On a Management Server it lowers the IIS stop wait of the 'VideoOS ApiGateway AppPool' to 30
+  seconds while ServerConfigurator runs and puts the old value back afterwards (saves about 1-2
+  minutes per Management Server when turning encryption ON).
 - It stops at the first real failure and explains in plain language what failed, the current
   state of every server, and what to do next.
+
+## Certificate files from your own CA
+
+Instead of a signing CA, every server can get a certificate prepared by your own CA. Put the
+files in one folder, all with the same password:
+
+| File | Certificate must carry |
+| --- | --- |
+| `<recording-server-fqdn>.p12` (one per Recording Server) | that server's name |
+| `<management-server-address>.p12` | the address the Management Server is registered under (on a cluster: the cluster name; add every node's name too) |
+| `<event-server-address>.p12` | the Event Server name entered on the Connect page (on a cluster: or the cluster name) |
+
+`.pfx` works as well. Each file needs its private key, the Server Authentication purpose and valid
+dates, and must be issued by your root CA (put an intermediate CA certificate into the file). Give
+the root CA file (`.cer`) too: it is added to the trusted root store of every server that gets a
+certificate. The pre-flight check opens and checks every file before anything is changed and names
+each missing or wrong one. Smart Client computers need your root CA as well (for example by Group
+Policy), and your CA's revocation list must be reachable.
 - It writes a CSV and TXT report to `%TEMP%\MilestoneRecorderCertManager-runs\`.
 
 ## Health check: Mrc-Doctor.ps1
@@ -97,7 +123,9 @@ Nothing is changed until every check passes:
 
 - every server is reachable and its current state can be read;
 - ServerConfigurator can be found on every server (see "Milestone installed in another folder");
-- the signing CA is present (when certificates must be issued);
+- the signing CA is present (when certificates must be issued), or every certificate file is
+  present and correct (when you use your own files);
+- a separate recording-server account is accepted by the Management Server (see Requirements);
 - on a cluster: every node of the role is Up, and the role is healthy;
 - every server is registered to the same management-server address the wizard works with.
   A server registered to another address (for example one cluster node's own name instead
@@ -117,7 +145,11 @@ role (generic services). Run the wizard on any Management Server node.
   ServerConfigurator last can start the Management Server. The Result page names the nodes
   that cannot take over. After a failover to such a node, open the wizard **on that node** and
   click **Re-register this node** (headless: `-Action register`). This also works when the
-  other node is paused or down.
+  other node is paused or down. This applies to automatic failovers too (a crash, a reboot for
+  Windows updates): until that node is registered again the Management Server stays down, and
+  registering it stops the other node from starting the Management Server. Plan patch reboots
+  with this in mind. Milestone's cluster guide runs the Management Server under a domain service
+  account; this limitation was seen with the services running as a system account.
 - Optional failover self-test (headless: `-TestFailover`): each role is moved to every other
   node and back, and must come up there. Management Server nodes that cannot take over
   (see above) are skipped and named.
@@ -150,9 +182,16 @@ skipped with a message.
   exist with the same name and password on every server. If it is not the built-in
   Administrator, set `LocalAccountTokenFilterPolicy=1` on the remote servers, otherwise
   Windows blocks its admin rights over WinRM.
-- A signing CA with its private key in the Management Server's certificate store. All
-  certificates must chain to the same CA. Use "Create signing CA" only if encryption was
-  never set up in the system.
+- Recording Servers outside the domain (workgroup) with their own account: tick "Recording servers
+  use a different account" and use one local account with the same name and password on every
+  Recording Server (a local administrator there). When their encryption changes they log on to the
+  Management Server with it, so every Management Server node needs a local account with the same
+  name and password in Management Client > Security > Roles > Administrators (each node's account
+  is a separate entry; the local Administrators group only helps when that role contains it). The
+  wizard reaches workgroup servers by IP address.
+- A signing CA with its private key in the Management Server's certificate store, or certificate
+  files from your own CA (see above). All certificates must chain to the same CA. Use "Create
+  signing CA" only if encryption was never set up in the system.
 
 ## Milestone installed in another folder
 
@@ -176,7 +215,9 @@ share: it is listed in `.gitignore`.
 ```powershell
 .\Mrc-Guided.ps1 -Action status|on|off -EsHost <event-server> -AdminUser <DOMAIN\user> `
     -AdminPwFile <path-to-password-file> -RootSubject '<signing-CA-subject>' `
-    [-TestFailover] [-FixRegistration] [-SearchPaths 'D:\Milestone']
+    [-TestFailover] [-FixRegistration] [-SearchPaths 'D:\Milestone'] `
+    [-RecTargets '<rec1-fqdn>,<REC2>=<rec2-ip>'] [-RecUser <user> -RecPwFile <path>] `
+    [-CertFolder <folder> -CertPwFile <path> -RootCaFile <root-ca.cer>]   # own CA: -RootSubject not needed
 .\Mrc-Guided.ps1 -Action register -AdminUser <DOMAIN\user> -AdminPwFile <path>   # this cluster node
 .\Mrc-Guided.ps1 -Action rollback -Snapshot <run-...-snapshot.json> -AdminUser ... -AdminPwFile ...
 ```

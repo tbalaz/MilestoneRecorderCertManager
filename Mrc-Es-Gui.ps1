@@ -450,7 +450,8 @@ function Invoke-RemoteRecorderInstall {
             $rlog = [System.Collections.Generic.List[string]]::new()
             $rlog.Add("[$env:COMPUTERNAME] Importing PFX -> Cert:\LocalMachine\My")
             $c = Import-PfxCertificate -FilePath $RPfx -CertStoreLocation 'Cert:\LocalMachine\My' -Password $RPw -Exportable:$false
-            if ($c -is [array]) { $c = $c | Select-Object -First 1 }
+            # A PFX that carries its chain imports several certificates: the one with the private key is the server's.
+            if ($c -is [array]) { $k = @($c | Where-Object { $_.HasPrivateKey }); $c = if ($k.Count) { $k[0] } else { $c[0] } }
             if ($null -eq $c) { throw 'Recorder PFX import returned no certificate.' }
             $rlog.Add("[$env:COMPUTERNAME] Imported  tp=$($c.Thumbprint)  subj=$($c.Subject)")
             # Grant NETWORK SERVICE Read on private key so VideoOS.Recorder.Service (Schannel on port 7563) can use it.
@@ -1115,20 +1116,28 @@ $script:EsHostWorker = {
     try {
         Import-Module PKI -ErrorAction SilentlyContinue   # New-SelfSignedCertificate / Import-PfxCertificate (not always auto-loaded)
         if($P.Action -eq 'enable'){
-            $signer = Get-ChildItem Cert:\LocalMachine\My,Cert:\CurrentUser\My -ErrorAction SilentlyContinue | Where-Object { $_.Thumbprint -eq $P.SignerTp -and $_.HasPrivateKey } | Select-Object -First 1
-            if(-not $signer){ throw "signer $($P.SignerTp) not found in cert store" }
-            $pfxPw=[securestring]::new(); foreach($ch in ([guid]::NewGuid().ToString('N')).ToCharArray()){$pfxPw.AppendChar($ch)}; $pfxPw.MakeReadOnly()
-            $certFqdn=Resolve-CertFqdn -Target $P.Target -Fqdn $P.Fqdn -DomainSuffix $P.Domain
-            $sans=@(ConvertTo-SanList ([string]$P.ExtraSans))
-            if($sans.Count){ $logs.Add("extra SANs: $($sans -join ', ')") }
-            $pkg=New-RecorderCertificatePackage -HostName $certFqdn -DomainSuffix $P.Domain -Signer $signer -PfxPassword $pfxPw -OutputDir $P.OutputDir -ExtraDnsNames $sans
-            $logs.Add("issued $($pkg.Fqdn) tp=$($pkg.Thumbprint)"); $res.Tp=$pkg.Thumbprint
+            if($P.PfxFile){
+                # A prepared certificate file (issued by the operator's own CA, checked before the run) is
+                # imported as it is - no signer, no new certificate.
+                $pfxPw=$P.PfxPw
+                $pkg=[pscustomobject]@{ Fqdn=$P.PfxName; Thumbprint=$P.PfxTp; PfxPath=$P.PfxFile }
+                $logs.Add("prepared certificate $([IO.Path]::GetFileName($P.PfxFile)) for $($pkg.Fqdn) tp=$($pkg.Thumbprint)"); $res.Tp=$pkg.Thumbprint
+            } else {
+                $signer = Get-ChildItem Cert:\LocalMachine\My,Cert:\CurrentUser\My -ErrorAction SilentlyContinue | Where-Object { $_.Thumbprint -eq $P.SignerTp -and $_.HasPrivateKey } | Select-Object -First 1
+                if(-not $signer){ throw "signer $($P.SignerTp) not found in cert store" }
+                $pfxPw=[securestring]::new(); foreach($ch in ([guid]::NewGuid().ToString('N')).ToCharArray()){$pfxPw.AppendChar($ch)}; $pfxPw.MakeReadOnly()
+                $certFqdn=Resolve-CertFqdn -Target $P.Target -Fqdn $P.Fqdn -DomainSuffix $P.Domain
+                $sans=@(ConvertTo-SanList ([string]$P.ExtraSans))
+                if($sans.Count){ $logs.Add("extra SANs: $($sans -join ', ')") }
+                $pkg=New-RecorderCertificatePackage -HostName $certFqdn -DomainSuffix $P.Domain -Signer $signer -PfxPassword $pfxPw -OutputDir $P.OutputDir -ExtraDnsNames $sans
+                $logs.Add("issued $($pkg.Fqdn) tp=$($pkg.Thumbprint)"); $res.Tp=$pkg.Thumbprint
+            }
             # Invoke-RemoteRecorderInstall is reused verbatim: despite its name it is not
             # role-specific - it imports the PFX to LocalMachine\My and (optionally) trusts the
-            # signer CA, and is exactly what Mrc-Gui.ps1's MS-role rows call too.
+            # CA certificate, and is exactly what Mrc-Gui.ps1's MS-role rows call too.
             $r=Invoke-RemoteRecorderInstall -ComputerName $P.Fqdn -Credential $P.Cred -UseSsl:$false `
                  -PfxPath $pkg.PfxPath -PfxPassword $pfxPw -SignerCerPath $P.CaCer `
-                 -InstallSignerToRoot $true -InstallSignerToIntermediate $false `
+                 -InstallSignerToRoot ([bool]$P.CaCer) -InstallSignerToIntermediate $false `
                  -EnableEncryption $false -ServerConfiguratorPath '' -ScCredential $P.Cred -CertificateGroup ''
             foreach($l in $r.Logs){ $logs.Add($l) }
             $e=Invoke-ScWithWedgeRetry -ComputerName $P.Fqdn -Credential $P.Cred `
