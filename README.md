@@ -78,8 +78,12 @@ files in one folder, all with the same password:
 | File | Certificate must carry |
 | --- | --- |
 | `<recording-server-fqdn>.p12` (one per Recording Server) | that server's name |
-| `<management-server-address>.p12` | the address the Management Server is registered under (on a cluster: the cluster name; add every node's name too) |
-| `<event-server-address>.p12` | the Event Server name entered on the Connect page (on a cluster: or the cluster name) |
+| `<management-server-address>.p12` | the address the Management Server is registered under (on a cluster: the cluster name; every node's name is recommended) |
+| `<event-server-address>.p12` | the Event Server name entered on the Connect page, or on a cluster the cluster name. **On a cluster it must also carry the name of every Event Server node**: each node registers the Event Server with the Management Server under its own name, and the API Gateway checks the certificate against that name. A certificate with only the cluster name breaks the alarms route (HTTP 502), so the pre-flight check refuses it. |
+
+One certificate may serve both the Management Server and the Event Server: give it the Management
+Server cluster name, the Event Server cluster name and every Event Server node name, and put the same
+file into the folder under both file names.
 
 `.pfx` works as well. Each file needs its private key, the Server Authentication purpose and valid
 dates, and must be issued by your root CA (put an intermediate CA certificate into the file). Give

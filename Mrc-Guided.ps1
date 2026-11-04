@@ -1268,10 +1268,14 @@ function Test-CertFile { param([string]$Path,[securestring]$Password,[string[]]$
     } finally { foreach($x in $col){ $x.Reset() } }
 }
 # The certificate file of the Management Server ('MS') or Event Server ('ES') role: Name = the name the role
-# is registered under (the CN the wizard would mint, the one name the certificate MUST carry), Lookup = file
-# names tried in order, Also = names it should carry too (cluster nodes, MS extra SANs; missing = warning).
+# is registered under (the CN the wizard would mint), Lookup = file names tried in order AND the names the
+# certificate may carry (one is enough), Need = names it MUST carry, Also = names it should carry too (MS
+# cluster nodes, MS extra SANs; missing = warning). Need on a clustered ES = every node: ServerConfigurator
+# registers the Event Server under the FQDN of the node it ran on (https://<node>:22331/) and the API Gateway
+# checks the certificate against that name - lab 2026-11-04: a certificate with only the cluster names gave
+# RemoteCertificateNameMismatch and /alarms 502. The clustered MS is registered under its cluster name.
 function Get-RoleCertSpec { param([string]$Key)
-    $cl = Get-ClusterObj $Key; $also = @()
+    $cl = Get-ClusterObj $Key; $also = @(); $need = @()
     if($Key -eq 'MS'){
         if($cl -and -not $cl.Address){ throw "The cluster role '$($cl.Group)' has no network name (cluster address), so the certificate name is unknown." }
         $name = if($cl){ [string]$cl.Address } else { [string]$script:MsFqdn }
@@ -1280,9 +1284,10 @@ function Get-RoleCertSpec { param([string]$Key)
         $name = Resolve-CertFqdn -Target $script:EsAddr -Fqdn '' -DomainSuffix $script:DomainName
         $lookup = @($name) + @(if($cl -and $cl.Address){ [string]$cl.Address })
     }
-    if($cl){ $also += @(@($cl.Nodes) | ForEach-Object { [string]$_.Fqdn }) }
+    if($cl){ $nf = @(@($cl.Nodes) | ForEach-Object { [string]$_.Fqdn }); if($Key -eq 'ES'){ $need += $nf } else { $also += $nf } }
     $name = $name.Trim().TrimEnd('.').ToLowerInvariant()
     [pscustomobject]@{ Key=$Key; Name=$name; Lookup=@($lookup | ForEach-Object { ([string]$_).ToLowerInvariant() } | Select-Object -Unique)
+                       Need=@($need | Where-Object { $_ } | ForEach-Object { ([string]$_).ToLowerInvariant() } | Select-Object -Unique)
                        Also=@($also | Where-Object { $_ } | ForEach-Object { ([string]$_).ToLowerInvariant() } | Where-Object { $_ -ne $name } | Select-Object -Unique) }
 }
 # A standalone MS / ES job (HostWorker / EsHostWorker) gets its role's checked certificate file instead of a
@@ -1315,8 +1320,10 @@ function Get-CertFileProblems { param([object[]]$Boxes,[string[]]$Roles=@())
             $spec = Get-RoleCertSpec $k
             $file = ''; foreach($n in $spec.Lookup){ $file = Find-CertFile $dir $n; if($file){ break } }
             if(-not $file){ $p.Add("No certificate file for the $what ($($spec.Name)): expected $(Join-Path $dir "$($spec.Name).p12")."); continue }
-            $c = Test-CertFile -Path $file -Password $script:CertFilesPw -Names @($spec.Name) -RootCa $root
-            $miss = @($spec.Also | Where-Object { -not (Test-CertNameMatch $c.Names @($_)) })
+            $c = Test-CertFile -Path $file -Password $script:CertFilesPw -Names @($spec.Lookup) -RootCa $root
+            $lack = @(@($spec.Need) | Where-Object { -not (Test-CertNameMatch $c.Names @($_)) })
+            if($lack.Count){ $p.Add("$($what): $([IO.Path]::GetFileName($file)) does not carry $($lack -join ', '). Every $what node registers itself with the Management Server under its own name, and the API Gateway checks the certificate against that name. Add every node name to the certificate (Subject Alternative Name)."); continue }
+            $miss = @(@($spec.Lookup) + @($spec.Also) | Where-Object { -not (Test-CertNameMatch $c.Names @($_)) } | Select-Object -Unique)
             if($miss.Count){ Write-Log "WARNING: $([IO.Path]::GetFileName($file)) ($what) does not carry $($miss -join ', '). It is used anyway; add these names to the certificate if clients or the other node(s) reach the $what by them." 'Err' }
             $script:RoleCertMap[$k] = [pscustomobject]@{ File=$file; Tp=$c.Thumbprint; Name=$spec.Name }
             Write-Log "[$what] certificate file $([IO.Path]::GetFileName($file)): $($c.Subject), valid until $($c.NotAfter.ToString('yyyy-MM-dd')) [$($c.Thumbprint)]" 'Good'
