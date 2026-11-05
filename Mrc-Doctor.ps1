@@ -511,10 +511,14 @@ function Get-ConnAddr { param([string]$Computer,[pscredential]$Cred)
     if(Test-LocalTarget $Computer){ return $Computer }
     $k=([string]$Computer).Trim().ToLowerInvariant()
     if($script:ConnCache.ContainsKey($k)){ return [string]$script:ConnCache[$k] }
+    # An address that just failed is not tried again for 60 s: many recorders can share one dead address
+    # (lab 2026-11-05: ~150 on one IP, 20 s each, one after another, made a state check take about 50 minutes).
+    if(-not (Test-Path variable:script:ConnFailed)){ $script:ConnFailed=@{} }
+    if($script:ConnFailed.ContainsKey($k) -and ((Get-Date)-$script:ConnFailed[$k].At).TotalSeconds -lt 60){ throw [string]$script:ConnFailed[$k].Msg }
     try { [void](Invoke-OnBoxRaw -Computer $Computer -Cred $Cred -Sb { 1 }); $script:ConnCache[$k]=$Computer; return $Computer }
     catch {
         $m=$_.Exception.Message
-        if(-not (Test-KerberosError $m) -and -not (Test-LocalLogonRefusal $m $Cred $Computer)){ throw }
+        if(-not (Test-KerberosError $m) -and -not (Test-LocalLogonRefusal $m $Cred $Computer)){ $script:ConnFailed[$k]=@{ At=Get-Date; Msg=$m }; throw }
         $ip = Find-IpConnection $Computer $Cred (Get-FirstLine $m) -SameName:(Test-LocalCred $Cred $Computer)
         if($ip){ return $ip }
         throw

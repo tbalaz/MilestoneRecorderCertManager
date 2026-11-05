@@ -98,7 +98,8 @@
     /register); without it such a computer fails the pre-flight check (status only reports it).
     -CertFolder <dir> -CertPwFile <file> [-RootCaFile <cer>] gives every server a prepared certificate
     (<recorder-fqdn>.p12 per recorder, <ms-address>.p12 and <es-address>.p12 for the roles, .p12 or .pfx in
-    <dir>, one password for all, read from <file>) instead of a new one; the pre-flight check names every
+    <dir>) instead of a new one. <file> holds the passwords: one line per certificate, <file name>;<password>
+    (or one single line, the password of all files). The pre-flight check names every
     missing file and opens and checks every file (password, private key, name, validity,
     Server Authentication, issued by the root CA) before anything is changed.
         -Action register                      re-register THIS Management Server cluster node
@@ -128,7 +129,7 @@ param(
     [string]$ExtraSans = '',                            # extra SAN DNS names for the Management Server certificate
     [string]$SearchPaths = '',                          # ';' list of folders (or exe paths) to search for ServerConfigurator.exe / MilestonePSTools when not installed in the default folder
     [string]$CertFolder = '',                        # prepared certificates (own CA): folder of <recorder-fqdn>.p12 + <ms-address>.p12 + <es-address>.p12 (empty = sign new ones with the signing CA)
-    [string]$CertPwFile,                             # file holding the password of those certificate files (headless only)
+    [string]$CertPwFile,                             # file with the passwords of those certificate files: one line per file, <file name>;<password>, or one line for all (headless only)
     [string]$RootCaFile = '',                           # optional root CA certificate (.cer / .crt) installed on every server that gets a prepared certificate
     [string]$LogFile,                                   # optional: tee the log here
     [string]$MsAddr = '',                               # VMS address for recorder discovery (default: this machine)
@@ -1222,6 +1223,7 @@ function Resolve-Signer {
 # Every file is matched and checked in the pre-flight check, before anything is changed.
 $script:CertFilesOn = $false; $script:CertFilesDir = ''; $script:CertFilesPw = $null; $script:CertRootCa = ''
 $script:RecCertMap = @{}; $script:RoleCertMap = @{}; $script:CertRootCer = ''
+$script:CertPwListFile = ''; $script:CertPwMap = @{}   # certificate file name (lower case) -> its password
 function Get-CertNames { param([System.Security.Cryptography.X509Certificates.X509Certificate2]$Cert)
     # Every SAN entry plus the subject CN, lowercased. The SAN text is localized ('DNS Name=' /
     # 'DNS-Name='), so only the value after '=' is taken.
@@ -1249,6 +1251,35 @@ function Find-CertFile { param([string]$Folder,[string]$Fqdn)
     if(-not $hit.Count){ $short=($f -split '\.')[0]; $hit=@($files | Where-Object { ($_.BaseName.ToLowerInvariant() -split '\.')[0] -eq $short }) }
     if($hit.Count -gt 1){ throw "more than one certificate file fits $f ($((@($hit | ForEach-Object { $_.Name })) -join ', ')). Keep only $f.p12 in the folder." }
     if($hit.Count){ $hit[0].FullName } else { '' }
+}
+# Passwords file (owner 2026-11-05: "every cert (.p12) has it's own password"): one line per certificate,
+# <file name>.p12;<password>. The first ';', TAB or ',' after the file name splits, the rest is the password.
+# Empty lines, # lines and a heading line are skipped. One single line of any other form = the password of all
+# files. Errors name the line NUMBER only: a line can hold a password.
+function Read-CertPwFile { param([string]$Path)
+    if(-not (Test-Path -LiteralPath $Path -PathType Leaf)){ throw "The passwords file was not found: '$Path'." }
+    $leaf=[IO.Path]::GetFileName($Path); $map=@{}; $plain=[System.Collections.Generic.List[int]]::new(); $single=''; $n=0
+    foreach($line in @([IO.File]::ReadAllLines($Path))){
+        $n++
+        if(-not $line.Trim() -or $line.TrimStart().StartsWith('#')){ continue }
+        if($line -match '^\s*(file|file ?name|name|certificate|cert)\s*[;,\t]'){ continue }
+        if($line -match '^\s*([^;,\t]+?\.(?:p12|pfx))\s*[;,\t](.*)$'){
+            $k=([IO.Path]::GetFileName($Matches[1].Trim())).ToLowerInvariant(); $v=$Matches[2]
+            if($map.ContainsKey($k)){ throw "$leaf, line ${n}: $k appears twice." }
+            if(-not $v){ throw "$leaf, line ${n}: $k has no password." }
+            $map[$k]=Get-SecurePw $v
+        } else { $plain.Add($n); $single=$line.Trim() } }
+    if(-not $map.Count -and -not $plain.Count){ throw "$leaf has no passwords in it." }
+    if($plain.Count -and ($map.Count -or $plain.Count -gt 1)){ throw "$leaf, line $($plain[$(if($map.Count){0}else{1})]): not in the form <file name>.p12;<password>." }
+    [pscustomobject]@{ Map=$map; Default=$(if($plain.Count){ Get-SecurePw $single } else { $null }) }
+}
+# The password of one certificate file: its own line in the passwords file, else the password for all files.
+function Get-CertFilePw { param([string]$File)
+    $leaf=[IO.Path]::GetFileName($File); $k=$leaf.ToLowerInvariant()
+    if($script:CertPwMap.ContainsKey($k)){ return $script:CertPwMap[$k] }
+    if($script:CertFilesPw -and $script:CertFilesPw.Length){ return $script:CertFilesPw }
+    if($script:CertPwMap.Count){ throw "$leaf has no password: add the line '$leaf;<password>' to the passwords file." }
+    Get-SecurePw ''
 }
 function Read-RootCaFile { param([string]$Path)
     if(-not (Test-Path -LiteralPath $Path -PathType Leaf)){ throw "The root CA file was not found: $Path" }
@@ -1321,7 +1352,7 @@ function Set-RoleCertParams { param([hashtable]$P,[string]$Key)
     if(-not ($script:CertFilesOn -and $P.Action -eq 'enable')){ return }
     $rc = $script:RoleCertMap[$Key]
     if(-not $rc){ throw "No checked certificate file for the $(Get-StageName $Key) - nothing was changed on it. Click Check again, then run the same action again." }
-    $P.PfxFile=$rc.File; $P.PfxTp=$rc.Tp; $P.PfxName=$rc.Name; $P.PfxPw=$script:CertFilesPw; $P.CaCer=[string]$script:CertRootCer
+    $P.PfxFile=$rc.File; $P.PfxTp=$rc.Tp; $P.PfxName=$rc.Name; $P.PfxPw=$rc.Pw; $P.CaCer=[string]$script:CertRootCer
 }
 # Pre-flight part for prepared files: fills $script:RoleCertMap (key 'MS' / 'ES'), $script:RecCertMap (key =
 # recorder Target, upper case) and $script:CertRootCer (the root CA as DER, for every computer that gets a
@@ -1345,12 +1376,13 @@ function Get-CertFileProblems { param([object[]]$Boxes,[string[]]$Roles=@())
             $spec = Get-RoleCertSpec $k
             $file = ''; foreach($n in $spec.Lookup){ $file = Find-CertFile $dir $n; if($file){ break } }
             if(-not $file){ $p.Add("No certificate file for the $what ($($spec.Name)): expected $(Join-Path $dir "$($spec.Name).p12")."); continue }
-            $c = Test-CertFile -Path $file -Password $script:CertFilesPw -Names @($spec.Lookup) -RootCa $root
+            $fpw = Get-CertFilePw $file
+            $c = Test-CertFile -Path $file -Password $fpw -Names @($spec.Lookup) -RootCa $root
             $lack = @(@($spec.Need) | Where-Object { -not (Test-CertNameMatch $c.Names @($_)) })
             if($lack.Count){ $p.Add("$($what): $([IO.Path]::GetFileName($file)) does not carry $($lack -join ', '). Every $what node registers itself with the Management Server under its own name, and the API Gateway checks the certificate against that name. Add every node name to the certificate (Subject Alternative Name)."); continue }
             $miss = @(@($spec.Lookup) + @($spec.Also) | Where-Object { -not (Test-CertNameMatch $c.Names @($_)) } | Select-Object -Unique)
             if($miss.Count){ Write-Log "WARNING: $([IO.Path]::GetFileName($file)) ($what) does not carry $($miss -join ', '). It is used anyway; add these names to the certificate if clients or the other node(s) reach the $what by them." 'Err' }
-            $script:RoleCertMap[$k] = [pscustomobject]@{ File=$file; Tp=$c.Thumbprint; Name=$spec.Name }
+            $script:RoleCertMap[$k] = [pscustomobject]@{ File=$file; Tp=$c.Thumbprint; Name=$spec.Name; Pw=$fpw }
             Write-Log "[$what] certificate file $([IO.Path]::GetFileName($file)): $($c.Subject), valid until $($c.NotAfter.ToString('yyyy-MM-dd')) [$($c.Thumbprint)]" 'Good'
         } catch { $p.Add("$($what): $($_.Exception.Message)") }
     }
@@ -1363,8 +1395,9 @@ function Get-CertFileProblems { param([object[]]$Boxes,[string[]]$Roles=@())
             # so the name in the file it was matched by (same short name) is accepted too.
             $names=@($fq); $base=[IO.Path]::GetFileNameWithoutExtension($file).ToLowerInvariant()
             if($base -ne $fq -and -not (([string]$b.Addr -match '\.') -and -not (Test-IpAddress $b.Addr))){ $names+=$base }
-            $c=Test-CertFile -Path $file -Password $script:CertFilesPw -Names $names -RootCa $root
-            $script:RecCertMap[([string]$b.Target).ToUpperInvariant()]=[pscustomobject]@{ File=$file; Tp=$c.Thumbprint; Name=$fq }
+            $fpw=Get-CertFilePw $file
+            $c=Test-CertFile -Path $file -Password $fpw -Names $names -RootCa $root
+            $script:RecCertMap[([string]$b.Target).ToUpperInvariant()]=[pscustomobject]@{ File=$file; Tp=$c.Thumbprint; Name=$fq; Pw=$fpw }
             Write-Log "[$($b.Name)] certificate file $([IO.Path]::GetFileName($file)): $($c.Subject), valid until $($c.NotAfter.ToString('yyyy-MM-dd')) [$($c.Thumbprint)]" 'Good'
         } catch { $p.Add("Recording server $($b.Name): $($_.Exception.Message)") }
     }
@@ -1384,7 +1417,7 @@ function Ensure-TrustedHosts { param([string[]]$Hosts)
         # A bare '*' means trust-all and is only valid as the SOLE pattern - appending host names
         # to it makes WinRM reject the whole value. Nothing to add in that case anyway.
         if($set -contains '*'){ Write-Log 'TrustedHosts already "*" (trust-all) - nothing to add.'; return }
-        $add=@($Hosts | Where-Object { $_ -and ($set -notcontains $_) -and -not (Test-LocalTarget $_) })
+        $add=@($Hosts | Where-Object { $_ -and ($set -notcontains $_) -and -not (Test-LocalTarget $_) } | Select-Object -Unique)
         if($add.Count){ Set-Item WSMan:\localhost\Client\TrustedHosts -Value (($set+$add) -join ',') -Force; Write-Log "TrustedHosts += $($add -join ',')" }
     } catch { Write-Log "TrustedHosts not updated ($($_.Exception.Message.Split([char]10)[0])) - run elevated if WinRM to IPs fails" 'Err' }
 }
@@ -1705,7 +1738,7 @@ function Invoke-RecordersParallel { param([object[]]$Boxes,[string]$Action,[hash
         # Prepared certificate file for this recorder (checked in the pre-flight check): HostWorker imports it
         # instead of signing a new one, and installs the operator's root CA (if given) instead of the signer.
         $cf=if($Common.ContainsKey('CertFiles') -and $Common.CertFiles){ $Common.CertFiles[([string]$box.Target).ToUpperInvariant()] }else{ $null }
-        if($cf){ $P.PfxFile=$cf.File; $P.PfxTp=$cf.Tp; $P.PfxName=$cf.Name; $P.PfxPw=$Common.CertPw; $P.CaCer=[string]$Common.RootCer }
+        if($cf){ $P.PfxFile=$cf.File; $P.PfxTp=$cf.Tp; $P.PfxName=$cf.Name; $P.PfxPw=$cf.Pw; $P.CaCer=[string]$Common.RootCer }
         $ps=[powershell]::Create(); $ps.RunspacePool=$pool
         [void]$ps.AddScript($script:HostWorker).AddArgument($P)
         $jobs += [pscustomobject]@{Box=$box;PS=$ps;Handle=$ps.BeginInvoke();Done=$false}
@@ -2079,10 +2112,14 @@ function Get-ConnAddr { param([string]$Computer,[pscredential]$Cred)
     if(Test-LocalTarget $Computer){ return $Computer }
     $k=([string]$Computer).Trim().ToLowerInvariant()
     if($script:ConnCache.ContainsKey($k)){ return [string]$script:ConnCache[$k] }
+    # An address that just failed is not tried again for 60 s: many recorders can share one dead address
+    # (lab 2026-11-05: ~150 on one IP, 20 s each, one after another, made a state check take about 50 minutes).
+    if(-not (Test-Path variable:script:ConnFailed)){ $script:ConnFailed=@{} }
+    if($script:ConnFailed.ContainsKey($k) -and ((Get-Date)-$script:ConnFailed[$k].At).TotalSeconds -lt 60){ throw [string]$script:ConnFailed[$k].Msg }
     try { [void](Invoke-OnBoxRaw -Computer $Computer -Cred $Cred -Sb { 1 }); $script:ConnCache[$k]=$Computer; return $Computer }
     catch {
         $m=$_.Exception.Message
-        if(-not (Test-KerberosError $m) -and -not (Test-LocalLogonRefusal $m $Cred $Computer)){ throw }
+        if(-not (Test-KerberosError $m) -and -not (Test-LocalLogonRefusal $m $Cred $Computer)){ $script:ConnFailed[$k]=@{ At=Get-Date; Msg=$m }; throw }
         $ip = Find-IpConnection $Computer $Cred (Get-FirstLine $m) -SameName:(Test-LocalCred $Cred $Computer)
         if($ip){ return $ip }
         throw
@@ -3119,7 +3156,7 @@ function New-ClusterCertificate { param([string]$Key,[object[]]$Nodes)
             $nAddr = Get-VerifiedNodeAddr $n
             if($nAddr -ne $n.Addr){ Write-Log "[$($n.Name)] importing on its own address $nAddr (verified: it answers as $($n.Target))" }
             $r = Invoke-RemoteRecorderInstall -ComputerName $nAddr -Credential $n.Cred -UseSsl:$false `
-                     -PfxPath $rc.File -PfxPassword $script:CertFilesPw -SignerCerPath $script:CertRootCer `
+                     -PfxPath $rc.File -PfxPassword $rc.Pw -SignerCerPath $script:CertRootCer `
                      -InstallSignerToRoot ([bool]$script:CertRootCer) -InstallSignerToIntermediate $false `
                      -EnableEncryption $false -ServerConfiguratorPath '' -ScCredential $n.Cred -CertificateGroup ''
             foreach($l in $r.Logs){ Write-Log "[$($n.Name)] $l" }
@@ -4330,7 +4367,7 @@ function Invoke-RecStage { param([bool]$Want)
     Set-StageStatus 'REC' "Working on $($todo.Count) recording server(s)..." 'Work'
     $common=@{ Cred=$script:RecCred; SignerTp=$script:SignerTp; CaCer=$script:CaCer; Domain=$script:DomainName; OutputDir=$script:OutputDir
                Guids=$script:CertGroupServer; Names='Server (recorder)'; ScPaths=$script:ScSearchPaths
-               CertFiles=$(if($Want -and $script:CertFilesOn){ $script:RecCertMap }else{ $null }); CertPw=$script:CertFilesPw; RootCer=$script:CertRootCer }
+               CertFiles=$(if($Want -and $script:CertFilesOn){ $script:RecCertMap }else{ $null }); RootCer=$script:CertRootCer }
     if($common.CertFiles){
         # Every recorder to change was matched to its file in the pre-flight check; a gap here is refused.
         $nofile=@($todo | Where-Object { -not $common.CertFiles.ContainsKey(([string]$_.Target).ToUpperInvariant()) })
@@ -4744,45 +4781,57 @@ function Update-CertFilesStatus {
     $script:CertFilesStatus.ForeColor=$(if($n){[Drawing.Color]::DarkGreen}else{[Drawing.Color]::DarkRed})
 }
 function Show-CertFilesDialog {
-    $dlg=[Windows.Forms.Form]::new(); $dlg.Text='Certificate files'; $dlg.Size=[Drawing.Size]::new(690,410); $dlg.StartPosition='CenterParent'; $dlg.FormBorderStyle='FixedDialog'; $dlg.MaximizeBox=$false; $dlg.MinimizeBox=$false
+    $dlg=[Windows.Forms.Form]::new(); $dlg.Text='Certificate files'; $dlg.Size=[Drawing.Size]::new(690,490); $dlg.StartPosition='CenterParent'; $dlg.FormBorderStyle='FixedDialog'; $dlg.MaximizeBox=$false; $dlg.MinimizeBox=$false
     $lbl={ param([string]$T,[int]$Y,[int]$H) $x=[Windows.Forms.Label]::new(); $x.Text=$T; $x.Location=[Drawing.Point]::new(12,$Y); $x.Size=[Drawing.Size]::new(650,$H); $dlg.Controls.Add($x) }
     $box={ param([int]$Y,[int]$W,[string]$T) $x=[Windows.Forms.TextBox]::new(); $x.Location=[Drawing.Point]::new(12,$Y); $x.Size=[Drawing.Size]::new($W,24); $x.Text=$T; $dlg.Controls.Add($x); $x }
-    $btn={ param([string]$T,[int]$X,[int]$Y) $x=[Windows.Forms.Button]::new(); $x.Text=$T; $x.Location=[Drawing.Point]::new($X,$Y); $x.Size=[Drawing.Size]::new(95,30); $dlg.Controls.Add($x); $x }
+    $btn={ param([string]$T,[int]$X,[int]$Y) $b=[Windows.Forms.Button]::new(); $b.Text=$T; $b.Location=[Drawing.Point]::new($X,$Y); $b.Size=[Drawing.Size]::new(95,30); $dlg.Controls.Add($b); $b }
     $script:RcUse=[Windows.Forms.CheckBox]::new(); $script:RcUse.Text='Use prepared certificate files from your own CA (no signing CA, no new certificates)'
     $script:RcUse.Location=[Drawing.Point]::new(12,12); $script:RcUse.Size=[Drawing.Size]::new(650,24); $script:RcUse.Checked=$script:CertFilesOn; $dlg.Controls.Add($script:RcUse)
     & $lbl 'Folder with one .p12 (or .pfx) per certificate: one per recording server (rec01.company.local.p12), one for the Management Server and one for the Event Server, each named after the address it is registered under (a cluster: the cluster address):' 40 42
     $script:RcFolder = & $box 84 545 $script:CertFilesDir
     $script:RcFolderBtn = & $btn 'Browse...' 567 81
-    & $lbl 'Password of the certificate files (the same for all files):' 122 22
+    & $lbl 'If all files share one password, type it here:' 122 22
     $script:RcPw = & $box 146 300 $(if($script:CertFilesPw){ [System.Net.NetworkCredential]::new('',$script:CertFilesPw).Password }else{ '' }); $script:RcPw.UseSystemPasswordChar=$true
-    & $lbl 'Root CA certificate to add to the trusted roots of every server that gets a file (optional, .cer / .crt) - for computers that do not trust your CA yet:' 184 36
-    $script:RcRoot = & $box 222 545 $script:CertRootCa
-    $script:RcRootBtn = & $btn 'Browse...' 567 219
-    & $lbl 'A clustered role uses ONE file on all its nodes; it must name the cluster address and every node. Every file is checked before anything is changed; the pre-flight check names any file that is missing.' 262 40
-    $ok = & $btn 'OK' 462 322; $cn = & $btn 'Cancel' 567 322; $cn.DialogResult='Cancel'; $dlg.CancelButton=$cn
-    $sync={ foreach($c in @($script:RcFolder,$script:RcFolderBtn,$script:RcPw,$script:RcRoot,$script:RcRootBtn)){ $c.Enabled=$script:RcUse.Checked } }
+    & $lbl 'If every file has its own password: a text file with one line per certificate, for example rec01.company.local.p12;Secret1 (it is read when you click OK; delete it afterwards):' 178 36
+    $script:RcPwList = & $box 216 545 $script:CertPwListFile
+    $script:RcPwListBtn = & $btn 'Browse...' 567 213
+    & $lbl 'Root CA certificate to add to the trusted roots of every server that gets a file (optional, .cer / .crt) - for computers that do not trust your CA yet:' 252 36
+    $script:RcRoot = & $box 290 545 $script:CertRootCa
+    $script:RcRootBtn = & $btn 'Browse...' 567 287
+    & $lbl 'A clustered role uses ONE file on all its nodes. The Event Server file must carry the cluster address and every node name, the Management Server file the cluster address. Every file is opened and checked before anything is changed: the pre-flight check names any file that is missing or has a wrong password.' 326 56
+    $ok = & $btn 'OK' 462 402; $cn = & $btn 'Cancel' 567 402; $cn.DialogResult='Cancel'; $dlg.CancelButton=$cn
+    $sync={ foreach($c in @($script:RcFolder,$script:RcFolderBtn,$script:RcPw,$script:RcPwList,$script:RcPwListBtn,$script:RcRoot,$script:RcRootBtn)){ $c.Enabled=$script:RcUse.Checked } }
     & $sync; $script:RcUse.Add_CheckedChanged($sync)
     $script:RcFolderBtn.Add_Click({
         $fd=[Windows.Forms.FolderBrowserDialog]::new(); $fd.Description='Folder with the certificate files (.p12 / .pfx)'
         if($script:RcFolder.Text -and (Test-Path -LiteralPath $script:RcFolder.Text)){ $fd.SelectedPath=$script:RcFolder.Text }
         if($fd.ShowDialog() -eq 'OK'){ $script:RcFolder.Text=$fd.SelectedPath }; $fd.Dispose() })
+    $script:RcPwListBtn.Add_Click({
+        $od=[Windows.Forms.OpenFileDialog]::new(); $od.Title='Passwords file'; $od.Filter='Text files (*.txt;*.csv)|*.txt;*.csv|All files (*.*)|*.*'
+        if($od.ShowDialog() -eq 'OK'){ $script:RcPwList.Text=$od.FileName }; $od.Dispose() })
     $script:RcRootBtn.Add_Click({
         $od=[Windows.Forms.OpenFileDialog]::new(); $od.Title='Root CA certificate'; $od.Filter='Certificate (*.cer;*.crt;*.der;*.pem)|*.cer;*.crt;*.der;*.pem|All files (*.*)|*.*'
         if($od.ShowDialog() -eq 'OK'){ $script:RcRoot.Text=$od.FileName }; $od.Dispose() })
     $ok.Add_Click({
         $msg=''
         if($script:RcUse.Checked){
-            $f=$script:RcFolder.Text.Trim().Trim('"'); $r=$script:RcRoot.Text.Trim().Trim('"')
+            $f=$script:RcFolder.Text.Trim().Trim('"'); $r=$script:RcRoot.Text.Trim().Trim('"'); $l=$script:RcPwList.Text.Trim().Trim('"')
             if(-not $f -or -not (Test-Path -LiteralPath $f -PathType Container)){ $msg="The folder was not found: '$f'." }
             elseif(-not @(Get-ChildItem -LiteralPath $f -File -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in '.p12','.pfx' }).Count){ $msg="There are no .p12 or .pfx files in $f." }
-            elseif($r){ try { [void](Read-RootCaFile $r) } catch { $msg=$_.Exception.Message } }
+            else {
+                if($l){ try { [void](Read-CertPwFile $l) } catch { $msg=$_.Exception.Message } }
+                if(-not $msg -and $r){ try { [void](Read-RootCaFile $r) } catch { $msg=$_.Exception.Message } } }
         }
-        if($msg){ [Windows.Forms.MessageBox]::Show($msg,'Recording server certificates',0,'Warning')|Out-Null; return }
+        if($msg){ [Windows.Forms.MessageBox]::Show($msg,'Certificate files check',0,'Warning')|Out-Null; return }
         $this.FindForm().DialogResult='OK' })
     if($dlg.ShowDialog($script:Form) -eq 'OK'){
         $script:CertFilesOn=$script:RcUse.Checked
         $script:CertFilesDir=$script:RcFolder.Text.Trim().Trim('"'); $script:CertRootCa=$script:RcRoot.Text.Trim().Trim('"'); $script:CertFilesPw=Get-SecurePw $script:RcPw.Text
-        Write-Log "Recording server certificates: $(if($script:CertFilesOn){"prepared files in $($script:CertFilesDir)$(if($script:CertRootCa){", root CA $($script:CertRootCa)"})"}else{'signed by the signing CA'})"
+        $script:CertPwListFile=$script:RcPwList.Text.Trim().Trim('"'); $script:CertPwMap=@{}
+        if($script:CertFilesOn -and $script:CertPwListFile){
+            $pl=Read-CertPwFile $script:CertPwListFile; $script:CertPwMap=$pl.Map
+            if($pl.Default -and -not $script:CertFilesPw.Length){ $script:CertFilesPw=$pl.Default } }
+        Write-Log "Certificates: $(if($script:CertFilesOn){"prepared files in $($script:CertFilesDir)$(if($script:CertPwMap.Count){", $($script:CertPwMap.Count) password(s) from $($script:CertPwListFile)"})$(if($script:CertRootCa){", root CA $($script:CertRootCa)"})"}else{'signed by the signing CA'})"
         Update-CertFilesStatus; [void](Update-CaStatus)
     }
     $dlg.Dispose()
@@ -4944,7 +4993,7 @@ function Get-RollbackCommand {
     $rec = if($script:RecSepChk -and $script:RecSepChk.Checked -and $script:RecCred){ " -RecUser '$($script:RecCred.UserName)' -RecPwFile <file-with-the-recording-server-password>" } else { '' }
     $cert = ''
     if($script:CertFilesOn){
-        $cert = ' -CertFolder "' + $script:CertFilesDir + '" -CertPwFile <file-with-the-certificate-password>'
+        $cert = ' -CertFolder "' + $script:CertFilesDir + '" -CertPwFile <file-with-the-certificate-passwords>'
         if($script:CertRootCa){ $cert += ' -RootCaFile "' + $script:CertRootCa + '"' }
     }
     "powershell -ExecutionPolicy Bypass -File `"$($script:SelfPath)`" -Action rollback -Snapshot `"$($script:LastSnapshotPath)`" -AdminUser '$u' -AdminPwFile <file-with-the-admin-password>$rec$cert"
@@ -5107,7 +5156,7 @@ $recLbl=New-UiLabel 'Extra recording servers (optional, one per line):' 24 466 2
 $script:ManualRecBox=[Windows.Forms.TextBox]::new(); $script:ManualRecBox.Multiline=$true; $script:ManualRecBox.ScrollBars='Vertical'
 $script:ManualRecBox.Location=[Drawing.Point]::new(320,466); $script:ManualRecBox.Size=[Drawing.Size]::new(320,60); $p1.Controls.Add($script:ManualRecBox)
 $recHint=New-UiLabel 'Recording servers are found automatically. Add them here only if they are missing.' 656 466 320 60; $recHint.TextAlign='TopLeft'; $p1.Controls.Add($recHint)
-$p1.Controls.Add((New-UiLabel 'Recording server certificates:' 24 534))
+$p1.Controls.Add((New-UiLabel 'Certificate files (your own CA):' 24 534))
 $script:CertFilesBtn=New-UiButton 'Certificate files...' 320 530 320 34; $p1.Controls.Add($script:CertFilesBtn); $script:CertFilesBtn.Add_Click({ Show-CertFilesDialog })
 $script:CertFilesStatus=New-UiLabel '' 656 528 320 44; $script:CertFilesStatus.TextAlign='TopLeft'; $p1.Controls.Add($script:CertFilesStatus)
 $script:ConnectStatus=New-UiLabel '' 24 580 570 30; $script:ConnectStatus.Font=$script:UiBold; $script:ConnectStatus.ForeColor=[Drawing.Color]::DarkOrange; $p1.Controls.Add($script:ConnectStatus)
@@ -5248,7 +5297,8 @@ if($script:Headless){
         if($CertPwFile){
             if(-not $CertFolder){ Write-Log 'REFUSED: -CertPwFile given without -CertFolder' 'Err'; exit 3 }
             if(-not (Test-Path -LiteralPath $CertPwFile)){ Write-Log "REFUSED: -CertPwFile not found: $CertPwFile" 'Err'; exit 3 }
-            $script:CertFilesPw=Get-SecurePw (([string](Get-Content -Raw -LiteralPath $CertPwFile)).Trim())
+            try { $pl=Read-CertPwFile $CertPwFile } catch { Write-Log "REFUSED: $($_.Exception.Message)" 'Err'; exit 3 }
+            $script:CertPwListFile=[string]$CertPwFile; $script:CertPwMap=$pl.Map; $script:CertFilesPw=$(if($pl.Default){ $pl.Default } else { Get-SecurePw '' })
         }
         $script:SignerSubjectBox.Text=$RootSubject; $script:RootSubjectForRun=$RootSubject
         try { Read-Inputs } catch { Write-Log "REFUSED: $($_.Exception.Message)" 'Err'; exit 3 }

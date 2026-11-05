@@ -73,7 +73,7 @@ wrong order, ServerConfigurator quits without changing anything and logs no reas
 ## Certificate files from your own CA
 
 Instead of a signing CA, every server can get a certificate prepared by your own CA. Put the
-files in one folder, all with the same password:
+files in one folder:
 
 | File | Certificate must carry |
 | --- | --- |
@@ -84,6 +84,19 @@ files in one folder, all with the same password:
 One certificate may serve both the Management Server and the Event Server: give it the Management
 Server cluster name, the Event Server cluster name and every Event Server node name, and put the same
 file into the folder under both file names.
+
+Every file can have its own password. Put them in a plain text file, one line per certificate:
+
+```
+rec01.company.local.p12;Secret1
+rec02.company.local.p12;Secret2
+```
+
+The first `;`, TAB or `,` after the file name ends the name, so a list pasted from Excel or a CSV
+works and a password may contain those characters. Pick this file in the **Certificate files...**
+dialog. The dialog's password box is the password for any file without a line of its own, and a
+text file with one line holding only a password counts for all files. The wizard reads the text file
+when you click OK and never writes a password to its logs, so delete the file right after.
 
 `.pfx` works as well. Each file needs its private key, the Server Authentication purpose and valid
 dates, and must be issued by your root CA (put an intermediate CA certificate into the file). Give

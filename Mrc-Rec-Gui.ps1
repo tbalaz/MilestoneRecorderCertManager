@@ -1077,7 +1077,7 @@ function Ensure-TrustedHosts { param([string[]]$Hosts)
         # A bare '*' means trust-all and is only valid as the SOLE pattern - appending host names
         # to it makes WinRM reject the whole value. Nothing to add in that case anyway.
         if($set -contains '*'){ Write-Log 'TrustedHosts already "*" (trust-all) - nothing to add.'; return }
-        $add=@($Hosts | Where-Object { $_ -and ($set -notcontains $_) -and -not (Test-LocalTarget $_) })
+        $add=@($Hosts | Where-Object { $_ -and ($set -notcontains $_) -and -not (Test-LocalTarget $_) } | Select-Object -Unique)
         if($add.Count){ Set-Item WSMan:\localhost\Client\TrustedHosts -Value (($set+$add) -join ',') -Force; Write-Log "TrustedHosts += $($add -join ',')" }
     } catch { Write-Log "TrustedHosts not updated ($($_.Exception.Message.Split([char]10)[0])) - run elevated if WinRM to IPs fails" 'Err' }
 }
