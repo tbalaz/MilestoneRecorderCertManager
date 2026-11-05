@@ -317,8 +317,17 @@ function Get-DomainSuffix {
     $s.ToLowerInvariant()
 }
 function Get-RecorderFqdn {
+    # DNS first (client 2026-11-05: recording servers in another DNS domain than the management server):
+    # the computer's real name from the same lookup 'Enter-PSSession <name>' does (this computer's DNS suffix
+    # search list). Only when DNS has no dotted answer for THAT host is the Domain field appended.
     param([string]$HostName, [string]$DomainSuffix)
-    "{0}.{1}" -f (Normalize-RecorderHostName $HostName), (Get-DomainSuffix $DomainSuffix)
+    $short = Normalize-RecorderHostName $HostName
+    if ($short -notmatch '^\d+$') {
+        # Accepted only as a well-formed DNS name of THAT host; a different domain is reported by discovery.
+        try { $h = ([string][System.Net.Dns]::GetHostEntry($short).HostName).TrimEnd('.').ToLowerInvariant()
+              if ($h -match '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$' -and ($h -split '\.')[0] -ieq $short) { return $h } } catch {}
+    }
+    "{0}.{1}" -f $short, (Get-DomainSuffix $DomainSuffix)
 }
 function ConvertTo-SanList {
     # Parse operator-entered extra SAN names: newline / comma / semicolon / space separated.
@@ -1836,6 +1845,8 @@ function Get-VmsRecorderList { param([string]$Domain,[pscredential]$VmsCred,[str
             Write-Log "Recording server '$($rec.Name)' runs on this Management Server - it is covered by the Management Server step, not handled separately."
             continue
         }
+        if(-not $isIp -and $srcTrim -notmatch '\.' -and $fqdn -notlike "*.$(Get-DomainSuffix $Domain)"){
+            Write-Log "Recording server '$($rec.Name)': Milestone knows it only as '$srcTrim'; DNS names it $fqdn (domain differs from $(Get-DomainSuffix $Domain)). That name is used for the connection and its certificate - check it is right before you continue." 'Err' }
         # W13: dedup by the full FQDN (not the short name) - two entries can share a short name only when
         # they are genuinely the same recorder reported twice.
         $dedupKey = ($(if($isIp){ $short } else { $fqdn })).ToUpperInvariant()

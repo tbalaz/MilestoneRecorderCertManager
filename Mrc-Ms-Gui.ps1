@@ -252,8 +252,17 @@ function Get-DomainSuffix {
     $s.ToLowerInvariant()
 }
 function Get-RecorderFqdn {
+    # DNS first (client 2026-11-05: recording servers in another DNS domain than the management server):
+    # the computer's real name from the same lookup 'Enter-PSSession <name>' does (this computer's DNS suffix
+    # search list). Only when DNS has no dotted answer for THAT host is the Domain field appended.
     param([string]$HostName, [string]$DomainSuffix)
-    "{0}.{1}" -f (Normalize-RecorderHostName $HostName), (Get-DomainSuffix $DomainSuffix)
+    $short = Normalize-RecorderHostName $HostName
+    if ($short -notmatch '^\d+$') {
+        # Accepted only as a well-formed DNS name of THAT host; a different domain is reported by discovery.
+        try { $h = ([string][System.Net.Dns]::GetHostEntry($short).HostName).TrimEnd('.').ToLowerInvariant()
+              if ($h -match '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$' -and ($h -split '\.')[0] -ieq $short) { return $h } } catch {}
+    }
+    "{0}.{1}" -f $short, (Get-DomainSuffix $DomainSuffix)
 }
 function ConvertTo-SanList {
     # Parse operator-entered extra SAN names: newline / comma / semicolon / space separated.
