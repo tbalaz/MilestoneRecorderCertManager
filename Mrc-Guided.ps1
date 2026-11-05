@@ -895,7 +895,11 @@ function Repair-WedgedService {
             }
         }
         $out.Add((& $stopOne $Dn))
-        foreach($sib in 'Milestone XProtect Data Collector Server','Milestone XProtect Log Server'){
+        # The Mobile Server joins the siblings of a Management Server bounce: SC stops and restarts it
+        # ('MobileServerSetManagementServerRegistrar') and in 2025 R3 that stop can hang (lab 2026-11-03/04).
+        $sibs=@('Milestone XProtect Data Collector Server','Milestone XProtect Log Server')
+        if($Dn -like '*Management Server*'){ $sibs+='Milestone XProtect Mobile Server' }
+        foreach($sib in $sibs){
             if($sib -ne $Dn){ $out.Add((& $stopOne $sib)) }
         }
         $svc=Get-Service | Where-Object { $_.DisplayName -eq $Dn }
@@ -931,27 +935,39 @@ function Invoke-ScWithWedgeRetry {
     param([string]$ComputerName,[pscredential]$Credential,[string]$Thumbprint,[string]$CertificateGroup,
           [ValidateSet('enableencryption','disableencryption')][string]$Action,
           [System.Collections.Generic.List[string]]$WorkLog,[string]$GroupName,[string]$ScPaths='')
+    if(-not (Test-Path variable:script:WedgeDepth)){ $script:WedgeDepth = 0 }   # StrictMode-safe init (runspaces too)
+    $m=''; $sc='10000'
     try {
-        Invoke-RemoteServerEncryption -ComputerName $ComputerName -Credential $Credential -UseSsl:$false `
+        $r = Invoke-RemoteServerEncryption -ComputerName $ComputerName -Credential $Credential -UseSsl:$false `
             -Thumbprint $Thumbprint -ServerConfiguratorPath $ScPaths -ScCredential $Credential -CertificateGroup $CertificateGroup -Action $Action
     } catch {
         $m=$_.Exception.Message
         if($m -notmatch 'cannot accept control messages|Unable to (?:stop|restart) the service|Could not stop service'){ throw }
-        if(-not (Test-Path variable:script:WedgeDepth)){ $script:WedgeDepth = 0 }   # StrictMode-safe init (runspaces too)
         if($script:WedgeDepth -ge 3){ $WorkLog.Add("[$GroupName] WEDGE: giving up after 3 recovery attempts"); throw }   # bounded: SC + up to 3 recoveries
-        $dn=if($m -match 'Unable to (?:stop|restart) the service (.+?)\.'){ $Matches[1].Trim() }
-            elseif($m -match 'Could not stop service MilestoneEventServer'){ 'Milestone XProtect Event Server' }   # SC names the ES by its service name (MilestoneEventServerService)
-            elseif($m -match 'Could not stop service (Milestone XProtect [A-Za-z ]+?Server)'){ $Matches[1].Trim() }   # SC 20000 PreExecute CouldNotStopServer variant
-            else { 'Milestone XProtect Management Server' }
-        $WorkLog.Add("[$GroupName] WEDGE: '$dn' stuck - SC could not stop/restart it (SC 10000) - bouncing it and retrying SC (recovery $($script:WedgeDepth + 1) of 3)")
-        # DEVIATION (required wiring for Repair-WedgedService's DEVIATION 1 above): the base only
-        # restarted a wedged Management Server before the retry; a wedged Event Server must also be
-        # restarted here, or Repair-WedgedService leaves it stopped and the SC retry has nothing to apply to.
-        $want=($Action -eq 'enableencryption') -and (($dn -like '*Management Server*') -or ($dn -like '*Event Server*'))
-        foreach($l in @(Repair-WedgedService -ComputerName $ComputerName -Credential $Credential -UseSsl:$false -DisplayName $dn -WantRunning $want)){ $WorkLog.Add("[$GroupName] $l") }
-        $script:WedgeDepth++
-        try { Invoke-ScWithWedgeRetry @PSBoundParameters } finally { $script:WedgeDepth-- }
     }
+    if(-not $m){
+        # Exit 2000 = SC applied, then a post-apply step failed. When that step is a service SC could not
+        # stop/restart (2025 R3: 'MobileServerSetManagementServerRegistrar.PreExecute' CouldNotStopServer on
+        # the Mobile Server, lab 2026-11-03/04), the Management Server is left half-configured and does not
+        # start: bounce that service and rerun the SAME SC invocation ONCE (never inside another recovery).
+        $last=@($r) | Where-Object { $_ -and $_.PSObject.Properties['ExitCode'] } | Select-Object -Last 1
+        if(-not $last -or [int64]$last.ExitCode -ne 2000 -or $script:WedgeDepth -gt 0){ return $r }
+        $m=(@($last.Logs) -join ' || ')
+        if($m -notmatch 'Unable to (?:stop|restart) the service|Could not stop service'){ return $r }
+        $sc='2000'
+    }
+    $dn=if($m -match 'Unable to (?:stop|restart) the service (.+?)\.'){ $Matches[1].Trim() }
+        elseif($m -match 'Could not stop service MilestoneEventServer'){ 'Milestone XProtect Event Server' }   # SC names the ES by its service name (MilestoneEventServerService)
+        elseif($m -match 'Could not stop service (Milestone XProtect [A-Za-z ]+?Server)'){ $Matches[1].Trim() }   # SC 20000 PreExecute CouldNotStopServer variant
+        else { 'Milestone XProtect Management Server' }
+    $WorkLog.Add("[$GroupName] WEDGE: '$dn' stuck - SC could not stop/restart it (SC $sc) - bouncing it and retrying SC (recovery $($script:WedgeDepth + 1) of 3)")
+    # DEVIATION (required wiring for Repair-WedgedService's DEVIATION 1 above): the base only
+    # restarted a wedged Management Server before the retry; a wedged Event Server must also be
+    # restarted here, or Repair-WedgedService leaves it stopped and the SC retry has nothing to apply to.
+    $want=($Action -eq 'enableencryption') -and (($dn -like '*Management Server*') -or ($dn -like '*Event Server*'))
+    foreach($l in @(Repair-WedgedService -ComputerName $ComputerName -Credential $Credential -UseSsl:$false -DisplayName $dn -WantRunning $want)){ $WorkLog.Add("[$GroupName] $l") }
+    $script:WedgeDepth++
+    try { Invoke-ScWithWedgeRetry @PSBoundParameters } finally { $script:WedgeDepth-- }
 }
 
 # -- Post-apply confirmation (reconnect-tolerant) --------------------------
@@ -2718,6 +2734,18 @@ function Get-ClusterHealthProblem { param($Cl)
     }
     "The cluster role '$($Cl.Group)' ($(Get-StageName $Cl.Key)) is '$st', not 'Online'. It must be running before anything is changed. In Failover Cluster Manager > Roles, right-click '$($Cl.Group)' > Start Role, then try again."
 }
+# Agreed with Estate Monitor 2026-11-04: a half-done Management Server node (an earlier ServerConfigurator run
+# did not finish, e.g. the Mobile Server hang) cannot start the Management Server, so its role reads Failed /
+# PartialOnline and the health check would refuse the very run that repairs it. Repairable = everything not
+# running in the MS role is a Milestone service resource (the ones the wizard itself takes offline before
+# ServerConfigurator), the Management Server among them - never an IP address, network name or disk. The
+# pre-flight lets such a role through only when a Management Server node also reads half-done.
+function Test-MsRoleRepairable { param($Cl)
+    if(-not $Cl -or $Cl.Key -ne 'MS' -or @('Failed','PartialOnline') -notcontains [string]$Cl.State){ return $false }
+    $down = @(@($Cl.Offline) | Where-Object { -not $_.IsEs })
+    if(-not @($down | Where-Object { $_.Type -eq 'Generic Service' -and ([string]$_.Name -match 'Management Server' -or [string]$_.ServiceName -match 'ManagementServer') }).Count){ return $false }
+    (@($down | Where-Object { $_.Type -ne 'Generic Service' }).Count -eq 0)
+}
 # In-run pause tracking: 'resume' resumes only the nodes THIS run paused; a node that was paused (or
 # Down) before the run is left exactly as it is.
 $script:PausedByRun = @{}
@@ -2966,6 +2994,47 @@ function Set-GatewayStopLimit { param($Box,[string]$Value,[switch]$Restore)
     if($set){ Write-Log "[$($Box.Name)] IIS: stop wait of '$p' set to $Value for ServerConfigurator (was $old; put back afterwards)."; return $old }
     if($note){ Write-Log "[$($Box.Name)] IIS: stop wait of '$p' left as it is ($note)." }
     ''
+}
+# Lab 2026-11-03/04 (2025 R3): ServerConfigurator on a Management Server stops and restarts the Mobile Server
+# ('MobileServerSetManagementServerRegistrar.PreExecute'); when that stop hangs, SC exits 2000 and leaves the
+# node half-configured. The wizard stops it first (kills it if the stop hangs) and starts it again afterwards
+# only when it was running before. Agreed with Estate Monitor 2026-11-04.
+$script:MobileSvcDisplay = 'Milestone XProtect Mobile Server'
+$script:MobileStopSb = { param([string]$Dn,[bool]$Start)
+    $ErrorActionPreference = 'Continue'
+    $s = Get-Service | Where-Object { $_.DisplayName -eq $Dn } | Select-Object -First 1
+    if(-not $s){ return [pscustomobject]@{ Was=''; Note='' } }
+    $was = [string]$s.Status
+    if($Start){
+        if($was -eq 'Running'){ return [pscustomobject]@{ Was=$was; Note='' } }
+        try { Start-Service -Name $s.Name -ErrorAction Stop; return [pscustomobject]@{ Was=$was; Note='' } }
+        catch { return [pscustomobject]@{ Was=$was; Note=$_.Exception.Message } } }
+    if($was -eq 'Stopped'){ return [pscustomobject]@{ Was=$was; Note='' } }
+    $note = ''
+    try { Stop-Service -Name $s.Name -Force -ErrorAction Stop }
+    catch {
+        $svcPid = (Get-CimInstance Win32_Service -Filter "Name='$($s.Name)'").ProcessId
+        if($svcPid){ Stop-Process -Id $svcPid -Force -ErrorAction SilentlyContinue; $note = "the stop hung - killed (pid $svcPid)" } else { $note = $_.Exception.Message } }
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while((Get-Service -Name $s.Name).Status -ne 'Stopped' -and $sw.Elapsed.TotalSeconds -lt 60){ Start-Sleep -Seconds 2 }
+    [pscustomobject]@{ Was=$was; Note=$note } }
+# Returns $true when the Mobile Server was running and was stopped here (put it back with -Restore).
+# Never throws: a failure is logged and ServerConfigurator runs as before.
+function Set-MobileServerStop { param($Box,[switch]$Restore)
+    $r = $null
+    try {
+        $r = if(Test-NodeIsLocal $Box.Target){ & $script:MobileStopSb $script:MobileSvcDisplay ([bool]$Restore) }
+             else { Invoke-OnNode -Node $Box.Target -Cred $Box.Cred -Sb $script:MobileStopSb -ArgumentList $script:MobileSvcDisplay,([bool]$Restore) }
+        $r = @($r) | Select-Object -Last 1
+    } catch { Write-Log "[$($Box.Name)] Mobile Server: could not be checked ($(Get-FirstLine $_.Exception.Message)) - ServerConfigurator runs as before."; return $false }
+    if(-not $r -or -not [string]$r.Was){ return $false }
+    if($Restore){
+        if($r.Note){ Write-Log "[$($Box.Name)] The Mobile Server could NOT be started again ($(Get-FirstLine $r.Note)). Start 'Milestone XProtect Mobile Server' in services.msc on $($Box.Name)." 'Err' }
+        elseif($r.Was -ne 'Running'){ Write-Log "[$($Box.Name)] Mobile Server started again." }
+        return $false }
+    if($r.Was -ne 'Running'){ Write-Log "[$($Box.Name)] Mobile Server is $($r.Was) - left as it is."; return $false }
+    Write-Log "[$($Box.Name)] Mobile Server stopped before ServerConfigurator$(if($r.Note){" ($($r.Note))"}) - its stop can hang ServerConfigurator; it is started again afterwards."
+    $true
 }
 # ServerConfigurator on ONE cluster node with an already imported certificate. ADAPTED from
 # $script:HostWorker (MS) / $script:EsHostWorker (ES): the same engine calls and the same verdict
@@ -3393,7 +3462,7 @@ function Invoke-ClusterNodeStep { param([string]$Key,$Box,[bool]$Want,[string]$T
     if(-not $mv.Ok){
         $out.Why = "The cluster role could not be moved to $($Box.Name), so nothing was changed on that node."; $out.Tech = $mv.Detail
         Add-GuidedRow $Box $act $false 'the cluster role could not be moved here - nothing changed' $mv.Detail; return $out }
-    $r = $null; $gwOld = ''
+    $r = $null; $gwOld = ''; $mobStopped = $false
     $sus = Invoke-ClusterOp $Key 'suspend'
     try {
         if(-not $sus.Ok){ throw "Not every cluster node could be paused, so ServerConfigurator was NOT run on $($Box.Name). $($sus.Detail)" }
@@ -3404,6 +3473,7 @@ function Invoke-ClusterNodeStep { param([string]$Key,$Box,[bool]$Want,[string]$T
             if(Test-NodeIsLocal $Box.Target){ [void](Wait-MsIdpReady -MsFqdn $Box.Addr) }
             else { [void](Wait-NodeMsSettled -Box $Box -WantRunning $false) }
             $gwOld = Set-GatewayStopLimit $Box $script:GatewayStopLimit
+            $mobStopped = Set-MobileServerStop $Box
         }
         Set-StageStatus $Key "$($Box.Name): ServerConfigurator is running (turn encryption $($act.ToUpper()))..." 'Work'
         $r = Invoke-NodeSc -Key $Key -Box $Box -Want $Want -Thumbprint $Thumbprint
@@ -3413,6 +3483,7 @@ function Invoke-ClusterNodeStep { param([string]$Key,$Box,[bool]$Want,[string]$T
     } catch { $out.Why = Get-PlainReason (Format-Err $_); $out.Tech = Format-Err $_ }
     finally {
         if($gwOld){ [void](Set-GatewayStopLimit $Box $gwOld -Restore) }
+        if($mobStopped){ [void](Set-MobileServerStop $Box -Restore) }
         $rs = Invoke-ClusterOp $Key 'resume'
         $resumeFail = ''
         if(-not $rs.Ok){
@@ -3629,7 +3700,7 @@ function Get-RecConnectHint { param([string]$Detail)
 
 # -- pre-flight: before ANY change. Returns plain-language problems; empty = OK to go. -------------
 function Get-PreFlightProblems { param([ValidateSet('on','off','register','rollback')][string]$Mode,[bool]$Want)
-    $p = [System.Collections.Generic.List[string]]::new()
+    $p = [System.Collections.Generic.List[string]]::new(); $msRepair = ''
     Write-Log "PRE-FLIGHT CHECK ($Mode) - nothing is changed until it passes" 'Good'
     if($script:MsDetectError){ $p.Add("Could not check whether this Management Server is part of a Windows failover cluster: $($script:MsDetectError)") }
     if($Mode -ne 'register' -and $script:EsBox -and $script:EsDetectError){ $p.Add("Could not check whether the Event Server ($($script:EsAddr)) is part of a Windows failover cluster (a cluster = several computers that take turns running the same server): $($script:EsDetectError)") }
@@ -3654,7 +3725,9 @@ function Get-PreFlightProblems { param([ValidateSet('on','off','register','rollb
         # unhealthy. Register still refuses when this node does not own the role (Invoke-RegisterActionCore),
         # rollback still requires every node Up (above), and a clustered MS takeover (Enter-MsNode) does not
         # need the Management Server itself to be running.
-        if($Mode -ne 'register' -and $Mode -ne 'rollback'){ $h = Get-ClusterHealthProblem $cl; if($h){ $p.Add($h) } }
+        if($Mode -ne 'register' -and $Mode -ne 'rollback'){
+            $h = Get-ClusterHealthProblem $cl
+            if($h -and (Test-MsRoleRepairable $cl)){ $msRepair = $h } elseif($h){ $p.Add($h) } }
     }
     if($Mode -ne 'register'){ $script:AdminRoleSids = @(); $a = Get-MilestoneAdminProblem; if($a){ $p.Add($a) } }
     if($Want -and $Mode -ne 'register' -and @($script:RecBoxes | Where-Object { -not $_.Excluded -and (Test-InScope $_) -and $_.Encrypted -ne $true }).Count){
@@ -3663,6 +3736,10 @@ function Get-PreFlightProblems { param([ValidateSet('on','off','register','rollb
     $boxes = @(if($Mode -eq 'register'){ @(Get-MsBoxes | Where-Object { -not $_.IsNode -or (Test-NodeIsLocal ([string]$_.Target)) }) } else { @(Get-MsBoxes) })
     if($Mode -ne 'register'){ $boxes += @(Get-EsBoxes); $boxes += @($script:RecBoxes | Where-Object { -not $_.Excluded -and (Test-InScope $_) }) }
     Update-BoxStates $boxes
+    if($msRepair){
+        $half = @(Get-MsBoxes | Where-Object { $_.Half })
+        if($half.Count){ Write-Log "REPAIR RUN: the Management Server role is not running because $((@($half | ForEach-Object { $_.Name })) -join ', ') is half-done (an earlier ServerConfigurator run did not finish). This run configures it again; the Management Server must come back up at the end, or the run stops there." 'Err' }
+        else { $p.Add($msRepair) } }
     foreach($b in $boxes){
         # W9/W4: an Unknown state (netsh unreadable, or RecorderConfig.xml AND the bindings both unusable)
         # is a pre-flight problem on EVERY box kind, including recorders - never silently treated as "not
@@ -4187,8 +4264,11 @@ function Invoke-MsStage { param([bool]$Want)
           ExtraSans=$script:MsExtraSans; ScPaths=$script:ScSearchPaths }
     Set-RoleCertParams $P 'MS'
     $gwOld = Set-GatewayStopLimit $ms $script:GatewayStopLimit
+    $mobStopped = Set-MobileServerStop $ms
     try { $r = & $script:HostWorker $P }
-    finally { if($gwOld){ [void](Set-GatewayStopLimit $ms $gwOld -Restore) } }
+    finally {
+        if($gwOld){ [void](Set-GatewayStopLimit $ms $gwOld -Restore) }
+        if($mobStopped){ [void](Set-MobileServerStop $ms -Restore) } }
     Add-RunResult $r
     foreach($l in $r.Logs){ Write-Log "[$($r.Target)] $l" }
     Write-Log "[$($r.Target)] $(if($r.Ok){'OK'}else{'FAILED'}): $($r.Status)" $(if($r.Ok){'Good'}else{'Err'})

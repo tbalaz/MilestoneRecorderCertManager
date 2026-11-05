@@ -817,7 +817,11 @@ function Repair-WedgedService {
             }
         }
         $out.Add((& $stopOne $Dn))
-        foreach($sib in 'Milestone XProtect Data Collector Server','Milestone XProtect Log Server'){
+        # The Mobile Server joins the siblings of a Management Server bounce: SC stops and restarts it
+        # ('MobileServerSetManagementServerRegistrar') and in 2025 R3 that stop can hang (lab 2026-11-03/04).
+        $sibs=@('Milestone XProtect Data Collector Server','Milestone XProtect Log Server')
+        if($Dn -like '*Management Server*'){ $sibs+='Milestone XProtect Mobile Server' }
+        foreach($sib in $sibs){
             if($sib -ne $Dn){ $out.Add((& $stopOne $sib)) }
         }
         $svc=Get-Service | Where-Object { $_.DisplayName -eq $Dn }
@@ -853,27 +857,39 @@ function Invoke-ScWithWedgeRetry {
     param([string]$ComputerName,[pscredential]$Credential,[string]$Thumbprint,[string]$CertificateGroup,
           [ValidateSet('enableencryption','disableencryption')][string]$Action,
           [System.Collections.Generic.List[string]]$WorkLog,[string]$GroupName,[string]$ScPaths='')
+    if(-not (Test-Path variable:script:WedgeDepth)){ $script:WedgeDepth = 0 }   # StrictMode-safe init (runspaces too)
+    $m=''; $sc='10000'
     try {
-        Invoke-RemoteServerEncryption -ComputerName $ComputerName -Credential $Credential -UseSsl:$false `
+        $r = Invoke-RemoteServerEncryption -ComputerName $ComputerName -Credential $Credential -UseSsl:$false `
             -Thumbprint $Thumbprint -ServerConfiguratorPath $ScPaths -ScCredential $Credential -CertificateGroup $CertificateGroup -Action $Action
     } catch {
         $m=$_.Exception.Message
         if($m -notmatch 'cannot accept control messages|Unable to (?:stop|restart) the service|Could not stop service'){ throw }
-        if(-not (Test-Path variable:script:WedgeDepth)){ $script:WedgeDepth = 0 }   # StrictMode-safe init (runspaces too)
         if($script:WedgeDepth -ge 3){ $WorkLog.Add("[$GroupName] WEDGE: giving up after 3 recovery attempts"); throw }   # bounded: SC + up to 3 recoveries
-        $dn=if($m -match 'Unable to (?:stop|restart) the service (.+?)\.'){ $Matches[1].Trim() }
-            elseif($m -match 'Could not stop service MilestoneEventServer'){ 'Milestone XProtect Event Server' }   # SC names the ES by its service name (MilestoneEventServerService)
-            elseif($m -match 'Could not stop service (Milestone XProtect [A-Za-z ]+?Server)'){ $Matches[1].Trim() }   # SC 20000 PreExecute CouldNotStopServer variant
-            else { 'Milestone XProtect Management Server' }
-        $WorkLog.Add("[$GroupName] WEDGE: '$dn' stuck - SC could not stop/restart it (SC 10000) - bouncing it and retrying SC (recovery $($script:WedgeDepth + 1) of 3)")
-        # DEVIATION (required wiring for Repair-WedgedService's DEVIATION 1 above): the base only
-        # restarted a wedged Management Server before the retry; a wedged Event Server must also be
-        # restarted here, or Repair-WedgedService leaves it stopped and the SC retry has nothing to apply to.
-        $want=($Action -eq 'enableencryption') -and (($dn -like '*Management Server*') -or ($dn -like '*Event Server*'))
-        foreach($l in @(Repair-WedgedService -ComputerName $ComputerName -Credential $Credential -UseSsl:$false -DisplayName $dn -WantRunning $want)){ $WorkLog.Add("[$GroupName] $l") }
-        $script:WedgeDepth++
-        try { Invoke-ScWithWedgeRetry @PSBoundParameters } finally { $script:WedgeDepth-- }
     }
+    if(-not $m){
+        # Exit 2000 = SC applied, then a post-apply step failed. When that step is a service SC could not
+        # stop/restart (2025 R3: 'MobileServerSetManagementServerRegistrar.PreExecute' CouldNotStopServer on
+        # the Mobile Server, lab 2026-11-03/04), the Management Server is left half-configured and does not
+        # start: bounce that service and rerun the SAME SC invocation ONCE (never inside another recovery).
+        $last=@($r) | Where-Object { $_ -and $_.PSObject.Properties['ExitCode'] } | Select-Object -Last 1
+        if(-not $last -or [int64]$last.ExitCode -ne 2000 -or $script:WedgeDepth -gt 0){ return $r }
+        $m=(@($last.Logs) -join ' || ')
+        if($m -notmatch 'Unable to (?:stop|restart) the service|Could not stop service'){ return $r }
+        $sc='2000'
+    }
+    $dn=if($m -match 'Unable to (?:stop|restart) the service (.+?)\.'){ $Matches[1].Trim() }
+        elseif($m -match 'Could not stop service MilestoneEventServer'){ 'Milestone XProtect Event Server' }   # SC names the ES by its service name (MilestoneEventServerService)
+        elseif($m -match 'Could not stop service (Milestone XProtect [A-Za-z ]+?Server)'){ $Matches[1].Trim() }   # SC 20000 PreExecute CouldNotStopServer variant
+        else { 'Milestone XProtect Management Server' }
+    $WorkLog.Add("[$GroupName] WEDGE: '$dn' stuck - SC could not stop/restart it (SC $sc) - bouncing it and retrying SC (recovery $($script:WedgeDepth + 1) of 3)")
+    # DEVIATION (required wiring for Repair-WedgedService's DEVIATION 1 above): the base only
+    # restarted a wedged Management Server before the retry; a wedged Event Server must also be
+    # restarted here, or Repair-WedgedService leaves it stopped and the SC retry has nothing to apply to.
+    $want=($Action -eq 'enableencryption') -and (($dn -like '*Management Server*') -or ($dn -like '*Event Server*'))
+    foreach($l in @(Repair-WedgedService -ComputerName $ComputerName -Credential $Credential -UseSsl:$false -DisplayName $dn -WantRunning $want)){ $WorkLog.Add("[$GroupName] $l") }
+    $script:WedgeDepth++
+    try { Invoke-ScWithWedgeRetry @PSBoundParameters } finally { $script:WedgeDepth-- }
 }
 
 # -- Post-apply confirmation (reconnect-tolerant), Event Server variant -----
