@@ -814,7 +814,7 @@ function Invoke-RemoteServerEncryption {
 # 'The service cannot accept control messages at this time') - SC exits 10000 having applied
 # NOTHING. No passive probe detects the wedge beforehand (interrogate returns 1061 even on healthy
 # VideoOS services), so SC's own failure IS the detection. This bounces the wedged service on the
-# TARGET machine (Stop-Service, kill if the stop itself hits 1061) plus the two known wedge-prone
+# TARGET machine (stop; kill if refused (1061) or not stopped after 60 s) plus the two known wedge-prone
 # siblings SC also has to stop (Log Server, Data Collector - left STOPPED on purpose; stopped is
 # valid SC input and SC starts them itself). When the caller needs the service running again
 # (Management Server before an enable, or SC skips the IIS 443 rebind) it is restarted and given
@@ -832,12 +832,15 @@ function Repair-WedgedService {
             $s=Get-Service | Where-Object { $_.DisplayName -eq $d }
             if(-not $s){ return "service '$d' not present" }
             if($s.Status -eq 'Stopped'){ return "$d already stopped" }
-            try { Stop-Service -Name $s.Name -Force -ErrorAction Stop; "stopped $d" }
-            catch {
-                $svcPid=(Get-CimInstance Win32_Service -Filter "Name='$($s.Name)'").ProcessId
-                if($svcPid){ Stop-Process -Id $svcPid -Force -ErrorAction SilentlyContinue; "killed $d (pid $svcPid)" }
-                else { "could not stop $d ($($_.Exception.Message))" }
-            }
+            # Ask once, then wait at most 60 s (owner 2026-11-06): Stop-Service has no time limit and waits for ever
+            # on a service that accepts the stop and then hangs in StopPending. Refused (1061) or still running = kill.
+            $refused=''
+            try { $s.Stop() } catch { $refused=$_.Exception.Message }
+            if(-not $refused){ try { $s.WaitForStatus('Stopped',[TimeSpan]::FromSeconds(60)); return "stopped $d" } catch {} }
+            $svcPid=(Get-CimInstance Win32_Service -Filter "Name='$($s.Name)'").ProcessId
+            $why=$(if($refused){ "stop refused: $refused" } else { 'not stopped after 60 s' })
+            if($svcPid){ Stop-Process -Id $svcPid -Force -ErrorAction SilentlyContinue; "killed $d (pid $svcPid, $why)" }
+            else { "could not stop $d ($why)" }
         }
         $out.Add((& $stopOne $Dn))
         # The Mobile Server joins the siblings of a Management Server bounce: SC stops and restarts it
@@ -900,6 +903,12 @@ function Invoke-ScWithWedgeRetry {
         elseif($m -match 'Could not stop service MilestoneEventServer'){ 'Milestone XProtect Event Server' }   # SC names the ES by its service name (MilestoneEventServerService)
         elseif($m -match 'Could not stop service (Milestone XProtect [A-Za-z ]+?Server)'){ $Matches[1].Trim() }   # SC 20000 PreExecute CouldNotStopServer variant
         else { 'Milestone XProtect Management Server' }
+    # Only a Milestone XProtect service is stopped or killed here (owner 2026-11-06): SC names it in free text.
+    if($dn -notlike 'Milestone XProtect *'){
+        $WorkLog.Add("[$GroupName] WEDGE: SC could not stop/restart '$dn' (SC $sc). It is not a Milestone XProtect service, so this tool does not stop it: stop it by hand, then run again.")
+        if($sc -eq '2000'){ return $r }
+        throw $m
+    }
     $WorkLog.Add("[$GroupName] WEDGE: '$dn' stuck - SC could not stop/restart it (SC $sc) - bouncing it and retrying SC (recovery $($script:WedgeDepth + 1) of 3)")
     $want=($Action -eq 'enableencryption') -and ($dn -like '*Management Server*')
     foreach($l in @(Repair-WedgedService -ComputerName $ComputerName -Credential $Credential -UseSsl:$false -DisplayName $dn -WantRunning $want)){ $WorkLog.Add("[$GroupName] $l") }
@@ -1285,11 +1294,13 @@ function Set-Busy { param([bool]$Busy)
 # sibling is a valid SC input (it starts them again after the apply).
 function Clear-WedgedMilestoneSiblings {
     foreach($sb in (Get-Service | Where-Object { $_.DisplayName -in 'Milestone XProtect Log Server','Milestone XProtect Data Collector Server' -and $_.Status -eq 'Running' })){
-        try { Stop-Service $sb.Name -Force -ErrorAction Stop; Write-Log "readiness gate stopped $($sb.DisplayName) (ServerConfigurator restarts it)" }
-        catch {
+        # Owner 2026-11-06: at most 60 s - a stop that is accepted and then hangs is killed like a refused one.
+        $stopped = $false
+        try { $sb.Stop(); $sb.WaitForStatus('Stopped',[TimeSpan]::FromSeconds(60)); $stopped = $true; Write-Log "readiness gate stopped $($sb.DisplayName) (ServerConfigurator restarts it)" } catch {}
+        if(-not $stopped){
             $ci = Get-CimInstance Win32_Service -Filter "DisplayName='$($sb.DisplayName)'"
             if($ci -and $ci.ProcessId -gt 0){
-                Write-Log "$($sb.DisplayName) control handler wedged - killing pid $($ci.ProcessId)" 'Err'
+                Write-Log "$($sb.DisplayName) control handler wedged or not stopped after 60 s - killing pid $($ci.ProcessId)" 'Err'
                 Stop-Process -Id $ci.ProcessId -Force -ErrorAction SilentlyContinue
             }
         }
@@ -1334,7 +1345,17 @@ function Wait-MsIdpReady { param([string]$MsFqdn,[int]$TimeoutSec=600,[switch]$W
             $svc.Refresh()
             if($svc.Status -eq 'Stopped'){ Clear-WedgedMilestoneSiblings; Write-Log 'MS service stopped - ready for ServerConfigurator (it will start it)'; return $true }
             if($svc.Status -eq 'Running'){
-                try { Stop-Service $svc.Name -Force -ErrorAction Stop; Clear-WedgedMilestoneSiblings; Write-Log 'MS service stopped by readiness gate - ServerConfigurator will start it'; return $true }
+                try {
+                    $svc.Stop()
+                    # Owner 2026-11-06: an accepted stop that hangs is killed after 60 s (Stop-Service waited for ever).
+                    try { $svc.WaitForStatus('Stopped',[TimeSpan]::FromSeconds(60)) }
+                    catch {
+                        $ci = Get-CimInstance Win32_Service -Filter "DisplayName='Milestone XProtect Management Server'"
+                        if($ci -and $ci.ProcessId -gt 0){
+                            Write-Log "MS service did not stop within 60 s - killing pid $($ci.ProcessId) so ServerConfigurator can proceed" 'Err'
+                            Stop-Process -Id $ci.ProcessId -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 5 }
+                    }
+                    Clear-WedgedMilestoneSiblings; Write-Log 'MS service stopped by readiness gate - ServerConfigurator will start it'; return $true }
                 catch {
                     Write-Log "MS service not stoppable yet ($($_.Exception.Message.Split([char]10)[0])) - waiting"
                     # The VideoOS service control handler can wedge permanently (error 1061 while the

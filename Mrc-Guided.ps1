@@ -28,7 +28,8 @@
                     your own CA instead of a new one signed by the signing CA (then no signing CA at all):
                     one .p12/.pfx per recording server (<computer-fqdn>.p12), one for the Management
                     Server and one for the Event Server, each named after the address the role is
-                    registered under (clustered: the cluster address; the same file goes on every node),
+                    registered under (clustered: the cluster address; the same file goes on every node)
+                    or with any name if its certificate carries that address,
                     plus an optional root CA file added to LocalMachine\Root on every server that gets one.
         2 Check   - every computer: reachable or not, and its REAL encryption state.
         3 Action  - 'Turn encryption ON' / 'Turn encryption OFF', with live progress per step and a
@@ -97,8 +98,8 @@
     register computers that point to a different management-server address (Server Configurator
     /register); without it such a computer fails the pre-flight check (status only reports it).
     -CertFolder <dir> -CertPwFile <file> [-RootCaFile <cer>] gives every server a prepared certificate
-    (<recorder-fqdn>.p12 per recorder, <ms-address>.p12 and <es-address>.p12 for the roles, .p12 or .pfx in
-    <dir>) instead of a new one. <file> holds the passwords: one line per certificate, <file name>;<password>
+    (<recorder-fqdn>.p12 per recorder, <ms-address>.p12 and <es-address>.p12 for the roles - or a role file
+    with any name whose certificate carries that address - .p12 or .pfx in <dir>) instead of a new one. <file> holds the passwords: one line per certificate, <file name>;<password>
     (or one single line, the password of all files). The pre-flight check names every
     missing file and opens and checks every file (password, private key, name, validity,
     Server Authentication, issued by the root CA) before anything is changed.
@@ -880,7 +881,7 @@ function Invoke-RemoteServerEncryption {
 # 'The service cannot accept control messages at this time') - SC exits 10000 having applied
 # NOTHING. No passive probe detects the wedge beforehand (interrogate returns 1061 even on healthy
 # VideoOS services), so SC's own failure IS the detection. This bounces the wedged service on the
-# TARGET machine (Stop-Service, kill if the stop itself hits 1061) plus the two known wedge-prone
+# TARGET machine (stop; kill if refused (1061) or not stopped after 60 s) plus the two known wedge-prone
 # siblings SC also has to stop (Log Server, Data Collector - left STOPPED on purpose; stopped is
 # valid SC input and SC starts them itself). When the caller needs the service running again
 # (before an enable retry) it is restarted and given the settle window before the SC retry.
@@ -897,12 +898,15 @@ function Repair-WedgedService {
             $s=Get-Service | Where-Object { $_.DisplayName -eq $d }
             if(-not $s){ return "service '$d' not present" }
             if($s.Status -eq 'Stopped'){ return "$d already stopped" }
-            try { Stop-Service -Name $s.Name -Force -ErrorAction Stop; "stopped $d" }
-            catch {
-                $svcPid=(Get-CimInstance Win32_Service -Filter "Name='$($s.Name)'").ProcessId
-                if($svcPid){ Stop-Process -Id $svcPid -Force -ErrorAction SilentlyContinue; "killed $d (pid $svcPid)" }
-                else { "could not stop $d ($($_.Exception.Message))" }
-            }
+            # Ask once, then wait at most 60 s (owner 2026-11-06): Stop-Service has no time limit and waits for ever
+            # on a service that accepts the stop and then hangs in StopPending. Refused (1061) or still running = kill.
+            $refused=''
+            try { $s.Stop() } catch { $refused=$_.Exception.Message }
+            if(-not $refused){ try { $s.WaitForStatus('Stopped',[TimeSpan]::FromSeconds(60)); return "stopped $d" } catch {} }
+            $svcPid=(Get-CimInstance Win32_Service -Filter "Name='$($s.Name)'").ProcessId
+            $why=$(if($refused){ "stop refused: $refused" } else { 'not stopped after 60 s' })
+            if($svcPid){ Stop-Process -Id $svcPid -Force -ErrorAction SilentlyContinue; "killed $d (pid $svcPid, $why)" }
+            else { "could not stop $d ($why)" }
         }
         $out.Add((& $stopOne $Dn))
         # The Mobile Server joins the siblings of a Management Server bounce: SC stops and restarts it
@@ -970,6 +974,12 @@ function Invoke-ScWithWedgeRetry {
         elseif($m -match 'Could not stop service MilestoneEventServer'){ 'Milestone XProtect Event Server' }   # SC names the ES by its service name (MilestoneEventServerService)
         elseif($m -match 'Could not stop service (Milestone XProtect [A-Za-z ]+?Server)'){ $Matches[1].Trim() }   # SC 20000 PreExecute CouldNotStopServer variant
         else { 'Milestone XProtect Management Server' }
+    # Only a Milestone XProtect service is stopped or killed here (owner 2026-11-06): SC names it in free text.
+    if($dn -notlike 'Milestone XProtect *'){
+        $WorkLog.Add("[$GroupName] WEDGE: SC could not stop/restart '$dn' (SC $sc). It is not a Milestone XProtect service, so this tool does not stop it: stop it by hand, then run again.")
+        if($sc -eq '2000'){ return $r }
+        throw $m
+    }
     $WorkLog.Add("[$GroupName] WEDGE: '$dn' stuck - SC could not stop/restart it (SC $sc) - bouncing it and retrying SC (recovery $($script:WedgeDepth + 1) of 3)")
     # DEVIATION (required wiring for Repair-WedgedService's DEVIATION 1 above): the base only
     # restarted a wedged Management Server before the retry; a wedged Event Server must also be
@@ -1255,6 +1265,26 @@ function Find-CertFile { param([string]$Folder,[string[]]$Fqdn)
     if($hit.Count -gt 1){ throw "more than one certificate file fits $f ($((@($hit | ForEach-Object { $_.Name })) -join ', ')). Keep only $f.p12 in the folder." }
     if($hit.Count){ $hit[0].FullName } else { '' }
 }
+function Find-CertFileByContent { param([string]$Folder,[string[]]$Names)
+    # A role file named after something else (owner 2026-11-06: files named after a DNS alias, the cluster network
+    # name only in the SAN): opens every .p12/.pfx with its password and returns the ONE file whose certificate with
+    # a private key carries one of the names. An exact name beats a wildcard; several of a kind = refuse, never
+    # guess. Files that cannot be opened are skipped and listed in Unreadable.
+    $want=@(@($Names) | ForEach-Object { ([string]$_).Trim().TrimEnd('.').ToLowerInvariant() } | Where-Object { $_ })
+    $exact=@(); $wild=@(); $bad=@()
+    foreach($f in @(Get-ChildItem -LiteralPath $Folder -File -ErrorAction Stop | Where-Object { $_.Extension -in '.p12','.pfx' })){
+        $col=[System.Security.Cryptography.X509Certificates.X509Certificate2Collection]::new()
+        try {
+            $fpw=Get-CertFilePw $f.FullName; $plain=if($fpw){ [System.Net.NetworkCredential]::new('',$fpw).Password } else { '' }
+            $col.Import($f.FullName,$plain,[System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::DefaultKeySet)
+            $cn=@(foreach($c in @($col | Where-Object { $_.HasPrivateKey })){ Get-CertNames $c })
+            if(@($want | Where-Object { $cn -contains $_ }).Count){ $exact+=$f.FullName } elseif($cn.Count -and (Test-CertNameMatch $cn $want)){ $wild+=$f.FullName }
+        } catch { $bad+=$f.Name } finally { foreach($x in $col){ $x.Reset() } }
+    }
+    $hit=@(if($exact.Count){ $exact } else { $wild })
+    if($hit.Count -gt 1){ throw "more than one certificate file carries $($want -join ' or ') ($((@($hit | ForEach-Object { [IO.Path]::GetFileName($_) })) -join ', ')). Keep only the right one, or name it $($want[0]).p12." }
+    [pscustomobject]@{ File=$(if($hit.Count){ $hit[0] } else { '' }); Unreadable=@($bad) }
+}
 # Passwords file (owner 2026-11-05: "every cert (.p12) has it's own password"): one line per certificate,
 # <file name>.p12;<password>. The first ';', TAB or ',' after the file name splits, the rest is the password.
 # Empty lines, # lines and a heading line are skipped. One single line of any other form = the password of all
@@ -1378,9 +1408,16 @@ function Get-CertFileProblems { param([object[]]$Boxes,[string[]]$Roles=@())
         try {
             $spec = Get-RoleCertSpec $k
             $file = ''; foreach($n in $spec.Lookup){ $file = Find-CertFile $dir $n; if($file){ break } }
-            if(-not $file){ $p.Add("No certificate file for the $what ($($spec.Name)): expected $(Join-Path $dir "$($spec.Name).p12")."); continue }
+            $byContent = $false
+            if(-not $file){
+                $bc = Find-CertFileByContent $dir @($spec.Lookup); $file = $bc.File; $byContent = [bool]$file
+                if(-not $file){
+                    $un = @($bc.Unreadable); $unTxt = if($un.Count){ " Could not open (password?): $((@($un | Select-Object -First 5)) -join ', ')$(if($un.Count -gt 5){ " and $($un.Count - 5) more" })." } else { '' }
+                    $p.Add("No certificate file for the $what ($($spec.Name)): expected $(Join-Path $dir "$($spec.Name).p12"), or a file whose certificate carries $($spec.Lookup -join ' or ').$unTxt"); continue }
+            }
             $fpw = Get-CertFilePw $file
             $c = Test-CertFile -Path $file -Password $fpw -Names @($spec.Lookup) -RootCa $root
+            if($byContent){ Write-Log "[$what] $([IO.Path]::GetFileName($file)) is not named after $($spec.Name); its certificate carries $([string](Get-First -Items @($spec.Lookup | Where-Object { Test-CertNameMatch $c.Names @($_) }))), so it is the $what file." }
             $lack = @(@($spec.Need) | Where-Object { -not (Test-CertNameMatch $c.Names @($_)) })
             if($lack.Count){ $p.Add("$($what): $([IO.Path]::GetFileName($file)) does not carry $($lack -join ', '). Every $what node registers itself with the Management Server under its own name, and the API Gateway checks the certificate against that name. Add every node name to the certificate (Subject Alternative Name)."); continue }
             $miss = @(@($spec.Lookup) + @($spec.Also) | Where-Object { -not (Test-CertNameMatch $c.Names @($_)) } | Select-Object -Unique)
@@ -1451,6 +1488,51 @@ function Test-EsRegistrationFailed { param([string[]]$ScLogs)
 }
 function Get-EsNotRegisteredMsg { param([int64]$ExitCode,[string]$What)
     "exit$ExitCode($What APPLIED LOCALLY but NOT REGISTERED with the management server - the MS still has the previous state; check this server resolves/reaches the MS address and re-run)"
+}
+# -- Event Server registrations still pending (owner 2026-11-06) ----------------------------------------
+# An ES node whose ServerConfigurator run changed the setting locally but did not register it with the Management
+# Server (exit 20 TimeoutException, exit 60 ServiceRegistrationNotFound) reads as done on the next run, which then
+# skipped it. This file in $script:RunsDir remembers such nodes; the next run in the same direction configures them
+# again, and a successful run removes the entry. A missing or damaged file means no entries, never an error.
+function Get-EsPendingFile { Join-Path $script:RunsDir 'es-registration-pending.json' }
+function Get-EsPending {
+    $h=@{}; $f=Get-EsPendingFile
+    if(-not (Test-Path -LiteralPath $f)){ return $h }
+    try { $j=ConvertFrom-Json -InputObject ([IO.File]::ReadAllText($f))
+          foreach($e in $j){ if($e -and $e.Target){ $h[([string]$e.Target).ToUpperInvariant()]=[pscustomobject]@{ Want=[bool]$e.Want; At=[string]$e.At } } } }
+    catch { Write-Log "The list of Event Server nodes still to register ($f) could not be read - ignored: $(Get-FirstLine $_.Exception.Message)" 'Err'; return @{} }
+    $h
+}
+function Set-EsPending { param([string]$Target,[bool]$Want,[bool]$Pending)
+    $h=Get-EsPending; $k=$Target.ToUpperInvariant()
+    if($Pending){ $h[$k]=[pscustomobject]@{ Want=$Want; At=(Get-Date).ToString('yyyy-MM-dd HH:mm') } }
+    elseif($h.ContainsKey($k)){ $h.Remove($k) } else { return }
+    try {
+        if(-not (Test-Path -LiteralPath $script:RunsDir)){ [void](New-Item -ItemType Directory -Path $script:RunsDir -Force) }
+        $rows=@(foreach($x in @($h.Keys)){ [pscustomobject]@{ Target=$x; Want=$h[$x].Want; At=$h[$x].At } })
+        [IO.File]::WriteAllText((Get-EsPendingFile), (ConvertTo-Json -InputObject $rows -Depth 3))
+    } catch { Write-Log "Could not save the list of Event Server nodes still to register: $(Get-FirstLine $_.Exception.Message)" 'Err' }
+}
+# After an Event Server ServerConfigurator result: a registration failure adds the node, a success removes it.
+function Update-EsPending { param($Box,[bool]$Want,$Result)
+    if(-not $Result){ return }
+    if($Result.Ok){ Set-EsPending ([string]$Box.Target) $Want $false; return }
+    if([string]$Result.Status -match 'NOT REGISTERED with the management server'){
+        Set-EsPending ([string]$Box.Target) $Want $true
+        Write-Log "$($Box.Name): ServerConfigurator changed the setting there but did not register it with the Management Server. The next 'Turn encryption $(if($Want){'ON'}else{'OFF'})' runs it on $($Box.Name) again." 'Err' }
+}
+# The Event Server boxes a run configures: local state differs from the target, or a registration for the same
+# target is still pending there.
+function Get-EsTodo { param([object[]]$Boxes,[bool]$Want)
+    $pend=Get-EsPending
+    @(foreach($b in @($Boxes)){
+        if(-not (Test-InScope $b)){ continue }
+        if($b.Encrypted -ne $Want){ $b; continue }
+        $e=$pend[([string]$b.Target).ToUpperInvariant()]
+        if($e -and $e.Want -eq $Want){
+            Write-Log "$($b.Name) already reads $(if($Want){'ON'}else{'OFF'}), but its last ServerConfigurator run ($($e.At)) did not register the change with the Management Server - running it again there."
+            $b }
+    })
 }
 
 # Per-host enable/disable worker for the Management Server (serial, this thread) and the recording
@@ -1653,11 +1735,13 @@ function Set-Busy { param([bool]$Busy)
 # sibling is a valid SC input (it starts them again after the apply).
 function Clear-WedgedMilestoneSiblings {
     foreach($sb in (Get-Service | Where-Object { $_.DisplayName -in 'Milestone XProtect Log Server','Milestone XProtect Data Collector Server' -and $_.Status -eq 'Running' })){
-        try { Stop-Service $sb.Name -Force -ErrorAction Stop; Write-Log "readiness gate stopped $($sb.DisplayName) (ServerConfigurator restarts it)" }
-        catch {
+        # Owner 2026-11-06: at most 60 s - a stop that is accepted and then hangs is killed like a refused one.
+        $stopped = $false
+        try { $sb.Stop(); $sb.WaitForStatus('Stopped',[TimeSpan]::FromSeconds(60)); $stopped = $true; Write-Log "readiness gate stopped $($sb.DisplayName) (ServerConfigurator restarts it)" } catch {}
+        if(-not $stopped){
             $ci = Get-CimInstance Win32_Service -Filter "DisplayName='$($sb.DisplayName)'"
             if($ci -and $ci.ProcessId -gt 0){
-                Write-Log "$($sb.DisplayName) control handler wedged - killing pid $($ci.ProcessId)" 'Err'
+                Write-Log "$($sb.DisplayName) control handler wedged or not stopped after 60 s - killing pid $($ci.ProcessId)" 'Err'
                 Stop-Process -Id $ci.ProcessId -Force -ErrorAction SilentlyContinue
             }
         }
@@ -1702,7 +1786,17 @@ function Wait-MsIdpReady { param([string]$MsFqdn,[int]$TimeoutSec=600,[switch]$W
             $svc.Refresh()
             if($svc.Status -eq 'Stopped'){ Clear-WedgedMilestoneSiblings; Write-Log 'MS service stopped - ready for ServerConfigurator (it will start it)'; return $true }
             if($svc.Status -eq 'Running'){
-                try { Stop-Service $svc.Name -Force -ErrorAction Stop; Clear-WedgedMilestoneSiblings; Write-Log 'MS service stopped by readiness gate - ServerConfigurator will start it'; return $true }
+                try {
+                    $svc.Stop()
+                    # Owner 2026-11-06: an accepted stop that hangs is killed after 60 s (Stop-Service waited for ever).
+                    try { $svc.WaitForStatus('Stopped',[TimeSpan]::FromSeconds(60)) }
+                    catch {
+                        $ci = Get-CimInstance Win32_Service -Filter "DisplayName='Milestone XProtect Management Server'"
+                        if($ci -and $ci.ProcessId -gt 0){
+                            Write-Log "MS service did not stop within 60 s - killing pid $($ci.ProcessId) so ServerConfigurator can proceed" 'Err'
+                            Stop-Process -Id $ci.ProcessId -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 5 }
+                    }
+                    Clear-WedgedMilestoneSiblings; Write-Log 'MS service stopped by readiness gate - ServerConfigurator will start it'; return $true }
                 catch {
                     Write-Log "MS service not stoppable yet ($($_.Exception.Message.Split([char]10)[0])) - waiting"
                     # The VideoOS service control handler can wedge permanently (error 1061 while the
@@ -2547,10 +2641,12 @@ $script:MsSettleProbeSb = {
     $log = [System.Collections.Generic.List[string]]::new(); $ready = $false
     $clear = {
         foreach($sb in @(Get-Service | Where-Object { $_.DisplayName -in 'Milestone XProtect Log Server','Milestone XProtect Data Collector Server' -and $_.Status -eq 'Running' })){
-            try { Stop-Service $sb.Name -Force -ErrorAction Stop; $log.Add("readiness gate stopped $($sb.DisplayName) (ServerConfigurator restarts it)") }
-            catch {
+            # Owner 2026-11-06: at most 60 s, then kill (as Clear-WedgedMilestoneSiblings).
+            $stopped = $false
+            try { $sb.Stop(); $sb.WaitForStatus('Stopped',[TimeSpan]::FromSeconds(60)); $stopped = $true; $log.Add("readiness gate stopped $($sb.DisplayName) (ServerConfigurator restarts it)") } catch {}
+            if(-not $stopped){
                 $ci = Get-CimInstance Win32_Service -Filter "Name='$($sb.Name)'"
-                if($ci -and $ci.ProcessId -gt 0){ Stop-Process -Id $ci.ProcessId -Force -ErrorAction SilentlyContinue; $log.Add("$($sb.DisplayName) control handler wedged - killed pid $($ci.ProcessId)") }
+                if($ci -and $ci.ProcessId -gt 0){ Stop-Process -Id $ci.ProcessId -Force -ErrorAction SilentlyContinue; $log.Add("$($sb.DisplayName) control handler wedged or not stopped after 60 s - killed pid $($ci.ProcessId)") }
             }
         }
     }
@@ -2570,7 +2666,15 @@ $script:MsSettleProbeSb = {
         $svc.Refresh()
         if($svc.Status -eq 'Stopped'){ & $clear; $log.Add('MS service stopped - ready for ServerConfigurator (it will start it)'); $ready = $true }
         elseif($svc.Status -eq 'Running'){
-            try { Stop-Service $svc.Name -Force -ErrorAction Stop; & $clear; $log.Add('MS service stopped by readiness gate - ServerConfigurator will start it'); $ready = $true }
+            try {
+                $svc.Stop()
+                # Owner 2026-11-06: an accepted stop that hangs is killed after 60 s.
+                try { $svc.WaitForStatus('Stopped',[TimeSpan]::FromSeconds(60)) }
+                catch {
+                    $ci = Get-CimInstance Win32_Service -Filter "Name='$($svc.Name)'"
+                    if($ci -and $ci.ProcessId -gt 0){ Stop-Process -Id $ci.ProcessId -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 5; $log.Add("MS service did not stop within 60 s - killed pid $($ci.ProcessId)") }
+                }
+                & $clear; $log.Add('MS service stopped by readiness gate - ServerConfigurator will start it'); $ready = $true }
             catch {
                 $log.Add("MS service not stoppable yet ($((([string]$_.Exception.Message) -split "`n")[0].Trim())) - waiting")
                 if($KillIfStuck){
@@ -3126,10 +3230,12 @@ $script:MobileStopSb = { param([string]$Dn,[bool]$Start)
         catch { return [pscustomobject]@{ Was=$was; Note=$_.Exception.Message } } }
     if($was -eq 'Stopped'){ return [pscustomobject]@{ Was=$was; Note='' } }
     $note = ''
-    try { Stop-Service -Name $s.Name -Force -ErrorAction Stop }
-    catch {
+    # Owner 2026-11-06: at most 60 s - Stop-Service waited for ever on a stop that was accepted and then hung.
+    $stopped = $false; $err = ''
+    try { $s.Stop(); $s.WaitForStatus('Stopped',[TimeSpan]::FromSeconds(60)); $stopped = $true } catch { $err = $_.Exception.Message }
+    if(-not $stopped){
         $svcPid = (Get-CimInstance Win32_Service -Filter "Name='$($s.Name)'").ProcessId
-        if($svcPid){ Stop-Process -Id $svcPid -Force -ErrorAction SilentlyContinue; $note = "the stop hung - killed (pid $svcPid)" } else { $note = $_.Exception.Message } }
+        if($svcPid){ Stop-Process -Id $svcPid -Force -ErrorAction SilentlyContinue; $note = "the stop hung or was refused - killed (pid $svcPid)" } else { $note = $err } }
     $sw = [Diagnostics.Stopwatch]::StartNew()
     while((Get-Service -Name $s.Name).Status -ne 'Stopped' -and $sw.Elapsed.TotalSeconds -lt 60){ Start-Sleep -Seconds 2 }
     [pscustomobject]@{ Was=$was; Note=$note } }
@@ -3581,6 +3687,14 @@ function Invoke-ClusterNodeStep { param([string]$Key,$Box,[bool]$Want,[string]$T
     $sus = Invoke-ClusterOp $Key 'suspend'
     try {
         if(-not $sus.Ok){ throw "Not every cluster node could be paused, so ServerConfigurator was NOT run on $($Box.Name). $($sus.Detail)" }
+        if(-not $isMs){
+            # Owner 2026-11-06: the Event Server resources go offline first, so the cluster does not take the service
+            # restart by ServerConfigurator for a failure and fail the role over (2026-10-30, 2026-11-05: 1069, 1254,
+            # 1042). The finally below starts them again.
+            Write-Log "Stopping the Event Server cluster resources before $($Box.Name) is configured, so the cluster does not move the role while ServerConfigurator restarts the service. The Event Server is unavailable until the node is configured." 'Good'
+            $esStop = Invoke-ClusterOp $Key 'stopsvc'
+            if(-not $esStop.Ok){ throw "The Event Server services could not be stopped in the cluster, so ServerConfigurator was NOT run on $($Box.Name). $($esStop.Detail)" }
+        }
         if($isMs){
             # Settle gate, ALWAYS the stopped path (enable and disable): ServerConfigurator runs with the
             # Management Server stopped - proven safe on a cluster node (the IIS-hosted IDP answers).
@@ -3608,6 +3722,7 @@ function Invoke-ClusterNodeStep { param([string]$Key,$Box,[bool]$Want,[string]$T
         }
         [void](Invoke-ClusterOp $Key 'start')
     }
+    if($r -and -not $isMs){ Update-EsPending $Box $Want $r }
     if($resumeFail){
         if($r){ Add-RunResult $r; foreach($l in $r.Logs){ Write-Log "[$($r.Target)] $l" } }
         Add-GuidedRow $Box $act $false 'cluster node(s) still paused - stopped' $resumeFail
@@ -3870,7 +3985,12 @@ function Get-PreFlightProblems { param([ValidateSet('on','off','register','rollb
             $h = Get-ClusterHealthProblem $cl
             if($h -and (Test-MsRoleRepairable $cl)){ $msRepair = $h } elseif($h){ $p.Add($h) } }
     }
-    if($Mode -ne 'register'){ $script:AdminRoleSids = @(); $a = Get-MilestoneAdminProblem; if($a){ $p.Add($a) } }
+    if($Mode -ne 'register'){
+        $script:AdminRoleSids = @()
+        # Repair run (owner 2026-11-06): the Management Server is not running, so the VMS login this check needs
+        # cannot work - on 2026-11-05 it cost 7.5 of 14 minutes of timeouts and ended 'not checked' anyway.
+        if($msRepair){ Write-Log 'Milestone Administrators role: not checked - the Management Server is not running (repair run), so the role cannot be read from the VMS.' }
+        else { $a = Get-MilestoneAdminProblem; if($a){ $p.Add($a) } } }
     if($Want -and $Mode -ne 'register' -and @($script:RecBoxes | Where-Object { -not $_.Excluded -and (Test-InScope $_) -and $_.Encrypted -ne $true }).Count){
         $ra = Get-RecAccountProblem; if($ra){ $p.Add($ra) } }
     # Register touches THIS node only (a peer may be Paused or Down); every other mode checks all boxes.
@@ -4338,7 +4458,7 @@ function Invoke-EsStage { param([bool]$Want)
     if($unk.Count){ $u=$unk[0]
         Set-StageStatus 'ES' 'FAILED - cannot read its state' 'Bad'; Add-GuidedRow $u $act $false 'cannot read state' $u.Detail
         Set-RunFailure 'Event Server' $u.Name "Could not read the Event Server's encryption state on $($u.Name)." $u.Detail; return $false }
-    $todo=@($esBoxes | Where-Object { (Test-InScope $_) -and $_.Encrypted -ne $Want })
+    $todo=@(Get-EsTodo $esBoxes $Want)
     Add-SkipRows $esBoxes $todo $act $wt 'Event Server'
     if(-not $todo.Count){ Set-StageStatus 'ES' $(if($null -ne $script:Scope){'Nothing to change back'}else{"Already $wt - skipped"}) 'Skip'; return $true }
     # Prerequisite (both directions): ServerConfigurator on the Event Server refuses while the MS is encrypted.
@@ -4363,6 +4483,7 @@ function Invoke-EsStage { param([bool]$Want)
     Set-RoleCertParams $P 'ES'
     $r = & $script:EsHostWorker $P
     Add-RunResult $r
+    Update-EsPending $es $Want $r
     foreach($l in $r.Logs){ Write-Log "[$($r.Target)] $l" }
     Write-Log "[$($r.Target)] $(if($r.Ok){'OK'}else{'FAILED'}): $($r.Status)" $(if($r.Ok){'Good'}else{'Err'})
     $gt = Confirm-BoxStates @($es) $Want -TotalSec 180
@@ -4882,7 +5003,7 @@ function Show-CertFilesDialog {
     $btn={ param([string]$T,[int]$X,[int]$Y) $b=[Windows.Forms.Button]::new(); $b.Text=$T; $b.Location=[Drawing.Point]::new($X,$Y); $b.Size=[Drawing.Size]::new(95,30); $dlg.Controls.Add($b); $b }
     $script:RcUse=[Windows.Forms.CheckBox]::new(); $script:RcUse.Text='Use prepared certificate files from your own CA (no signing CA, no new certificates)'
     $script:RcUse.Location=[Drawing.Point]::new(12,12); $script:RcUse.Size=[Drawing.Size]::new(650,24); $script:RcUse.Checked=$script:CertFilesOn; $dlg.Controls.Add($script:RcUse)
-    & $lbl 'Folder with one .p12 (or .pfx) per certificate: one per recording server (rec01.company.local.p12), one for the Management Server and one for the Event Server, each named after the address it is registered under (a cluster: the cluster address):' 40 42
+    & $lbl 'Folder with one .p12 (or .pfx) per certificate: one per recording server (rec01.company.local.p12), one for the Management Server and one for the Event Server, each named after the address it is registered under (a cluster: the cluster address) or carrying that address in its certificate:' 40 42
     $script:RcFolder = & $box 84 545 $script:CertFilesDir
     $script:RcFolderBtn = & $btn 'Browse...' 567 81
     & $lbl 'If all files share one password, type it here:' 122 22
