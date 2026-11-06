@@ -50,6 +50,8 @@
     then classified Blocking (a FAIL that breaks Estate Monitor on the Management Server or Event Server)
     or Client (everything else, reported but not blocking); verdict PASS / FAIL / INCOMPLETE; exit codes
     0 = PASS, 1 = FAIL, 4 = INCOMPLETE (2 error and 3 refused unchanged). Without -Gate nothing changes.
+    -Accept 'ENC-2','INV-2@SERVER1' -AcceptReason '<why>' (with -Gate): findings the operator judged harmless no
+    longer decide the gate verdict; every report lists them under 'Accepted by the operator' with the reason.
 #>
 [CmdletBinding()]
 param(
@@ -66,6 +68,8 @@ param(
     [string]$MsAddr = '',                                 # VMS address for recorder discovery (default: this machine)
     [string]$ReportDir = '',                              # headless: where to write the report (default %TEMP%\MilestoneRecorderCertManager-runs)
     [ValidateSet('','EstateMonitor')][string]$Gate = '',  # headless install gate: classify findings Blocking/Client, verdict PASS/FAIL/INCOMPLETE, exit 0/1/4
+    [string[]]$Accept = @(),                             # with -Gate: findings judged harmless, 'ID' or 'ID@Computer' (several, or comma-separated)
+    [string]$AcceptReason = '',                          # required with -Accept: why they do not block; printed in every report
     [string]$LogFile                                     # optional: tee the log here
 )
 
@@ -111,6 +115,8 @@ $MsAddr      = Resolve-Default $MsAddr      'MsAddr'
 $script:Headless    = [bool]$Run
 $script:GateName    = [string]$Gate
 if ($Gate -and -not $Run) { Write-Warning '-Gate applies to headless -Run only; ignored here.'; $script:GateName = '' }
+$script:AcceptList  = @()   # parsed -Accept entries (headless main block)
+$script:AcceptReasonText = ''
 $script:LogFilePath = $LogFile
 
 function Stop-DoctorRefused { param([string]$Msg)
@@ -1071,7 +1077,9 @@ $script:FactsCommonSb = {
         $ips = @([System.Net.Dns]::GetHostAddresses($env:COMPUTERNAME) | Where-Object { $_.AddressFamily -eq 'InterNetwork' } | ForEach-Object { $_.IPAddressToString })
         $drive = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$($env:SystemDrive)'" -ErrorAction SilentlyContinue
         $out.Identity = [pscustomobject]@{
-            ComputerName=$env:COMPUTERNAME; Fqdn=$(if($cs.Domain){"$env:COMPUTERNAME.$($cs.Domain)".ToLowerInvariant()}else{$env:COMPUTERNAME})
+            # Outside a domain Win32_ComputerSystem.Domain is the WORKGROUP name, not a DNS suffix (client report
+            # 2026-10-30: '<recorder>.workgroup'): then the primary DNS suffix, else the bare name.
+            ComputerName=$env:COMPUTERNAME; Fqdn=$(if($cs.PartOfDomain -and $cs.Domain){"$env:COMPUTERNAME.$($cs.Domain)".ToLowerInvariant()}else{ $sfx=''; try { $sfx=[string][System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().DomainName } catch {}; if($sfx){"$env:COMPUTERNAME.$sfx".ToLowerInvariant()}else{$env:COMPUTERNAME.ToLowerInvariant()} })
             Ips=$ips; UtcNow=[DateTime]::UtcNow.ToString('o'); OsCaption=[string]$os.Caption; OsBuild=[string]$os.BuildNumber
             MemFreeMb=[math]::Round($os.FreePhysicalMemory/1024); MemTotalMb=[math]::Round($cs.TotalPhysicalMemory/1MB)
             SysDriveFreeGb=$(if($drive){[math]::Round($drive.FreeSpace/1GB,1)}else{$null}); SysDriveTotalGb=$(if($drive){[math]::Round($drive.Size/1GB,1)}else{$null})
@@ -1749,7 +1757,13 @@ function Test-INV2 { param($Result)
     foreach($b in @($Result.Boxes)){
         if(-not $b.Reachable){ continue }
         $vers = @(@($b.Common.Services) | Where-Object { $_.ExeVersion } | ForEach-Object { $_.ExeVersion } | Select-Object -Unique)
-        if($vers.Count -gt 1){ $rows += New-Row 'INV-2' 'INV' 'FAIL' $b.Name 'Milestone service versions on this box' "Different Milestone service versions found on $($b.Name): $($vers -join ', ')." 'Re-run the Milestone installer/upgrade on this box so every Milestone component is the same version.' }
+        if($vers.Count -gt 1){
+            # One release (major.minor), several builds: a Milestone hotfix updates only the components it fixes (client
+            # report 2026-10-30: 25.1.15248.2 and 25.1.16342.2 on both Event Server nodes). Different releases stay FAIL.
+            $rels = @($vers | ForEach-Object { (([string]$_) -split '\.' | Select-Object -First 2) -join '.' } | Select-Object -Unique)
+            if($rels.Count -eq 1){ $rows += New-Row 'INV-2' 'INV' 'WARN' $b.Name 'Milestone service versions on this box' "Milestone components on $($b.Name) run different builds of release $($rels[0]): $($vers -join ', '). A Milestone hotfix updates only the components it fixes, so this is normal after a hotfix." 'Nothing to do if a Milestone hotfix was installed on this box; otherwise run the same Milestone installer/upgrade on it again.' }
+            else { $rows += New-Row 'INV-2' 'INV' 'FAIL' $b.Name 'Milestone service versions on this box' "Different Milestone service versions found on $($b.Name): $($vers -join ', ')." 'Re-run the Milestone installer/upgrade on this box so every Milestone component is the same version.' }
+        }
         $v = Get-BoxCoreVersion $b
         if($v -and $msVer -and $v -ne $msVer){ $rows += New-Row 'INV-2' 'INV' 'WARN' $b.Name 'Version vs Management Server' "$($b.Name) is version $v; the Management Server is $msVer." 'Upgrade this box (or the Management Server) so every component runs the same Milestone version.' }
     }
@@ -2045,7 +2059,13 @@ function Test-ENC3 { param($Result)
             if($Result.ClusterMs -and $Result.ClusterMs.Address){ $expectNames.Add(([string]$Result.ClusterMs.Address).ToLowerInvariant()) }
             foreach($e in @($b.RegAddr)){ $h=Get-UrlHost $e.Value; if($h){ $expectNames.Add($h) } }
         }
+        # Only certificates Milestone uses (client report 2026-10-30: other software's 443 certificate on a not encrypted
+        # Event Server and recorder failed the gate): on a Management Server the IIS 443 binding always and every other
+        # binding while its encryption is on; on an Event Server or recorder only while it is encrypted, never 443.
+        $encOn = ((Get-BoxEncEnabled $b) -eq $true)
         foreach($c in @($b.Certs)){
+            $used = if($b.Kind -eq 'MS'){ ([int]$c.Port -eq 443) -or $encOn } else { $encOn -and ([int]$c.Port -ne 443) }
+            if(-not $used){ continue }
             if(-not $c.Found){ $rows += New-Row 'ENC-3' 'ENC' 'FAIL' $b.Name "Certificate on port $($c.Port)" "$($b.Name) port $($c.Port): the bound certificate (thumbprint $($c.Thumbprint)) was not found in LocalMachine\My." 'Re-issue and import the certificate for this box with Mrc-Guided.ps1 / the role GUI.'; continue }
             $now = Get-Date
             $notAfter=$null; try { $notAfter=[DateTime]$c.NotAfter } catch {}
@@ -2368,7 +2388,19 @@ $script:GateTables = @{
         Title        = 'Estate Monitor precheck'
         BlockingIds  = @('SVC-1','REG-1','REG-2','REG-3','ENC-2','ENC-3','IIS-1','IIS-2','IIS-3','CLU-1','CLU-3','NET-2','NET-3','NET-4','ENV-1','ENV-4','INV-2','CFG-1')
         BlockingKinds= @('MS','ES')
+        ClientPorts  = @(9001,7563)   # Recording Server ports: a NET-3 row about them is a recorder finding, also on an MS box
     }
+}
+# -Accept entries (owner 2026-11-06): 'ID' = every row with that Id, 'ID@Computer' = that computer's rows only ('ID@' =
+# role rows without a computer). Several, or comma-separated. A malformed entry throws (the headless block refuses).
+function ConvertTo-AcceptList { param([string[]]$Raw)
+    $out = New-Object System.Collections.Generic.List[object]
+    foreach($tok in @(@($Raw) | ForEach-Object { ([string]$_) -split '[,;]' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })){
+        $parts = $tok -split '@',2
+        if($parts[0].Trim() -notmatch '^[A-Za-z]{2,4}-\d+$'){ throw "-Accept '$tok' is not a finding id like ENC-2 or ENC-2@SERVER1." }
+        $out.Add([pscustomobject]@{ Text=$tok; Id=$parts[0].Trim().ToUpperInvariant(); Computer=$(if($parts.Count -gt 1){ $parts[1].Trim() } else { $null }) })
+    }
+    $out.ToArray()
 }
 function Get-RowBox { param($Result,[string]$Computer)
     if(-not $Computer){ return $null }
@@ -2393,12 +2425,13 @@ function Test-ClusterNodeName { param($Result,[string]$Name)
     $false
 }
 function Get-GateExitCode { param([string]$Verdict) switch($Verdict){ 'PASS'{0} 'FAIL'{1} 'INCOMPLETE'{4} default{2} } }
-function Get-DoctorGate { param($Result,[object[]]$Rows,[string]$Name='EstateMonitor')
+function Get-DoctorGate { param($Result,[object[]]$Rows,[string]$Name='EstateMonitor',[object[]]$Accept=@(),[string]$AcceptReason='')
     $t = $script:GateTables[$Name]
     $out = New-Object System.Collections.Generic.List[object]
     $blocking = New-Object System.Collections.Generic.List[object]
     $client = New-Object System.Collections.Generic.List[object]
     $incomplete = New-Object System.Collections.Generic.List[object]
+    $accepted = New-Object System.Collections.Generic.List[object]; $used = @{}
     foreach($r in @($Rows)){
         $box = Get-RowBox $Result $r.Computer
         $kind = if($box){ [string]$box.Kind } else { '' }
@@ -2408,19 +2441,29 @@ function Get-DoctorGate { param($Result,[object[]]$Rows,[string]$Name='EstateMon
             # A cluster NODE that is Down/Paused does not stop Estate Monitor while the role runs on another node
             # (it only removes failover). Role rows (no computer) keep blocking.
             if($r.Id -eq 'CLU-1' -and (Test-ClusterNodeName $Result $r.Computer)){ $gate = 'Client' }
+            # Recorder findings never block - also a Recording Server port on an MS box (its local Recording Server).
+            if($r.Id -eq 'NET-3' -and ([string]$r.Check -match '^Port (\d+) ') -and (@($t.ClientPorts) -contains [int]$Matches[1])){ $gate = 'Client' }
         } elseif($r.Status -eq 'WARN'){ $gate = 'Client' }
-        $c = [pscustomobject]@{ Id=$r.Id; Area=$r.Area; Status=$r.Status; Computer=$r.Computer; Check=$r.Check; Finding=$r.Finding; Fix=$r.Fix; Gate=$gate }
-        $out.Add($c)
-        if($gate -eq 'Blocking'){ $blocking.Add($c) } elseif($gate -eq 'Client'){ $client.Add($c) }
         # Could-not-look matters only for a box that serves: a standalone MS/ES or the current role OWNER. A cluster node
         # that is not the owner, or that the cluster reports Down/Paused, is known not to be serving.
         $isBoxCore = ($t.BlockingKinds -contains $kind)
         if($isBoxCore -and $box -and $box.IsNode -and ((-not $box.Active) -or (Test-ClusterNodeDown $Result $r.Computer))){ $isBoxCore = $false }
-        if(($r.Id -eq 'NET-1' -and $r.Status -eq 'FAIL' -and $isBoxCore) -or ($r.Id -eq 'COL-1' -and $r.Status -eq 'WARN' -and $isBoxCore) -or ($r.Id -eq 'REG-3' -and $r.Status -eq 'WARN')){ $incomplete.Add($c) }
+        $isInc = (($r.Id -eq 'NET-1' -and $r.Status -eq 'FAIL' -and $isBoxCore) -or ($r.Id -eq 'COL-1' -and $r.Status -eq 'WARN' -and $isBoxCore) -or ($r.Id -eq 'REG-3' -and $r.Status -eq 'WARN'))
+        # Accepted by the operator: only a row that would decide the verdict (Blocking, or could-not-look).
+        if($gate -eq 'Blocking' -or $isInc){
+            $hit = @(@($Accept) | Where-Object { $_ -and ([string]$_.Id) -ieq ([string]$r.Id) -and ($null -eq $_.Computer -or ([string]$_.Computer) -ieq ([string]$r.Computer)) })
+            if($hit.Count){ $gate = 'Accepted'; $isInc = $false; foreach($h in $hit){ $used[[string]$h.Text] = $true } }
+        }
+        $c = [pscustomobject]@{ Id=$r.Id; Area=$r.Area; Status=$r.Status; Computer=$r.Computer; Check=$r.Check; Finding=$r.Finding; Fix=$r.Fix; Gate=$gate }
+        $out.Add($c)
+        if($gate -eq 'Blocking'){ $blocking.Add($c) } elseif($gate -eq 'Client'){ $client.Add($c) } elseif($gate -eq 'Accepted'){ $accepted.Add($c) }
+        if($isInc){ $incomplete.Add($c) }
     }
     $verdict = if($blocking.Count){ 'FAIL' } elseif($incomplete.Count){ 'INCOMPLETE' } else { 'PASS' }
+    $unused = @(@($Accept) | Where-Object { $_ -and -not $used.ContainsKey([string]$_.Text) } | ForEach-Object { [string]$_.Text })
     [pscustomobject]@{ Name=$Name; Title=$t.Title; Verdict=$verdict; ExitCode=(Get-GateExitCode $verdict); Rows=$out.ToArray()
-                       Blocking=$blocking.ToArray(); Client=$client.ToArray(); Incomplete=$incomplete.ToArray() }
+                       Blocking=$blocking.ToArray(); Client=$client.ToArray(); Incomplete=$incomplete.ToArray()
+                       Accepted=$accepted.ToArray(); AcceptReason=$AcceptReason; AcceptUnused=$unused }
 }
 
 # ===================== DOCTOR: RENDER (HTML + CSV + TXT) =====================
@@ -2457,12 +2500,19 @@ function New-DoctorHtml { param($Result,[object[]]$Rows,$Gate=$null)
     [void]$sb.Append("<b>Overall verdict:</b> <span class='badge' style='background:$verdictColor'>$verdict</span></p>")
     if ($Gate) {
         $gateColor = switch ($Gate.Verdict) { 'PASS' { '#1b7a1b' } 'FAIL' { '#b00020' } default { '#b8860b' } }
-        [void]$sb.Append("<h2 style='color:$gateColor'>$(Get-HtmlEsc $Gate.Title): $($Gate.Verdict)</h2>")
+        [void]$sb.Append("<h2 style='color:$gateColor'>$(Get-HtmlEsc $Gate.Title): $($Gate.Verdict)$(if(@($Gate.Accepted).Count){" ($(@($Gate.Accepted).Count) accepted by the operator)"})</h2>")
         if (@($Gate.Blocking).Count) {
             [void]$sb.Append('<table><tr><th>Id</th><th>Computer</th><th>Finding</th><th>Fix</th></tr>')
             foreach ($r in @($Gate.Blocking)) { [void]$sb.Append("<tr class='FAIL'><td>$(Get-HtmlEsc $r.Id)</td><td>$(Get-HtmlEsc $r.Computer)</td><td>$(Get-HtmlEsc $r.Finding)</td><td>$(Get-HtmlEsc $r.Fix)</td></tr>") }
             [void]$sb.Append('</table>')
         } else { [void]$sb.Append('<p>No blocking findings.</p>') }
+        if (@($Gate.Accepted).Count) {
+            [void]$sb.Append("<h3>Accepted by the operator (they do not decide the verdict)</h3><p><b>Reason given:</b> $(Get-HtmlEsc $Gate.AcceptReason)</p>")
+            [void]$sb.Append('<table><tr><th>Id</th><th>Status</th><th>Computer</th><th>Finding</th><th>Fix</th></tr>')
+            foreach ($r in @($Gate.Accepted)) { [void]$sb.Append("<tr class='$($r.Status)'><td>$(Get-HtmlEsc $r.Id)</td><td><span class='badge badge-$($r.Status)'>$($r.Status)</span></td><td>$(Get-HtmlEsc $r.Computer)</td><td>$(Get-HtmlEsc $r.Finding)</td><td>$(Get-HtmlEsc $r.Fix)</td></tr>") }
+            [void]$sb.Append('</table>')
+        }
+        if (@($Gate.AcceptUnused).Count) { [void]$sb.Append("<p><b>-Accept entries that matched no blocking finding:</b> $(Get-HtmlEsc (@($Gate.AcceptUnused) -join ', '))</p>") }
         if ($Gate.Verdict -eq 'INCOMPLETE') {
             [void]$sb.Append('<p>The doctor could not look at everything that matters, so it cannot say PASS:</p><ul>')
             foreach ($r in @($Gate.Incomplete)) { [void]$sb.Append("<li>$(Get-HtmlEsc $r.Id) $(Get-HtmlEsc $r.Computer): $(Get-HtmlEsc $r.Finding)</li>") }
@@ -2514,7 +2564,7 @@ function New-DoctorCsv { param([object[]]$Rows,$Gate=$null)
 }
 function New-DoctorTxt { param($Result,[object[]]$Rows,$Gate=$null)
     $lines = New-Object System.Collections.Generic.List[string]
-    if ($Gate) { $lines.Add("$($Gate.Title.ToUpperInvariant()): $($Gate.Verdict)") }
+    if ($Gate) { $lines.Add("$($Gate.Title.ToUpperInvariant()): $($Gate.Verdict)$(if(@($Gate.Accepted).Count){", $(@($Gate.Accepted).Count) finding(s) accepted by the operator"})") }
     $lines.Add('MILESTONE XPROTECT DOCTOR REPORT')
     $lines.Add("Generated (UTC): $($Result.GeneratedUtc)")
     $lines.Add("Management Server: $($Result.MsComputer) (target: $($Result.TargetMsHost))")
@@ -2528,6 +2578,11 @@ function New-DoctorTxt { param($Result,[object[]]$Rows,$Gate=$null)
         $lines.Add('Blocking:')
         foreach ($r in @($Gate.Blocking)) { $lines.Add("  [$($r.Status)] $($r.Id) $($r.Computer): $($r.Finding)$(if($r.Fix){" FIX: $($r.Fix)"})") }
         if (-not @($Gate.Blocking).Count) { $lines.Add('  (none)') }
+        if (@($Gate.Accepted).Count) {
+            $lines.Add("Accepted by the operator (reason: $($Gate.AcceptReason)):")
+            foreach ($r in @($Gate.Accepted)) { $lines.Add("  [$($r.Status)] $($r.Id) $($r.Computer): $($r.Finding)") }
+        }
+        if (@($Gate.AcceptUnused).Count) { $lines.Add("-Accept entries that matched no blocking finding: $(@($Gate.AcceptUnused) -join ', ')") }
         if ($Gate.Verdict -eq 'INCOMPLETE') {
             $lines.Add('Could not look at (so no PASS):')
             foreach ($r in @($Gate.Incomplete)) { $lines.Add("  [$($r.Status)] $($r.Id) $($r.Computer): $($r.Finding)") }
@@ -2581,13 +2636,14 @@ function Invoke-DoctorRun {
     Write-Log 'Evaluating...'
     $rows = Invoke-DoctorEvaluate $result
     $gate = $null
-    if ($script:GateName) { $gate = Get-DoctorGate $result $rows $script:GateName }
+    if ($script:GateName) { $gate = Get-DoctorGate $result $rows $script:GateName @($script:AcceptList) $script:AcceptReasonText }
     $paths = Save-DoctorReport $result $rows $gate
     $fail = @($rows | Where-Object { $_.Status -eq 'FAIL' }).Count
     $warn = @($rows | Where-Object { $_.Status -eq 'WARN' }).Count
     Write-Log "Report: $($paths.Html)" 'Good'
     Write-Log "OVERALL: FAIL=$fail WARN=$warn" $(if($fail -or $warn){'Err'}else{'Good'})
-    if ($gate) { Write-Log "$($gate.Title.ToUpperInvariant()): $($gate.Verdict) (blocking $(@($gate.Blocking).Count), client $(@($gate.Client).Count), exit $($gate.ExitCode))" $(if($gate.Verdict -eq 'PASS'){'Good'}else{'Err'}) }
+    if ($gate) { Write-Log "$($gate.Title.ToUpperInvariant()): $($gate.Verdict) (blocking $(@($gate.Blocking).Count), client $(@($gate.Client).Count), accepted by the operator $(@($gate.Accepted).Count), exit $($gate.ExitCode))" $(if($gate.Verdict -eq 'PASS'){'Good'}else{'Err'}) }
+    if ($gate -and @($gate.AcceptUnused).Count) { Write-Log "WARNING: -Accept entries that matched no blocking finding: $(@($gate.AcceptUnused) -join ', ')" 'Err' }
     [pscustomobject]@{ Result=$result; Rows=$rows; Paths=$paths; Fail=$fail; Warn=$warn; Gate=$gate }
 }
 
@@ -2654,6 +2710,10 @@ $script:MsAddrValue = [string]$MsAddr
 if ($script:Headless) {
     try {
         if ([string]::IsNullOrWhiteSpace($AdminPwFile) -or -not (Test-Path -LiteralPath $AdminPwFile)) { Write-Log "REFUSED: -AdminPwFile not found: $AdminPwFile" 'Err'; exit 3 }
+        try { $script:AcceptList = @(ConvertTo-AcceptList $Accept) } catch { Write-Log "REFUSED: $($_.Exception.Message)" 'Err'; exit 3 }
+        if ($script:AcceptList.Count -and -not $script:GateName) { Write-Log 'WARNING: -Accept applies to -Gate only; ignored here.' 'Err'; $script:AcceptList = @() }
+        if ($script:AcceptList.Count -and [string]::IsNullOrWhiteSpace($AcceptReason)) { Write-Log 'REFUSED: -Accept needs -AcceptReason (why these findings do not block; it is printed in every report).' 'Err'; exit 3 }
+        $script:AcceptReasonText = ([string]$AcceptReason).Trim()
         $script:DomainBox.Text     = $Domain
         $script:NoEsChk.Checked    = [bool]$NoEventServer
         $script:EsHostBox.Text     = $(if ($NoEventServer) { '' } else { $EsHost })

@@ -1242,13 +1242,16 @@ function Test-CertNameMatch { param([string[]]$CertNames,[string[]]$Wanted)
     }
     $false
 }
-function Find-CertFile { param([string]$Folder,[string]$Fqdn)
-    # '<fqdn>.p12' / '.pfx' (any case); else the ONE file whose first label is the short name (the same
-    # computer under another DNS suffix). '' = none. Several candidates = refuse, never guess.
-    $f=([string]$Fqdn).Trim().TrimEnd('.').ToLowerInvariant()
+function Find-CertFile { param([string]$Folder,[string[]]$Fqdn)
+    # '<name>.p12' / '.pfx' (any case) for any of the names, in their order; else the ONE file whose first label is
+    # the short name of the first name (the same computer under another DNS suffix). '' = none. Several candidates =
+    # refuse, never guess.
+    $want=@(@($Fqdn) | ForEach-Object { ([string]$_).Trim().TrimEnd('.').ToLowerInvariant() } | Where-Object { $_ })
+    $f=$(if($want.Count){ $want[0] } else { '' })
     $files=@(Get-ChildItem -LiteralPath $Folder -File -ErrorAction Stop | Where-Object { $_.Extension -in '.p12','.pfx' })
-    $hit=@($files | Where-Object { $_.BaseName.ToLowerInvariant() -eq $f })
-    if(-not $hit.Count){ $short=($f -split '\.')[0]; $hit=@($files | Where-Object { ($_.BaseName.ToLowerInvariant() -split '\.')[0] -eq $short }) }
+    $hit=@()
+    foreach($w in $want){ $hit=@($files | Where-Object { $_.BaseName.ToLowerInvariant() -eq $w }); if($hit.Count){ $f=$w; break } }
+    if(-not $hit.Count -and $f){ $short=($f -split '\.')[0]; $hit=@($files | Where-Object { ($_.BaseName.ToLowerInvariant() -split '\.')[0] -eq $short }) }
     if($hit.Count -gt 1){ throw "more than one certificate file fits $f ($((@($hit | ForEach-Object { $_.Name })) -join ', ')). Keep only $f.p12 in the folder." }
     if($hit.Count){ $hit[0].FullName } else { '' }
 }
@@ -1304,7 +1307,7 @@ function Test-CertFile { param([string]$Path,[securestring]$Password,[string[]]$
         $named=@($keyed | Where-Object { Test-CertNameMatch (Get-CertNames $_) $Names })
         if(-not $named.Count){
             $has=if($keyed.Count -eq 1){ "is for $((Get-CertNames $keyed[0]) -join ', ')" } else { "holds $($keyed.Count) certificates with a private key" }
-            throw "$leaf $has - not for $($Names[0]). A certificate must carry the name the server is known by." }
+            throw "$leaf $has - not for $((@($Names) | Select-Object -Unique) -join ' or '). A certificate must carry the name the server is known by." }
         $c=$named[0]; $now=Get-Date
         if($c.NotAfter -lt $now){ throw "$leaf expired on $($c.NotAfter.ToString('yyyy-MM-dd'))." }
         if($c.NotBefore -gt $now){ throw "$leaf is valid only from $($c.NotBefore.ToString('yyyy-MM-dd HH:mm')). Check the clock of this computer, or wait." }
@@ -1389,15 +1392,28 @@ function Get-CertFileProblems { param([object[]]$Boxes,[string[]]$Roles=@())
     foreach($b in @($Boxes)){
         try {
             $fq=Resolve-CertFqdn -Target $b.Target -Fqdn $b.Addr -DomainSuffix $script:DomainName
-            $file=Find-CertFile $dir $fq
-            if(-not $file){ $p.Add("No certificate file for recording server $($b.Name): expected $(Join-Path $dir "$fq.p12")."); continue }
+            # The recorder's own DNS names, as it reported them in the state check (owner 2026-11-05: recorders in
+            # another DNS domain, certificates issued for that domain): a certificate for one of them is right even
+            # when this computer reaches the recorder under another name (DNS here, or the Domain box). The recorder
+            # reports these names itself, so only names under its own short name count: it must never pick the file
+            # (private key) of another computer by claiming that computer's name.
+            $shorts=@(@([string]$b.Target, $fq) | ForEach-Object { (([string]$_).ToLowerInvariant() -split '\.')[0] } | Where-Object { $_ })
+            $own=@(); if($b.PSObject.Properties['OwnNames']){ $own=@(@($b.OwnNames) | ForEach-Object { ([string]$_).ToLowerInvariant() } | Where-Object { $_ -and $_ -ne $fq -and $shorts -contains (($_ -split '\.')[0]) } | Select-Object -Unique) }
+            $file=Find-CertFile $dir (@($fq) + $own)
+            if(-not $file){ $p.Add("No certificate file for recording server $($b.Name): expected $(Join-Path $dir "$fq.p12")$(if($own.Count){ ' or ' + (Join-Path $dir "$($own[0]).p12") })."); continue }
+            # One file per computer: a file already given to a role or another recorder is never handed out again.
+            $usedBy=@(@(foreach($k in @($script:RoleCertMap.Keys)){ if($script:RoleCertMap[$k].File -eq $file){ "the $(Get-StageName $k)" } }) + @(foreach($k in @($script:RecCertMap.Keys)){ if($script:RecCertMap[$k].File -eq $file){ "recording server $k" } }))
+            if($usedBy.Count){ $p.Add("Recording server $($b.Name): $([IO.Path]::GetFileName($file)) is already used for $($usedBy[0]). Every computer needs its own certificate file."); continue }
             # A recorder the VMS knows only by short name or IP: its FQDN here is a guess from the domain box,
             # so the name in the file it was matched by (same short name) is accepted too.
-            $names=@($fq); $base=[IO.Path]::GetFileNameWithoutExtension($file).ToLowerInvariant()
-            if($base -ne $fq -and -not (([string]$b.Addr -match '\.') -and -not (Test-IpAddress $b.Addr))){ $names+=$base }
+            $names=@($fq) + $own; $base=[IO.Path]::GetFileNameWithoutExtension($file).ToLowerInvariant()
+            if($names -notcontains $base -and -not (([string]$b.Addr -match '\.') -and -not (Test-IpAddress $b.Addr))){ $names+=$base }
             $fpw=Get-CertFilePw $file
             $c=Test-CertFile -Path $file -Password $fpw -Names $names -RootCa $root
-            $script:RecCertMap[([string]$b.Target).ToUpperInvariant()]=[pscustomobject]@{ File=$file; Tp=$c.Thumbprint; Name=$fq; Pw=$fpw }
+            $carried=[string](Get-First -Items @($names | Where-Object { Test-CertNameMatch $c.Names @($_) }))
+            if(-not $carried){ $carried=$fq }
+            $script:RecCertMap[([string]$b.Target).ToUpperInvariant()]=[pscustomobject]@{ File=$file; Tp=$c.Thumbprint; Name=$carried; Pw=$fpw }
+            if($carried -ne $fq){ Write-Log "[$($b.Name)] $([IO.Path]::GetFileName($file)) is for $carried$(if($own -contains $carried){', the name the recording server reports for itself'}); this computer reaches it as $fq." }
             Write-Log "[$($b.Name)] certificate file $([IO.Path]::GetFileName($file)): $($c.Subject), valid until $($c.NotAfter.ToString('yyyy-MM-dd')) [$($c.Thumbprint)]" 'Good'
         } catch { $p.Add("Recording server $($b.Name): $($_.Exception.Message)") }
     }
@@ -1905,6 +1921,8 @@ function New-Box { param([string]$Role,[string]$Name,[string]$Target,[string]$Ad
 $script:MsCluster = $null; $script:MsNodeBoxes = @(); $script:MsDetectError = ''
 $script:EsCluster = $null; $script:EsNodeBoxes = @(); $script:EsDetectError = ''
 $script:MsStaleNodes = @(); $script:MsLastRegistered = ''; $script:FailoverResults = @()
+$script:RoleMoveNotes = @(); $script:RoleLost = @()
+$script:EsWaitSec = 180; $script:EsHoldPolls = 12
 $script:Scope = $null; $script:FinalOwners = @{}; $script:LastSnapshotPath = ''; $script:TestFailoverOn = $false
 function Get-First { param($Items) $a=@($Items); if($a.Count){ $a[0] } else { $null } }
 function Get-ClusterObj { param([string]$Key) if($Key -eq 'MS'){ $script:MsCluster } elseif($Key -eq 'ES'){ $script:EsCluster } else { $null } }
@@ -1979,6 +1997,12 @@ $script:BindingsSb = {
 # (present on a 2025 R3 recorder at this path); the bindings are used ONLY when that element is missing
 # or unreadable. Source=xml/bindings tells the caller which one produced the answer.
 $script:RecorderStateSb = {
+    # The recorder's own DNS names (host name + primary DNS suffix; host name + AD domain when domain-joined): a
+    # prepared certificate file may carry one of them instead of the name the wizard reaches the recorder by.
+    $ownNames = @()
+    try { $gp = [System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties(); if ($gp.HostName -and $gp.DomainName) { $ownNames += ('{0}.{1}' -f $gp.HostName, $gp.DomainName) } } catch {}
+    try { $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop; if ($cs.PartOfDomain -and $cs.Domain) { $ownNames += ('{0}.{1}' -f $(if ($cs.DNSHostName) { $cs.DNSHostName } else { $env:COMPUTERNAME }), $cs.Domain) } } catch {}
+    $ownNames = @($ownNames | ForEach-Object { ([string]$_).Trim().TrimEnd('.').ToLowerInvariant() } | Where-Object { $_ -match '\.' } | Select-Object -Unique)
     $cfgPath = Join-Path $env:ProgramData 'Milestone\XProtect Recording Server\RecorderConfig.xml'
     if (Test-Path -LiteralPath $cfgPath) {
         try {
@@ -1987,22 +2011,22 @@ $script:RecorderStateSb = {
             if ($n) {
                 $en = [string]$n.GetAttribute('enabled')
                 if ($en -eq 'true' -or $en -eq 'false') {
-                    return [pscustomobject]@{ Source='xml'; Ok=$true; Bindings=''; Count=0; Enabled=($en -eq 'true'); Hash=[string]$n.GetAttribute('certificateHash') }
+                    return [pscustomobject]@{ Source='xml'; Ok=$true; Bindings=''; Count=0; Enabled=($en -eq 'true'); Hash=[string]$n.GetAttribute('certificateHash'); Names=$ownNames }
                 }
             }
         } catch {}
     }
     $addrRe = '(\d{1,3}(?:\.\d{1,3}){3}:\d+|\[[0-9A-Fa-f:]+\]:\d+)'
     $raw = $null
-    try { $raw = @(netsh http show sslcert 2>&1) } catch { return [pscustomobject]@{ Source='bindings'; Ok=$false; Bindings=''; Count=0; Enabled=$null; Hash=''; Error=$_.Exception.Message } }
-    if ($LASTEXITCODE) { return [pscustomobject]@{ Source='bindings'; Ok=$false; Bindings=''; Count=0; Enabled=$null; Hash=''; Error="netsh exited $LASTEXITCODE" } }
+    try { $raw = @(netsh http show sslcert 2>&1) } catch { return [pscustomobject]@{ Source='bindings'; Ok=$false; Bindings=''; Count=0; Enabled=$null; Hash=''; Error=$_.Exception.Message; Names=$ownNames } }
+    if ($LASTEXITCODE) { return [pscustomobject]@{ Source='bindings'; Ok=$false; Bindings=''; Count=0; Enabled=$null; Hash=''; Error="netsh exited $LASTEXITCODE"; Names=$ownNames } }
     $b = @()
     foreach ($ln in $raw) {
         $m = [regex]::Match([string]$ln, $addrRe)
         if ($m.Success) { $b += $m.Groups[1].Value }
     }
     $b = @($b | Where-Object { $_ -notmatch ':(443|5986)$' })
-    [pscustomobject]@{ Source='bindings'; Ok=$true; Bindings=($b -join ','); Count=$b.Count; Enabled=($b.Count -gt 0); Hash='' }
+    [pscustomobject]@{ Source='bindings'; Ok=$true; Bindings=($b -join ','); Count=$b.Count; Enabled=($b.Count -gt 0); Hash=''; Names=$ownNames }
 }
 $script:EsStateSb = {
     $p = Join-Path $env:ProgramData 'Milestone\XProtect Event Server\config\ServiceEndpoints.xml'
@@ -2196,6 +2220,7 @@ function Invoke-OnNode { param([string]$Node,[pscredential]$Cred,[scriptblock]$S
 }
 function Set-RecBoxState { param($Box,$R)
     $Box.Reachable=$true
+    $Box | Add-Member -NotePropertyName OwnNames -NotePropertyValue @(if($R -and $R.PSObject.Properties['Names']){ @($R.Names) | Where-Object { $_ } | ForEach-Object { ([string]$_).ToLowerInvariant() } }) -Force
     if($R.Source -eq 'xml'){
         $Box.Encrypted=$R.Enabled; $Box.Detail="RecorderConfig.xml: serverEncryption enabled=$($R.Enabled)$(if($R.Hash){' hash=' + $R.Hash}else{''})"
     } elseif($R.Ok){
@@ -2956,7 +2981,8 @@ function Test-FinalMsLiveGuard { param([string]$Act)
 }
 # Wait until the role's service answers on the node: MS = service Running + :9000, ES = + :22331.
 # MS port: 9000 when encrypted, 80 when not (-Port overrides; else from $Box.Encrypted).
-function Wait-NodeService { param([string]$Key,$Box,[int]$TimeoutSec=0,[int]$Port=0)
+# -FollowRole: also return (Moved) as soon as the role is on another node: the service stopping here is then correct.
+function Wait-NodeService { param([string]$Key,$Box,[int]$TimeoutSec=0,[int]$Port=0,[switch]$FollowRole)
     $isMs = ($Key -eq 'MS')
     $dn = if($isMs){ $script:MsSvcDisplay } else { $script:EsSvcDisplay }
     $port = if($Port -gt 0){ $Port } elseif($isMs){ $(if($Box.Encrypted -eq $false){ 80 } else { 9000 }) } else { 22331 }
@@ -2970,18 +2996,59 @@ function Wait-NodeService { param([string]$Key,$Box,[int]$TimeoutSec=0,[int]$Por
             if($p.Status -eq 'Running' -and $p.Port){
                 $sec = [int]((Get-Date) - $t0).TotalSeconds
                 Write-Log "[$($Box.Name)] $(Get-StageName $Key) is up ($last) after ${sec}s" 'Good'
-                return [pscustomobject]@{ Up=$true; Detail="up after ${sec}s"; Seconds=$sec }
+                return [pscustomobject]@{ Up=$true; Moved=$false; Owner=[string]$Box.Target; Detail="up after ${sec}s"; Seconds=$sec }
             }
         } catch {
             if(Test-IdentityError $_.Exception.Message){
                 $im = Get-IdentityMessage $_.Exception.Message
                 Write-Log "[$($Box.Name)] $im" 'Err'
-                return [pscustomobject]@{ Up=$false; Detail=$im; Seconds=[int]((Get-Date) - $t0).TotalSeconds } }
+                return [pscustomobject]@{ Up=$false; Moved=$false; Owner=[string]$Box.Target; Detail=$im; Seconds=[int]((Get-Date) - $t0).TotalSeconds } }
             $last = "cannot connect: $(Get-FirstLine $_.Exception.Message)" }
+        if($FollowRole){
+            $cl = Update-ClusterInfo $Key
+            if($cl -and -not $cl.Error -and [string]$cl.Owner -and [string]$cl.Owner -ne [string]$Box.Target){
+                return [pscustomobject]@{ Up=$false; Moved=$true; Owner=[string]$cl.Owner; Detail="the cluster moved the role to $($cl.Owner)"; Seconds=[int]((Get-Date) - $t0).TotalSeconds } } }
         Wait-Ui 10
     } while((Get-Date) -lt $deadline)
     Write-Log "[$($Box.Name)] $(Get-StageName $Key) did NOT come up within $([int]($TimeoutSec/60)) min ($last)" 'Err'
-    [pscustomobject]@{ Up=$false; Detail="the service did not come up within $([int]($TimeoutSec/60)) minutes ($last)"; Seconds=$TimeoutSec }
+    [pscustomobject]@{ Up=$false; Moved=$false; Owner=[string]$Box.Target; Detail="the service did not come up within $([int]($TimeoutSec/60)) minutes ($last)"; Seconds=$TimeoutSec }
+}
+# Event Server only (owner 2026-11-05: "follow the role"). The cluster can fail the role over during the wait (lab: SC
+# exit 0, then 'Failover' a minute after the resume). What must answer is the service on the node that has the role now.
+# Never for the Management Server: only the node registered last can start it.
+function Wait-EsRoleService { param($Box)
+    $cur = $Box; $from = ''
+    for($hop = 0; $hop -lt 3; $hop++){
+        $up = Wait-NodeService 'ES' $cur -TimeoutSec $script:EsWaitSec -FollowRole
+        if(-not $up.Moved){
+            $d = if($from -and -not $up.Up){ "the cluster moved the role from $from to $($cur.Name), and there $($up.Detail)" } else { $up.Detail }
+            return [pscustomobject]@{ Up=$up.Up; Owner=[string]$cur.Target; Detail=$d } }
+        Write-Log "[$($cur.Name)] the cluster moved role '$((Get-ClusterObj 'ES').Group)' to $($up.Owner) during the wait - following it." 'Err'
+        if(-not $from){ $from = [string]$cur.Name }
+        [void](Wait-ClusterGroupSettled 'ES' 300 0)
+        $owner = [string](Get-ClusterObj 'ES').Owner
+        $cur = Get-NodeBox 'ES' $owner
+        if(-not $cur){ return [pscustomobject]@{ Up=$false; Owner=$owner; Detail="the cluster moved the role from $from to $owner, a node this run does not know" } }
+    }
+    [pscustomobject]@{ Up=$false; Owner=[string]$cur.Target; Detail="the cluster kept moving the role between its nodes (first from $from)" }
+}
+# A node the cluster moved the role away from may not be able to run it, and its encryption state cannot show that.
+# Put the role there and watch the service: in the lab the role left about a minute after the service had started.
+function Test-EsNodeHoldsRole { param($Box)
+    $mv = Move-ClusterRole 'ES' ([string]$Box.Target)
+    if(-not $mv.Ok){ return [pscustomobject]@{ Ok=$false; Detail="the role could not be moved there: $($mv.Detail)" } }
+    $up = Wait-NodeService 'ES' $Box -TimeoutSec $script:EsWaitSec -FollowRole
+    if(-not $up.Up){ return [pscustomobject]@{ Ok=$false; Detail=$up.Detail } }
+    for($i = 0; $i -lt $script:EsHoldPolls; $i++){
+        Wait-Ui 10
+        $cl = Update-ClusterInfo 'ES'
+        if($cl -and -not $cl.Error -and [string]$cl.Owner -ne [string]$Box.Target){ return [pscustomobject]@{ Ok=$false; Detail="the cluster moved the role to $($cl.Owner) again" } }
+        try {
+            $p = Get-First -Items @(Invoke-OnNode -Node $Box.Target -Cred $Box.Cred -Sb $script:ServiceProbeSb -ArgumentList @($script:EsSvcDisplay,22331))
+            if($p.Status -ne 'Running' -or -not $p.Port){ return [pscustomobject]@{ Ok=$false; Detail="the service stopped answering (service $($p.Status), port 22331 $(if($p.Port){'open'}else{'closed'}))" } }
+        } catch { Write-Log "[$($Box.Name)] service check: $(Get-FirstLine $_.Exception.Message)" 'Err' }
+    }
+    [pscustomobject]@{ Ok=$true; Detail='' }
 }
 # Remote-node version of the Management Server settle gate (the local node uses Wait-MsIdpReady).
 function Wait-NodeMsSettled { param($Box,[bool]$WantRunning,[int]$TimeoutSec=600)
@@ -3552,9 +3619,11 @@ function Invoke-ClusterNodeStep { param([string]$Key,$Box,[bool]$Want,[string]$T
     foreach($l in $r.Logs){ Write-Log "[$($r.Target)] $l" }
     Write-Log "[$($r.Target)] $(if($r.Ok){'OK'}else{'FAILED'}): $($r.Status)" $(if($r.Ok){'Good'}else{'Err'})
     Set-StageStatus $Key "$($Box.Name): waiting for the $role service to come back..." 'Work'
-    $up = if($isMs){ Wait-NodeService $Key $Box -Port $(if($Want){ 9000 } else { 80 }) } else { Wait-NodeService $Key $Box }
+    $up = if($isMs){ Wait-NodeService $Key $Box -Port $(if($Want){ 9000 } else { 80 }) } else { Wait-EsRoleService $Box }
     $gt = Confirm-BoxStates @($Box) $Want -TotalSec $(if($isMs){300}else{180})
-    if($r.Ok -and $gt -and $up.Up){ $out.Ok = $true; return $out }
+    if($r.Ok -and $gt -and $up.Up){
+        if([string]$up.Owner -ne [string]$Box.Target){ $script:RoleLost = @(@($script:RoleLost) + [string]$Box.Target) }
+        $out.Ok = $true; return $out }
     $out.Why = if(-not $r.Ok){ Get-PlainReason "$($r.Status) $($r.Error)" }
                elseif(-not $gt){ "ServerConfigurator reported success, but $($Box.Name) still reports: $(Get-StateText $Box)." }
                elseif(Test-IdentityError $up.Detail){ $up.Detail }
@@ -3621,6 +3690,30 @@ function Invoke-ClusterStage { param([string]$Key,[bool]$Want,[object[]]$Todo)
                 $up = Wait-NodeService $Key $fb
                 if(-not $up.Up){ $failed = [pscustomobject]@{ Box=$fb; Why="The $role did not come back up on $final."; Tech=$up.Detail } }
             }
+        }
+    }
+    if(-not $failed -and -not $isMs){
+        # Before this stage counts as done, every node that lost the role must prove it can run it.
+        foreach($t in @(@($script:RoleLost) | Select-Object -Unique)){
+            $lb = Get-NodeBox $Key $t
+            Set-StageStatus $Key "Checking that $($lb.Name) can run the $role (the cluster moved the role away from it)..." 'Work'
+            $h = Test-EsNodeHoldsRole $lb
+            if(-not $h.Ok){ $failed = [pscustomobject]@{ Box=$lb; Why="Encryption on $($lb.Name) is correct, but the $role does not stay up there: $($h.Detail). The cluster moved the role away from it during this run as well. Check the Windows event log and the free memory on $($lb.Name)."; Tech=$h.Detail }; break }
+            $note = "The cluster moved the Event Server role away from $($lb.Name) during this run, right after $($lb.Name) was configured, and the run carried on. The wizard then put the role back on $($lb.Name): the Event Server stayed up there for $([int]($script:EsHoldPolls * 10 / 60)) minutes."
+            $script:RoleMoveNotes = @(@($script:RoleMoveNotes) + $note); Write-Log $note 'Good'
+        }
+    }
+    if(-not $failed -and -not $isMs){
+        # The role ends where it should, also after a move during the last wait or after the check above.
+        [void](Update-ClusterInfo $Key)
+        if(-not $cl.Error -and [string]$cl.Owner -ne $final -and (Get-NodeBox $Key $final)){
+            Set-StageStatus $Key "Moving the role back to $final..." 'Work'
+            [void](Move-ClusterRole $Key $final)
+            [void](Update-ClusterInfo $Key)
+            $hb = Get-NodeBox $Key ([string]$cl.Owner)
+            $up = if($hb){ Wait-EsRoleService $hb } else { [pscustomobject]@{ Up=$false; Owner=[string]$cl.Owner; Detail="the role is on $($cl.Owner), a node this run does not know" } }
+            if(-not $up.Up){ $failed = [pscustomobject]@{ Box=$order[-1]; Why="The $role is not running after the cluster moved its role: $($up.Detail)."; Tech=$up.Detail } }
+            elseif([string]$up.Owner -ne $final){ $failed = [pscustomobject]@{ Box=$order[-1]; Why="The $role runs on $($up.Owner), but does not stay on $final. Encryption is correct on every node. Check the Windows event log and the free memory on $final."; Tech=$up.Detail } }
         }
     }
     if($failed){
@@ -4038,6 +4131,7 @@ function Get-ClusterNotes {
         $n.Add("If the role '$g' moves to one of those nodes (a failover), the Management Server will not start there. Fix: make sure the role is on that node (Failover Cluster Manager > Roles > right-click '$g' > Move > Select Node), then on THAT node start this wizard and click 'Re-register this node'. Afterwards that node works and the others need the same step after their next failover.")
     }
     if($script:PausedBeforeNote){ $n.Add(''); foreach($x in ($script:PausedBeforeNote -split "`r`n")){ $n.Add($x) } }
+    if(@($script:RoleMoveNotes).Count){ $n.Add(''); foreach($x in @($script:RoleMoveNotes)){ $n.Add($x) } }
     if(@($script:FailoverResults).Count){
         $n.Add('')
         $n.Add('Failover test (each role was moved to every other node and back):')
@@ -4415,6 +4509,7 @@ function Reset-RunState {
     $script:RecCertMap=@{}; $script:RoleCertMap=@{}; $script:CertRootCer=''
     $script:FailoverResults=@(); $script:Scope=$null; $script:FinalOwners=@{}
     $script:MsTouched=$false; $script:MsLive=$null; $script:PausedByRun=@{}; $script:PausedBeforeNote=''
+    $script:RoleMoveNotes=@(); $script:RoleLost=@()
 }
 
 # Full ON/OFF sequence in the lab-verified order, stopping at the first step whose real state is wrong.
