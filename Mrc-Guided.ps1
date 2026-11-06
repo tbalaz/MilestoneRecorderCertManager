@@ -91,6 +91,15 @@
             -EsHost <event-server-fqdn> -AdminUser '<DOMAIN>\Administrator' -AdminPwFile <path-to-pw-file> `
             -RecTargets '<rec1-fqdn>,<REC2>=<rec2-ip>' -RecUser Administrator -RecPwFile <path-to-pw-file> `
             -RootSubject 'CN=<Your Organization> CA' -ExtraSans '<ms-alias-fqdn>' -LogFile <path-to-log>
+    -Wave all|canary|group (default all) turns ON in waves: canary = only the recording servers listed in
+    -CanaryRecorders, group = those plus -CanaryGroupRecorders, all = every recording server (as before).
+    The lists are comma lists of recorder name, target or address (case-insensitive) and replace the
+    ticks saved by the wizard (recorder-waves.json); not given = the saved ticks are used. Refused
+    (exit 3): an unknown name, a recorder in both lists, -Wave canary|group with -Action off (OFF always
+    does all recording servers). Example, first the canary, later its group, last everyone:
+        ... -Action on -Wave canary -CanaryRecorders 'REC1' -CanaryGroupRecorders 'REC2,REC3'
+        ... -Action on -Wave group  -CanaryRecorders 'REC1' -CanaryGroupRecorders 'REC2,REC3'
+        ... -Action on -Wave all
     -Action on|off|status|register|rollback. -NoEventServer instead of -EsHost when there is no
     standalone Event Server. Without -RecTargets the recording servers are discovered from the VMS
     (-MsAddr, default this machine; needs MilestonePSTools). -TestFailover runs the failover
@@ -107,7 +116,8 @@
                                               (it must own the role now; needs -AdminUser/-AdminPwFile)
         -Action rollback -Snapshot <file>     undo what the run that wrote <file> changed
                                               (recorders and Event Server are taken from the file)
-    Exit code: on/off -> 0 only if every computer's real state equals the target; status -> 0 only
+    Exit code: on/off -> 0 only if every computer's real state equals the target (an ON wave: the
+    recording servers outside the wave are not counted); status -> 0 only
     if every computer was reachable; register -> 0 if the node registered and the Management
     Server came up; rollback -> 0 if every computer is back to the snapshot state. 1 = not
     complete, 2 = fatal error, 3 = refused (not a Management Server / not elevated / missing input),
@@ -122,6 +132,9 @@ param(
     [string]$EsHost = '',                               # standalone Event Server host (FQDN, short name or IP)
     [switch]$NoEventServer,                             # there is no standalone Event Server
     [string]$RecTargets = '',                           # comma list of recorders ('host' or 'name=ip'); empty = discover from the VMS
+    [ValidateSet('all','canary','group')][string]$Wave = 'all',   # headless ON: which recording servers (all / canary only / canary + canary group)
+    [string]$CanaryRecorders = '',                      # comma list of recorder names / targets / addresses for the canary wave (replaces the saved ticks)
+    [string]$CanaryGroupRecorders = '',                 # comma list for the canary group wave (replaces the saved ticks)
     [string]$AdminUser = '',                            # admin account (Management Server + Event Server + default for recorders)
     [string]$AdminPwFile,                               # file holding the admin password (headless only)
     [string]$RecUser = '',                              # optional separate recording-server account
@@ -1521,6 +1534,97 @@ function Update-EsPending { param($Box,[bool]$Want,$Result)
         Set-EsPending ([string]$Box.Target) $Want $true
         Write-Log "$($Box.Name): ServerConfigurator changed the setting there but did not register it with the Management Server. The next 'Turn encryption $(if($Want){'ON'}else{'OFF'})' runs it on $($Box.Name) again." 'Err' }
 }
+# -- Recording-server waves (owner 2026-11-06) ---------------------------------------------------------
+# Rolling ON out in waves: a recording server is 'canary', 'group' (canary group) or none (= the rest). The ticks
+# are kept in recorder-waves.json in $script:RunsDir (key = recorder Target upper case). A missing or damaged
+# file means no ticks, never an error. $script:RunWave ('all' | 'canary' | 'group') decides which recorders an ON
+# run configures: canary = the canary ones, group = canary + group, all = every one.
+function Get-RecWaveFile { Join-Path $script:RunsDir 'recorder-waves.json' }
+function Get-RecWaves {
+    $h=@{}; $f=Get-RecWaveFile
+    if(-not (Test-Path -LiteralPath $f)){ return $h }
+    try { $j=ConvertFrom-Json -InputObject ([IO.File]::ReadAllText($f))
+          foreach($e in $j){ if($e -and $e.Target -and ([string]$e.Wave -in 'canary','group')){ $h[([string]$e.Target).ToUpperInvariant()]=[string]$e.Wave } } }
+    catch { Write-Log "The list of canary / canary group recording servers ($f) could not be read - ignored: $(Get-FirstLine $_.Exception.Message)" 'Err'; return @{} }
+    $h
+}
+function Set-RecWave { param([string]$Target,[string]$Wave)
+    $h=Get-RecWaves; $k=$Target.ToUpperInvariant()
+    if($Wave -in 'canary','group'){ $h[$k]=$Wave } elseif($h.ContainsKey($k)){ $h.Remove($k) } else { return }
+    try {
+        if(-not (Test-Path -LiteralPath $script:RunsDir)){ [void](New-Item -ItemType Directory -Path $script:RunsDir -Force) }
+        $rows=@(foreach($x in @($h.Keys)){ [pscustomobject]@{ Target=$x; Wave=$h[$x] } })
+        [IO.File]::WriteAllText((Get-RecWaveFile), (ConvertTo-Json -InputObject $rows -Depth 3))
+    } catch { Write-Log "Could not save the list of canary / canary group recording servers: $(Get-FirstLine $_.Exception.Message)" 'Err' }
+}
+# 'canary', 'group' or '' (none) for one recorder box. $Waves = a table from Get-RecWaves (read once per loop).
+function Get-RecWaveOf { param($Box,[hashtable]$Waves=$null)
+    if($null -eq $Waves){ $Waves=Get-RecWaves }
+    $k=([string]$Box.Target).ToUpperInvariant()
+    if($Waves.ContainsKey($k)){ [string]$Waves[$k] } else { '' }
+}
+function Test-RecInWave { param($Box,[string]$Wave,[hashtable]$Waves=$null)
+    if($Wave -ne 'canary' -and $Wave -ne 'group'){ return $true }
+    $m=Get-RecWaveOf $Box $Waves
+    if($Wave -eq 'canary'){ return ($m -eq 'canary') }
+    ($m -eq 'canary' -or $m -eq 'group')
+}
+# True when an ON run of a wave leaves this recording server alone (rollback and OFF always cover everything).
+function Test-OutOfWave { param($Box,[bool]$Want)
+    if(-not $Want -or $script:RunWave -eq 'all' -or $null -ne $script:Scope){ return $false }
+    if((Get-BoxKind $Box) -ne 'REC'){ return $false }
+    -not (Test-RecInWave $Box $script:RunWave)
+}
+# Plain-language refusals for the wave choice, before anything changes. Empty = fine. Unrolled on purpose: callers wrap in @().
+function Get-WaveProblems { param([bool]$Want)
+    $p=[System.Collections.Generic.List[string]]::new()
+    if($Want){
+        $w=Get-RecWaves
+        $recs=@($script:RecBoxes | Where-Object { -not $_.Excluded })
+        $can=@($recs | Where-Object { (Get-RecWaveOf $_ $w) -eq 'canary' })
+        $grp=@($recs | Where-Object { (Get-RecWaveOf $_ $w) -eq 'group' })
+        $names={ param($a) (@($a | ForEach-Object { $_.Name })) -join ', ' }
+        if($script:RunWave -eq 'canary' -and -not $can.Count){ $p.Add("Wave 'canary only' is chosen, but no recording server is ticked 'Canary' (step 2). Tick the canary recording server, or choose 'All recording servers'.") }
+        if($script:RunWave -eq 'group'){
+            if(-not $grp.Count){ $p.Add("Wave 'canary + canary group' is chosen, but no recording server is ticked 'Canary group' (step 2).") }
+            $nc=@($can | Where-Object { $_.Encrypted -ne $true })
+            if($nc.Count){ $p.Add("Wave 'canary + canary group' is chosen, but the canary recording server(s) $(& $names $nc) are not encrypted yet. Finish the canary wave first.") }
+        }
+        if($script:RunWave -eq 'all'){
+            $nt=@(@($can)+@($grp) | Where-Object { $_.Encrypted -ne $true })
+            if($nt.Count){ $p.Add("'All recording servers' is chosen, but the ticked canary / canary group recording server(s) $(& $names $nt) are not encrypted yet. Finish the canary / canary group wave first, or untick them.") }
+        }
+    }
+    $p.ToArray()
+}
+# The one-line description of a run's wave, for the log and the report.
+function Get-WaveLine { param([string]$Wave)
+    $recs=@($script:RecBoxes); $w=Get-RecWaves
+    $in=@($recs | Where-Object { Test-RecInWave $_ $Wave $w })
+    "Wave: $(Get-WaveLabel $Wave) - $($in.Count) of $($recs.Count) recording servers ($(if($in.Count){(@($in | ForEach-Object { $_.Name })) -join ', '}else{'none'}))"
+}
+function Get-WaveLabel { param([string]$Wave)
+    switch($Wave){ 'canary' { 'canary only' } 'group' { 'canary + canary group' } default { 'all recording servers' } }
+}
+# End-of-run wording: an ON run of a canary / group wave must not claim "ON on every computer".
+function Get-DoneText { param([bool]$Want,[string]$Wave)
+    if($Want -and ($Wave -eq 'canary' -or $Wave -eq 'group')){ return "ON for this wave ($(Get-WaveLabel $Wave)); the recording servers outside it are left as they are" }
+    "$(if($Want){'ON'}else{'OFF'}) on every computer"
+}
+# Headless: match -CanaryRecorders / -CanaryGroupRecorders (comma lists of name, target or address, case-insensitive)
+# to the known recorders. Returns Problems (refusals) and the matched Targets of each list.
+function Resolve-WaveLists { param([string]$Canary,[string]$Group,[object[]]$Boxes)
+    $probs=[System.Collections.Generic.List[string]]::new(); $res=@{ canary=@(); group=@() }
+    foreach($pair in @(@('canary',$Canary),@('group',$Group))){
+        foreach($n in @(([string]$pair[1]) -split '[;,\r\n]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ })){
+            $m=@(@($Boxes) | Where-Object { $_ -and ($n -ieq [string]$_.Name -or $n -ieq [string]$_.Target -or $n -ieq [string]$_.Addr) })
+            if(-not $m.Count){ $probs.Add("'$n' (listed for the $($pair[0]) wave) is not a known recording server."); continue }
+            $res[$pair[0]] += [string]$m[0].Target
+        }
+    }
+    foreach($t in @($res['canary'] | Where-Object { $res['group'] -contains $_ })){ $probs.Add("Recording server '$t' is in both the canary and the canary group list.") }
+    [pscustomobject]@{ Problems=$probs.ToArray(); Canary=@($res['canary']); Group=@($res['group']) }
+}
 # The Event Server boxes a run configures: local state differs from the target, or a registration for the same
 # target is still pending there.
 function Get-EsTodo { param([object[]]$Boxes,[bool]$Want)
@@ -2018,6 +2122,8 @@ $script:MsStaleNodes = @(); $script:MsLastRegistered = ''; $script:FailoverResul
 $script:RoleMoveNotes = @(); $script:RoleLost = @()
 $script:EsWaitSec = 180; $script:EsHoldPolls = 12
 $script:Scope = $null; $script:FinalOwners = @{}; $script:LastSnapshotPath = ''; $script:TestFailoverOn = $false
+# Owner 2026-11-06: which recording servers an ON run configures: 'all' (default, as before), 'canary', 'group' (canary + group).
+$script:RunWave = 'all'; $script:RunWaveLine = ''; $script:WaveGridLoading = $false
 function Get-First { param($Items) $a=@($Items); if($a.Count){ $a[0] } else { $null } }
 function Get-ClusterObj { param([string]$Key) if($Key -eq 'MS'){ $script:MsCluster } elseif($Key -eq 'ES'){ $script:EsCluster } else { $null } }
 function Get-NodeBoxes { param([string]$Key) if($Key -eq 'MS'){ @($script:MsNodeBoxes) } elseif($Key -eq 'ES'){ @($script:EsNodeBoxes) } else { @() } }
@@ -3991,7 +4097,7 @@ function Get-PreFlightProblems { param([ValidateSet('on','off','register','rollb
         # cannot work - on 2026-11-05 it cost 7.5 of 14 minutes of timeouts and ended 'not checked' anyway.
         if($msRepair){ Write-Log 'Milestone Administrators role: not checked - the Management Server is not running (repair run), so the role cannot be read from the VMS.' }
         else { $a = Get-MilestoneAdminProblem; if($a){ $p.Add($a) } } }
-    if($Want -and $Mode -ne 'register' -and @($script:RecBoxes | Where-Object { -not $_.Excluded -and (Test-InScope $_) -and $_.Encrypted -ne $true }).Count){
+    if($Want -and $Mode -ne 'register' -and @($script:RecBoxes | Where-Object { -not $_.Excluded -and (Test-InScope $_) -and $_.Encrypted -ne $true -and -not (Test-OutOfWave $_ $Want) }).Count){
         $ra = Get-RecAccountProblem; if($ra){ $p.Add($ra) } }
     # Register touches THIS node only (a peer may be Paused or Down); every other mode checks all boxes.
     $boxes = @(if($Mode -eq 'register'){ @(Get-MsBoxes | Where-Object { -not $_.IsNode -or (Test-NodeIsLocal ([string]$_.Target)) }) } else { @(Get-MsBoxes) })
@@ -4009,11 +4115,13 @@ function Get-PreFlightProblems { param([ValidateSet('on','off','register','rollb
         if(-not $b.Reachable){ $p.Add("Cannot connect to $($b.Name) ($(Get-RoleText $b)): $($b.Detail). Make sure it is switched on and WinRM (PowerShell remoting) is enabled.") }
         elseif($null -eq $b.Encrypted){ $p.Add("Could not read the encryption state of $($b.Name) ($(Get-RoleText $b)): $($b.Detail)") }
     }
+    # Owner 2026-11-06: the wave choice (canary / canary group / all) is checked before anything changes.
+    if($Want -and $Mode -eq 'on'){ foreach($m in @(Get-WaveProblems $Want)){ $p.Add($m) } }
     # W1: ServerConfigurator.exe must exist at the engine's fixed install path on every target that would
     # actually run it in this action (register always runs it on the local node; on/off/rollback run it on
     # every reachable box that still needs to change). Otherwise refuse and change nothing.
     $scTargets = if($Mode -eq 'register'){ @($boxes | Where-Object { $_.Reachable }) }
-                 else { @($boxes | Where-Object { $_.Reachable -and (Test-InScope $_) -and ($_.Encrypted -ne $Want -or $_.Half) }) }
+                 else { @($boxes | Where-Object { $_.Reachable -and (Test-InScope $_) -and -not (Test-OutOfWave $_ $Want) -and ($_.Encrypted -ne $Want -or $_.Half) }) }
     foreach($m in @(Get-ScMissingProblem $scTargets)){ $p.Add($m) }
     # Registered to a different management server? Read-only here; Invoke-PreFlight offers the fix.
     $script:RegFindings = @(Get-RegistrationMismatches @($boxes | Where-Object { $_.Reachable }))
@@ -4024,7 +4132,7 @@ function Get-PreFlightProblems { param([ValidateSet('on','off','register','rollb
     }
     foreach($x in @($script:RegFindings)){ $p.Add((Get-RegFindingText $x)) }
     if($Want -and $Mode -ne 'register'){
-        $needs = @($boxes | Where-Object { (Test-InScope $_) -and $_.Encrypted -ne $true })
+        $needs = @($boxes | Where-Object { (Test-InScope $_) -and -not (Test-OutOfWave $_ $Want) -and $_.Encrypted -ne $true })
         if($script:CertFilesOn){
             # Prepared certificate files: every computer that needs a certificate gets its file (one per MS / ES
             # role, one per recorder) - no signing CA. The files are matched and checked here.
@@ -4378,6 +4486,8 @@ function Save-Report {
            Where-Object { $_.LastWriteTime -ge $script:RunStart } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
     if($txt){
         $script:LastReportPath=$txt.FullName
+        # Owner 2026-11-06: the report says which wave the run covered (the CSV columns stay as they are).
+        if($script:RunWaveLine){ try { Set-Content -LiteralPath $txt.FullName -Value ($script:RunWaveLine + "`r`n`r`n" + (Get-Content -LiteralPath $txt.FullName -Raw)) -Encoding UTF8 } catch {} }
         $logPath = $txt.FullName -replace '-results\.txt$','-log.txt'
         try { Set-Content -LiteralPath $logPath -Value $script:Log.Text -Encoding UTF8 } catch {}
     }
@@ -4549,6 +4659,8 @@ function Invoke-RecStage { param([bool]$Want)
     Update-BoxStates $recs
     $todo=@()
     foreach($b in $recs){
+        # Owner 2026-11-06: a recording server outside the chosen wave is left exactly as it is.
+        if(Test-OutOfWave $b $Want){ Write-Log "[$($b.Name)] not in this wave ($($script:RunWave)) - left as it is" 'Good'; Add-GuidedRow $b $act $true 'not in this wave - left as it is'; continue }
         if($b.Reachable -and $b.Encrypted -eq $Want){ Write-Log "[$($b.Name)] recording server already $wt - skipped" 'Good'; Add-GuidedRow $b $act $true "already $wt - skipped" }
         else { $todo+=$b }
     }
@@ -4630,7 +4742,7 @@ function Reset-RunState {
     $script:RecCertMap=@{}; $script:RoleCertMap=@{}; $script:CertRootCer=''
     $script:FailoverResults=@(); $script:Scope=$null; $script:FinalOwners=@{}
     $script:MsTouched=$false; $script:MsLive=$null; $script:PausedByRun=@{}; $script:PausedBeforeNote=''
-    $script:RoleMoveNotes=@(); $script:RoleLost=@()
+    $script:RoleMoveNotes=@(); $script:RoleLost=@(); $script:RunWaveLine=''
 }
 
 # Full ON/OFF sequence in the lab-verified order, stopping at the first step whose real state is wrong.
@@ -4694,6 +4806,10 @@ function Invoke-GuidedRunCore { param([ValidateSet('on','off')][string]$Act)
     Reset-Stages ($keys + @(if($doFt){ 'FT' }))
     Write-Log "========== TURN ENCRYPTION $wt ==========" 'Good'
     Write-Log "Order: $(@($keys | ForEach-Object { Get-StageName $_ }) -join ', then ')"
+    # Owner 2026-11-06: which recording servers this run covers (OFF always covers all of them).
+    if(-not $want){ $script:RunWave='all' }
+    $script:RunWaveLine = Get-WaveLine $script:RunWave
+    Write-Log $script:RunWaveLine
     foreach($k in @('MS','ES')){ if(Get-ClusterObj $k){ [void](Update-ClusterInfo $k) } }
     Initialize-MsTracking
     $all=@(Get-AllBoxes)
@@ -4729,11 +4845,14 @@ function Invoke-GuidedRunCore { param([ValidateSet('on','off')][string]$Act)
     }
     $all=@(Get-AllBoxes); Update-BoxStates $all
     Write-StateLog "STATE AFTER (target: encryption $wt)" $all
-    foreach($b in $all){ $fine = ($b.Encrypted -eq $want) -and -not $b.Half
+    foreach($b in $all){
+        # Owner 2026-11-06: a recording server outside the wave is not part of the final check.
+        if(Test-OutOfWave $b $want){ Add-GuidedRow $b 'final-state' $true "final state $(Get-StateText $b) - not in this wave, left as it is"; continue }
+        $fine = ($b.Encrypted -eq $want) -and -not $b.Half
         Add-GuidedRow $b 'final-state' $fine "final state $(Get-StateText $b) (target $wt)" $(if(-not $fine){$b.Detail}else{''}) }
-    $allMatch = (@($all | Where-Object { $_.Encrypted -ne $want -or $_.Half }).Count -eq 0)
+    $allMatch = (@($all | Where-Object { -not (Test-OutOfWave $_ $want) -and ($_.Encrypted -ne $want -or $_.Half) }).Count -eq 0)
     if($ok -and -not $allMatch){
-        $bad=@($all | Where-Object { $_.Encrypted -ne $want -or $_.Half } | ForEach-Object { $_.Name })
+        $bad=@($all | Where-Object { -not (Test-OutOfWave $_ $want) -and ($_.Encrypted -ne $want -or $_.Half) } | ForEach-Object { $_.Name })
         Set-RunFailure 'Final check' ($bad -join ', ') 'These computers are not in the wanted state (for example they could not be reached).' '' 'Make sure every computer is switched on and reachable, then run the same action again.'
     }
     $success = $ok -and $allMatch
@@ -4750,7 +4869,7 @@ function Invoke-GuidedRunCore { param([ValidateSet('on','off')][string]$Act)
     }
     try { if(-not (Test-FinalMsLiveGuard $Act)){ $success=$false } } catch { Write-ErrorTrace $_; $success=$false }
     if(-not (Test-FinalPausedGuard $Act)){ $success=$false }
-    Write-Log "OVERALL: $(if($success){"encryption is $wt on every computer"}else{'NOT COMPLETE - see the message above'})" $(if($success){'Good'}else{'Err'})
+    Write-Log "OVERALL: $(if($success){"encryption is $(Get-DoneText $want $script:RunWave)"}else{'NOT COMPLETE - see the message above'})" $(if($success){'Good'}else{'Err'})
     foreach($l in @(Get-ClusterNotes)){ if($l){ Write-Log $l } }
     Save-Report
     $script:HasResult=$true
@@ -4923,7 +5042,7 @@ function Get-OutcomeText { param($Res)
                 if($Res.PSObject.Properties['FailoverFailed'] -and $Res.FailoverFailed){
                     $badDet = (@($script:FailoverResults) | Where-Object { -not $_.Ok -and -not $_.Skipped } | ForEach-Object { "$($_.Role) on $($_.Node): $($_.Detail)" }) -join '; '
                     "Encryption done, but the failover test FAILED: $badDet"
-                } else { "Encryption is now $wt on every computer." }
+                } else { "Encryption is now $(Get-DoneText ([bool]$Res.Want) $script:RunWave)." }
             } }
         return "$head`r`n`r`nCurrent state:`r`n$lines$notesTxt$snapTxt`r`n`r`nReport file:`r`n$rep"
     }
@@ -4964,15 +5083,51 @@ function New-StateGrid { param([int]$X,[int]$Y,[int]$W,[int]$H)
         [void]$g.Columns.Add($col) }
     $g.Columns['Detail'].AutoSizeMode='Fill'
     $g }
+# Owner 2026-11-06: the check grid (step 2) gets two tick columns, 'Canary' and 'Canary group', editable on recording-server rows.
+function Add-WaveColumns { param($Grid)
+    $Grid.Columns['Role'].Width=200; $Grid.Columns['Detail'].MinimumWidth=120
+    foreach($c in @(@('Canary','Canary',70),@('CanaryGroup','Canary group',100))){
+        $col=[Windows.Forms.DataGridViewCheckBoxColumn]::new(); $col.Name=$c[0]; $col.HeaderText=$c[1]; $col.Width=$c[2]; $col.SortMode='NotSortable'
+        [void]$Grid.Columns.Add($col) }
+    $Grid.Columns['Canary'].DisplayIndex=4; $Grid.Columns['CanaryGroup'].DisplayIndex=5
+    $Grid.ReadOnly=$false
+    foreach($n in @('Name','Role','Reach','State','Detail')){ $Grid.Columns[$n].ReadOnly=$true }
+}
+# A tick changed: one tick per row, then save at once.
+function Update-WaveFromCell { param($Grid,[int]$RowIndex,[int]$ColIndex)
+    if($script:WaveGridLoading -or $RowIndex -lt 0 -or $ColIndex -lt 0){ return }
+    $name=[string]$Grid.Columns[$ColIndex].Name
+    if($name -ne 'Canary' -and $name -ne 'CanaryGroup'){ return }
+    $row=$Grid.Rows[$RowIndex]; $b=$row.Tag
+    if($null -eq $b -or (Get-BoxKind $b) -ne 'REC'){ return }
+    $c=[bool]$row.Cells['Canary'].Value; $g=[bool]$row.Cells['CanaryGroup'].Value
+    $script:WaveGridLoading=$true
+    try {
+        if($name -eq 'Canary' -and $c){ $row.Cells['CanaryGroup'].Value=$false; $g=$false }
+        elseif($name -eq 'CanaryGroup' -and $g){ $row.Cells['Canary'].Value=$false; $c=$false }
+    } finally { $script:WaveGridLoading=$false }
+    Set-RecWave ([string]$b.Target) $(if($c){'canary'}elseif($g){'group'}else{''})
+}
 function Show-StateGrid { param($Grid,[object[]]$Boxes)
+    $script:WaveGridLoading=$true
+    try {
     $Grid.Rows.Clear()
+    $hasWave=$Grid.Columns.Contains('Canary'); if($hasWave){ $waves=Get-RecWaves }
     foreach($b in @($Boxes)){
         $idx=$Grid.Rows.Add($b.Name,(Get-RoleText $b),$(if($b.Reachable){'Yes'}else{'No'}),(Get-StateText $b),$b.Detail)
         $row=$Grid.Rows[$idx]
+        if($hasWave){
+            $row.Tag=$b
+            if((Get-BoxKind $b) -eq 'REC'){
+                $m=Get-RecWaveOf $b $waves
+                $row.Cells['Canary'].Value=($m -eq 'canary'); $row.Cells['CanaryGroup'].Value=($m -eq 'group') }
+            else { foreach($n in @('Canary','CanaryGroup')){ $row.Cells[$n].ReadOnly=$true; $row.Cells[$n].Style.BackColor=[Drawing.Color]::Gainsboro } }
+        }
         $row.Cells['Reach'].Style.BackColor = if($b.Reachable){ $script:ColGood } else { $script:ColBad }
         $row.Cells['State'].Style.BackColor = if(-not $b.Reachable -or $null -eq $b.Encrypted){ $script:ColBad } elseif($b.Encrypted){ $script:ColGood } else { $script:ColOff }
     }
     $Grid.ClearSelection()
+    } finally { $script:WaveGridLoading=$false }
 }
 function Get-StateSummary { param([object[]]$Boxes)
     $a=@($Boxes)
@@ -5156,7 +5311,7 @@ function Show-RunOutcome { param($Res)
     $script:ResultLabel.Text = switch($Res.Kind){
         'register' { if($Res.Success){ 'Done. This node is registered again and the Management Server runs on it.' } else { 'NOT complete. Re-register did not finish - see the message and the notes below.' } }
         'rollback' { if($Res.Success){ 'Done. Every computer is back in the state it had before the run.' } else { 'NOT complete. The rollback did not finish - see the message and the table below.' } }
-        default    { if($Res.Success){ "Done. Encryption is $wt on every computer." } else { "NOT complete. Encryption could not be turned $wt everywhere - see the message and the table below." } } }
+        default    { if($Res.Success){ "Done. Encryption is $(Get-DoneText ([bool]$Res.Want) $script:RunWave)." } else { "NOT complete. Encryption could not be turned $wt everywhere - see the message and the table below." } } }
     $script:ResultLabel.ForeColor = if($Res.Success){ [Drawing.Color]::DarkGreen } else { [Drawing.Color]::DarkRed }
     $script:ReportBox.Text = $Res.Report
     $script:NotesBox.Text = (@(Get-ClusterNotes) -join "`r`n")
@@ -5166,6 +5321,8 @@ function Show-RunOutcome { param($Res)
 }
 function Start-GuidedAction { param([ValidateSet('on','off')][string]$Act)
     $wt=$Act.ToUpper()
+    # Owner 2026-11-06: the wave choice only counts for ON; OFF always does every recording server.
+    $script:RunWave = if($Act -eq 'on'){ switch($script:WaveBox.SelectedIndex){ 1 { 'canary' } 2 { 'group' } default { 'all' } } } else { 'all' }
     $script:TestFailoverOn = [bool]($script:FailoverChk.Visible -and $script:FailoverChk.Checked)
     $q=Get-ConfirmText $Act
     if([Windows.Forms.MessageBox]::Show($q,'Please confirm',4,'Question') -ne 'Yes'){ return }
@@ -5403,7 +5560,9 @@ $script:SignerPfxBox=[Windows.Forms.TextBox]::new(); $script:SignerPwBox=[Window
 # ---- page 2: Check ----
 $p2=$script:Pages[1]
 $p2.Controls.Add((New-UiLabel 'This is the current state of every computer. Nothing has been changed yet.' 24 10 950 34))
-$script:CheckGrid=New-StateGrid 24 50 950 320; $p2.Controls.Add($script:CheckGrid)
+$script:CheckGrid=New-StateGrid 24 50 950 320; Add-WaveColumns $script:CheckGrid; $p2.Controls.Add($script:CheckGrid)
+$script:CheckGrid.Add_CurrentCellDirtyStateChanged({ if($script:CheckGrid.IsCurrentCellDirty){ [void]$script:CheckGrid.CommitEdit([Windows.Forms.DataGridViewDataErrorContexts]::Commit) } })
+$script:CheckGrid.Add_CellValueChanged({ param($s,$e) Update-WaveFromCell $script:CheckGrid $e.RowIndex $e.ColumnIndex })
 $script:ClusterLabel=New-UiLabel '' 24 376 950 120; $script:ClusterLabel.TextAlign='TopLeft'; $script:ClusterLabel.Anchor='Bottom,Left,Right'; $p2.Controls.Add($script:ClusterLabel)
 $script:CheckSummary=New-UiLabel '' 24 500 720 30; $script:CheckSummary.Anchor='Bottom,Left'; $script:CheckSummary.Font=$script:UiBold; $p2.Controls.Add($script:CheckSummary)
 $recheckBtn=New-UiButton 'Check again' 794 498 180; $recheckBtn.Anchor='Bottom,Right'; $p2.Controls.Add($recheckBtn); $recheckBtn.Add_Click({ Do-Recheck })
@@ -5416,7 +5575,11 @@ $onBtn=New-UiButton 'Turn encryption ON' 24 56 460 64; $onBtn.Font=[Drawing.Font
 $offBtn=New-UiButton 'Turn encryption OFF' 514 56 460 64; $offBtn.Font=[Drawing.Font]::new('Segoe UI',14,[Drawing.FontStyle]::Bold); $offBtn.BackColor=[Drawing.Color]::FromArgb(84,110,122); $offBtn.ForeColor=[Drawing.Color]::White; $offBtn.FlatStyle='Flat'
 $p3.Controls.Add($onBtn); $p3.Controls.Add($offBtn)
 $onBtn.Add_Click({ Start-GuidedAction 'on' }); $offBtn.Add_Click({ Start-GuidedAction 'off' })
-$order3=New-UiLabel "ON order: Event Server, then Management Server, then recording servers.`r`nOFF order: Management Server, then recording servers, then Event Server." 24 128 950 50; $order3.TextAlign='TopLeft'; $p3.Controls.Add($order3)
+$order3=New-UiLabel "ON order: Event Server, then Management Server, then recording servers.`r`nOFF order: Management Server, then recording servers, then Event Server." 24 128 560 50; $order3.TextAlign='TopLeft'; $p3.Controls.Add($order3)
+# Owner 2026-11-06: which recording servers ON covers (waves: canary, then canary group, then all). OFF always does all.
+$waveLbl=New-UiLabel 'Turn ON for (OFF always does all recording servers):' 600 126 374 22; $p3.Controls.Add($waveLbl)
+$script:WaveBox=[Windows.Forms.ComboBox]::new(); $script:WaveBox.Name='WaveBox'; $script:WaveBox.DropDownStyle='DropDownList'; $script:WaveBox.Location=[Drawing.Point]::new(600,150); $script:WaveBox.Size=[Drawing.Size]::new(374,26)
+[void]$script:WaveBox.Items.AddRange(@('All recording servers','Canary only','Canary + canary group')); $script:WaveBox.SelectedIndex=0; $p3.Controls.Add($script:WaveBox)
 $script:FailoverChk=New-UiCheck 'Test failover after the change (move each cluster role to every other node and back)' 24 178 950; $script:FailoverChk.Checked=$true; $script:FailoverChk.Visible=$false; $p3.Controls.Add($script:FailoverChk)
 $script:StageGrid=[Windows.Forms.DataGridView]::new(); $script:StageGrid.Location=[Drawing.Point]::new(24,212); $script:StageGrid.Size=[Drawing.Size]::new(950,160); $script:StageGrid.Anchor='Top,Left,Right'
 $script:StageGrid.AllowUserToAddRows=$false; $script:StageGrid.AllowUserToDeleteRows=$false; $script:StageGrid.RowHeadersVisible=$false; $script:StageGrid.ReadOnly=$true
@@ -5454,7 +5617,7 @@ $rbHint=New-UiLabel 'Changes back only what the last run changed. Available only
 $script:BackBtn.Add_Click({ if($script:Page -gt 1){ Show-Page ($script:Page - 1) } })
 $script:NextBtn.Add_Click({ switch($script:Page){ 1 { Do-Connect } 2 { Show-Page 3 } 3 { Show-Page 4 } default { $script:Form.Close() } } })
 
-$script:BusyCtrls=@($script:BackBtn,$script:NextBtn,$onBtn,$offBtn,$recheckBtn,$findCaBtn,$createCaBtn,$script:CertFilesBtn,$script:RegBtn,$undoOldBtn,$script:FailoverChk)   # RollbackBtn: Update-RollbackButton decides
+$script:BusyCtrls=@($script:BackBtn,$script:NextBtn,$onBtn,$offBtn,$script:WaveBox,$recheckBtn,$findCaBtn,$createCaBtn,$script:CertFilesBtn,$script:RegBtn,$undoOldBtn,$script:FailoverChk)   # RollbackBtn: Update-RollbackButton decides
 
 # Closing the window in the middle of a change can leave cluster nodes paused or a role elsewhere.
 $script:Form.Add_FormClosing({
@@ -5490,6 +5653,7 @@ Write-Log "Management Server: $env:COMPUTERNAME (local). Order ON = Event Server
 
 if($script:Headless){
     try {
+        if($Wave -ne 'all' -and $Action -eq 'off'){ Write-Log "REFUSED: -Wave $Wave cannot be used with -Action off (OFF always does all recording servers)" 'Err'; exit 3 }
         if([string]::IsNullOrWhiteSpace($AdminPwFile) -or -not (Test-Path -LiteralPath $AdminPwFile)){ Write-Log "REFUSED: -AdminPwFile not found: $AdminPwFile" 'Err'; exit 3 }
         $script:AdminPwBox.Text   = (Get-Content -Raw -LiteralPath $AdminPwFile).Trim()
         $script:AdminUserBox.Text = $AdminUser
@@ -5546,6 +5710,15 @@ if($script:Headless){
             exit ([int](-not $allOk))
         }
         $script:TestFailoverOn = [bool]$TestFailover
+        # Owner 2026-11-06: waves. Given lists replace (and save) the ticks; not given = the saved ticks.
+        $script:RunWave = $(if($Action -eq 'on'){ $Wave } else { 'all' })
+        if($CanaryRecorders -or $CanaryGroupRecorders){
+            $wl = Resolve-WaveLists -Canary $CanaryRecorders -Group $CanaryGroupRecorders -Boxes @($script:RecBoxes)
+            if(@($wl.Problems).Count){ foreach($x in @($wl.Problems)){ Write-Log "REFUSED: $x" 'Err' }; exit 3 }
+            foreach($b in @($script:RecBoxes)){ Set-RecWave ([string]$b.Target) '' }
+            foreach($t in @($wl.Canary)){ Set-RecWave $t 'canary' }
+            foreach($t in @($wl.Group)){ Set-RecWave $t 'group' }
+        }
         $res=@(Invoke-GuidedRun $Action)[-1]
         foreach($l in ((Get-OutcomeText $res) -split "`r`n")){ Write-Log $l $(if($res.Success){'Good'}else{'Err'}) }
         if(-not $res.Success -and $script:LastSnapshotPath -and (Test-RollbackUseful)){

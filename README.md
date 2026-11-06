@@ -171,6 +171,22 @@ role (generic services). Run the wizard on any Management Server node.
   node and back, and must come up there. Management Server nodes that cannot take over
   (see above) are skipped and named.
 
+## Recording Servers in waves (canary first)
+
+To turn encryption ON for a few Recording Servers before all of them, tick Recording Server rows
+on the Check page: **Canary** (the first one or two) and **Canary group** (the next batch). On the
+Action page choose the wave, then click ON:
+
+- **Canary only**: the Management Server, the Event Server and the canary Recording Servers.
+- **Canary + canary group**: also the canary group. Refused until the canary is encrypted.
+- **All recording servers** (the default): every Recording Server. Refused while a ticked canary
+  or canary group Recording Server is not encrypted yet: finish that wave first, or untick it.
+
+Recording Servers outside the wave are left as they are, and the result page says so. OFF always
+covers every Recording Server. The ticks are saved next to the run reports
+(`recorder-waves.json`). Headless: `-Wave canary|group|all` with `-CanaryRecorders` and
+`-CanaryGroupRecorders` (comma lists of names or addresses; they replace the saved ticks).
+
 ## Undo (rollback)
 
 Before every run the wizard saves the current state of every server as a JSON snapshot next to
@@ -235,6 +251,7 @@ share: it is listed in `.gitignore`.
     [-TestFailover] [-FixRegistration] [-SearchPaths 'D:\Milestone'] `
     [-RecTargets '<rec1-fqdn>,<REC2>=<rec2-ip>'] [-RecUser <user> -RecPwFile <path>] `
     [-CertFolder <folder> -CertPwFile <path> -RootCaFile <root-ca.cer>]   # own CA: -RootSubject not needed
+    [-Wave canary|group|all -CanaryRecorders '<rec1>' -CanaryGroupRecorders '<rec2>,<rec3>']   # ON in waves
 .\Mrc-Guided.ps1 -Action register -AdminUser <DOMAIN\user> -AdminPwFile <path>   # this cluster node
 .\Mrc-Guided.ps1 -Action rollback -Snapshot <run-...-snapshot.json> -AdminUser ... -AdminPwFile ...
 ```
@@ -243,7 +260,7 @@ Passwords are read from a file, never passed on the command line. Delete the fil
 
 | Exit code | Meaning |
 | --- | --- |
-| 0 | Every server ended in the wanted state (status: every server was reachable) |
+| 0 | Every server ended in the wanted state (status: every server was reachable; an ON wave: Recording Servers outside the wave are not counted) |
 | 1 | Not complete: see the report; nothing after the failed step was changed |
 | 2 | Fatal error |
 | 3 | Refused: not a Management Server, not elevated, or missing input |
