@@ -104,7 +104,15 @@ the root CA file (`.cer`) too: it is added to the trusted root store of every se
 certificate. The pre-flight check opens and checks every file before anything is changed and names
 each missing or wrong one. Smart Client computers need your root CA as well (for example by Group
 Policy), and your CA's revocation list must be reachable.
-- It writes a CSV and TXT report to `%TEMP%\MilestoneRecorderCertManager-runs\`.
+- It writes a CSV and TXT report to `%TEMP%\MilestoneRecorderCertManager-runs\`. The TXT report has one
+  block per server with the full status and error text; the CSV adds a `Step` and an `ExitCode` column.
+- `run-<start>-log.txt` in the same folder is written while the run works (every 3 seconds), so a run
+  that hangs or is closed still leaves its log. Each step starts with the state it read and the facts it
+  used (account, ServerConfigurator folders, cluster role owner and nodes); a server's ServerConfigurator
+  log is in the log one line per line.
+- When a step fails, `run-<start>-diag-<SERVER>.txt` holds that server's Milestone services, cluster
+  state, Windows Application and System errors and warnings, and the full ServerConfigurator log of that
+  step. It is collected read-only. Send the report, the log and any diagnostics file to support.
 
 ## Health check: Mrc-Doctor.ps1
 

@@ -1142,6 +1142,8 @@ $script:Headless    = [bool]$Action
 $script:SelfPath    = $PSCommandPath
 $script:ChangeInProgress = $false   # a change / rollback / re-register is running (window close guard)
 $script:LogFilePath = $LogFile
+$script:AutoLogFile = $false                       # headless without -LogFile: the run log file doubles as the live log
+$script:AutoLogFile = [string]::IsNullOrEmpty($LogFile)
 
 # Plain-language refusal before any window exists (Write-Log needs the form's log box).
 function Stop-Refused { param([string]$Msg)
@@ -1964,8 +1966,8 @@ function Invoke-RecordersParallel { param([object[]]$Boxes,[string]$Action,[hash
             try { $r=@($j.PS.EndInvoke($j.Handle))[0] } catch { $r=[pscustomobject]@{Target=[string]$j.Box.Target;Fqdn=[string]$j.Box.Addr;Ok=$false;Status="FAILED ($($_.Exception.Message))";Tp='';Error=$_.Exception.Message;Groups='';Action=$Action;Started=Get-Date;Ended=Get-Date;DurationSec=0.0;Logs=@()} }
             $j.PS.Dispose(); $j.Done=$true; $remaining--; $done++
             if($r){
-                Add-RunResult $r; foreach($l in $r.Logs){ Write-Log "[$($r.Target)] $l" }
-                Write-Log "[$($r.Target)] $(if($r.Ok){'OK'}else{'FAILED'}): $($r.Status)" $(if($r.Ok){'Good'}else{'Err'})
+                Add-RunResult $r; foreach($l in $r.Logs){ Write-LogLines "[$($r.Target)] " ([string]$l) }
+                Write-LogLines "[$($r.Target)] $(if($r.Ok){'OK'}else{'FAILED'}): " ([string]$r.Status) $(if($r.Ok){'Good'}else{'Err'})
                 [void]$out.Add([pscustomobject]@{Box=$j.Box;Result=$r})
             }
             Set-StageStatus 'REC' "Working... $done of $($jobs.Count) finished" 'Work'
@@ -2110,6 +2112,9 @@ function Get-VmsRecorderList { param([string]$Domain,[pscredential]$VmsCred,[str
 $script:MsBox = $null; $script:EsBox = $null; $script:RecBoxes = @()
 $script:RunFailure = $null; $script:SignerTp = ''; $script:CaCer = ''; $script:HasResult = $false
 $script:RunStart = Get-Date; $script:StageRows = @{}; $script:LastOutcome = $null
+# Owner 2026-11-06 (debug logging): live run log file, diagnostics files of failed computers.
+$script:RunLogPath = ''; $script:RunLogWritten = 0; $script:RunLogBusy = $false; $script:RunLogTimer = $null
+$script:DiagFiles = @(); $script:DiagDone = @{}; $script:DiagRecCount = 0
 $script:SessOpt = New-PSSessionOption -OpenTimeout 20000 -OperationTimeout 180000
 
 function New-Box { param([string]$Role,[string]$Name,[string]$Target,[string]$Addr,[pscredential]$Cred)
@@ -3438,7 +3443,7 @@ function New-ClusterCertificate { param([string]$Key,[object[]]$Nodes)
                      -PfxPath $rc.File -PfxPassword $rc.Pw -SignerCerPath $script:CertRootCer `
                      -InstallSignerToRoot ([bool]$script:CertRootCer) -InstallSignerToIntermediate $false `
                      -EnableEncryption $false -ServerConfiguratorPath '' -ScCredential $n.Cred -CertificateGroup ''
-            foreach($l in $r.Logs){ Write-Log "[$($n.Name)] $l" }
+            foreach($l in $r.Logs){ Write-LogLines "[$($n.Name)] " ([string]$l) }
             foreach($l in @(Invoke-OnNode -Node $n.Target -Cred $n.Cred -Sb $script:KeyGrantSb -ArgumentList @($rc.Tp,$dn))){ Write-Log ([string]$l) $(if([string]$l -match 'WARNING'){'Err'}else{'Info'}) }
         }
         return $rc.Tp
@@ -3466,7 +3471,7 @@ function New-ClusterCertificate { param([string]$Key,[object[]]$Nodes)
                  -PfxPath $pkg.PfxPath -PfxPassword $pfxPw -SignerCerPath $script:CaCer `
                  -InstallSignerToRoot $true -InstallSignerToIntermediate $false `
                  -EnableEncryption $false -ServerConfiguratorPath '' -ScCredential $n.Cred -CertificateGroup ''
-        foreach($l in $r.Logs){ Write-Log "[$($n.Name)] $l" }
+        foreach($l in $r.Logs){ Write-LogLines "[$($n.Name)] " ([string]$l) }
         foreach($l in @(Invoke-OnNode -Node $n.Target -Cred $n.Cred -Sb $script:KeyGrantSb -ArgumentList @($pkg.Thumbprint,$dn))){ Write-Log ([string]$l) $(if([string]$l -match 'WARNING'){'Err'}else{'Info'}) }
     }
     $pkg.Thumbprint
@@ -3517,7 +3522,7 @@ function Invoke-NodeRegister { param($Box,[string]$Address,[string]$Key='MS')
         }
         $out.Ran = $true
         $r = Invoke-ScRegisterOn $Box $Address
-        foreach($l in @($r.Logs)){ Write-Log "[$($Box.Name)] $l" }
+        foreach($l in @($r.Logs)){ Write-LogLines "[$($Box.Name)] " ([string]$l) }
     } catch { $out.Detail = $(if(Test-IdentityError $_.Exception.Message){ Get-IdentityMessage $_.Exception.Message } else { Format-Err $_ }); Write-Log "[$($Box.Name)] register FAILED: $($out.Detail)" 'Err' }
     finally {
         $rs = Invoke-ClusterOp $Key 'resume'
@@ -3702,7 +3707,7 @@ function Test-BoxRegistration { param($Box,[string]$TargetHost,[int]$TotalSec=90
 function Repair-HostRegistration { param($F)
     $b = $F.Box; $url = [string]$F.Target; $r = $null; $det = ''
     Write-Log "[$($b.Name)] registering with $url (Server Configurator /register)" 'Good'
-    try { $r = Invoke-ScRegisterOn $b $url; foreach($l in @($r.Logs)){ Write-Log "[$($b.Name)] $l" } }
+    try { $r = Invoke-ScRegisterOn $b $url; foreach($l in @($r.Logs)){ Write-LogLines "[$($b.Name)] " ([string]$l) } }
     catch { $det = Get-PlainReason (Format-Err $_); Write-Log "[$($b.Name)] register FAILED: $(Format-Err $_)" 'Err' }
     $ok = ($null -ne $r) -and [bool]$r.Ok
     if($ok){ $ok = Test-BoxRegistration $b (Get-UrlHost $url) }
@@ -3784,6 +3789,7 @@ function Invoke-PreFlight { param([ValidateSet('on','off','register','rollback')
 # wait for the service, read the node's real state.
 function Invoke-ClusterNodeStep { param([string]$Key,$Box,[bool]$Want,[string]$Thumbprint)
     $out = [pscustomobject]@{ Ok=$false; ScRan=$false; Why=''; Tech='' }
+    $t0 = Get-Date
     $isMs = ($Key -eq 'MS'); $act = $(if($Want){'on'}else{'off'}); $role = Get-StageName $Key
     $mv = if($isMs){ Enter-MsNode $Box } else { Move-ClusterRole $Key $Box.Target }
     if(-not $mv.Ok){
@@ -3830,21 +3836,23 @@ function Invoke-ClusterNodeStep { param([string]$Key,$Box,[bool]$Want,[string]$T
     }
     if($r -and -not $isMs){ Update-EsPending $Box $Want $r }
     if($resumeFail){
-        if($r){ Add-RunResult $r; foreach($l in $r.Logs){ Write-Log "[$($r.Target)] $l" } }
+        if($r){ Add-RunResult $r; foreach($l in $r.Logs){ Write-LogLines "[$($r.Target)] " ([string]$l) } }
         Add-GuidedRow $Box $act $false 'cluster node(s) still paused - stopped' $resumeFail
         $out.Why = $resumeFail; $out.Tech = $rs.Detail; return $out }
     if(-not $r){
         if(-not $out.Why){ $out.Why = "ServerConfigurator could not be run on $($Box.Name)." }
         Add-GuidedRow $Box $act $false 'ServerConfigurator not run' $out.Tech; return $out }
     Add-RunResult $r
-    foreach($l in $r.Logs){ Write-Log "[$($r.Target)] $l" }
-    Write-Log "[$($r.Target)] $(if($r.Ok){'OK'}else{'FAILED'}): $($r.Status)" $(if($r.Ok){'Good'}else{'Err'})
+    foreach($l in $r.Logs){ Write-LogLines "[$($r.Target)] " ([string]$l) }
+    Write-LogLines "[$($r.Target)] $(if($r.Ok){'OK'}else{'FAILED'}): " ([string]$r.Status) $(if($r.Ok){'Good'}else{'Err'})
     Set-StageStatus $Key "$($Box.Name): waiting for the $role service to come back..." 'Work'
     $up = if($isMs){ Wait-NodeService $Key $Box -Port $(if($Want){ 9000 } else { 80 }) } else { Wait-EsRoleService $Box }
-    $gt = Confirm-BoxStates @($Box) $Want -TotalSec $(if($isMs){300}else{180})
+    # Owner 2026-11-06: a failed ServerConfigurator run reads the state once; the 180 / 300 s wait is only for a run that worked.
+    $gt = Confirm-BoxStates @($Box) $Want -TotalSec $(if(-not $r.Ok){ 0 } elseif($isMs){ 300 } else { 180 })
     if($r.Ok -and $gt -and $up.Up){
         if([string]$up.Owner -ne [string]$Box.Target){ $script:RoleLost = @(@($script:RoleLost) + [string]$Box.Target) }
         $out.Ok = $true; return $out }
+    Save-NodeDiagnostics $Box $t0 $(if(-not $r.Ok){ "ServerConfigurator failed on $($Box.Name)" } else { "the $role did not come back on $($Box.Name)" })
     $out.Why = if(-not $r.Ok){ Get-PlainReason "$($r.Status) $($r.Error)" }
                elseif(-not $gt){ "ServerConfigurator reported success, but $($Box.Name) still reports: $(Get-StateText $Box)." }
                elseif(Test-IdentityError $up.Detail){ $up.Detail }
@@ -4473,6 +4481,229 @@ function Initialize-Targets { param([string]$ManualList,[bool]$Discover)
     $discErr
 }
 
+# -- readable log, live run log, report files, diagnostics (owner 2026-11-06, docs/plans/2026-11-06-guided-debug-logging.md)
+# Pure: one log entry (the engine joins a computer's ServerConfigurator log with ' || ' and its notes with ' | [')
+# -> one text line per part. The first line keeps the text, the following lines are indented 4 spaces.
+function Expand-LogEntry { param([string]$Text)
+    $t = [string]$Text
+    if([string]::IsNullOrWhiteSpace($t)){ return @() }
+    $parts = @([regex]::Split($t, ' \| (?=\[)| \|\| |\r?\n') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    $out = [System.Collections.Generic.List[string]]::new(); $i = 0
+    foreach($p in $parts){ if($i -eq 0){ [void]$out.Add($p) } else { [void]$out.Add('    ' + $p) }; $i++ }
+    $out.ToArray()
+}
+# Write one entry as several log lines (the prefix goes on the first line only).
+function Write-LogLines { param([string]$Prefix,[string]$Text,[string]$Level='Info')
+    $lines = @(Expand-LogEntry $Text)
+    if(-not $lines.Count){ if($Prefix.Trim()){ Write-Log $Prefix.TrimEnd() $Level }; return }
+    $i = 0
+    foreach($l in $lines){ Write-Log $(if($i -eq 0){ "$Prefix$l" } else { $l }) $Level; $i++ }
+}
+# The window log as text with CRLF line ends.
+function Get-LogText { ([string]$script:Log.Text) -replace "(?<!`r)`n","`r`n" }
+# Appends the part of the window log that is not in the run log file yet. Called by the 3 s timer and on a failure.
+function Write-RunLogPart {
+    if($script:RunLogBusy){ return }
+    $script:RunLogBusy = $true
+    try {
+        if(-not $script:RunLogPath -or $script:Headless){ return }
+        $txt = Get-LogText
+        if($txt.Length -lt $script:RunLogWritten){ $script:RunLogWritten = 0 }
+        if($txt.Length -gt $script:RunLogWritten){
+            $part = $txt.Substring($script:RunLogWritten)
+            if($script:RunLogWritten -eq 0){ [IO.File]::WriteAllText($script:RunLogPath, $part, [Text.UTF8Encoding]::new($false)) }
+            else { [IO.File]::AppendAllText($script:RunLogPath, $part, [Text.UTF8Encoding]::new($false)) }
+            $script:RunLogWritten = $txt.Length
+        }
+    } catch {} finally { $script:RunLogBusy = $false }
+}
+# Run start (GUI and headless, every action): name the run log file and keep it growing while the run works.
+function Start-RunLog {
+    try {
+        if(-not (Test-Path -LiteralPath $script:RunsDir)){ [void](New-Item -ItemType Directory -Path $script:RunsDir -Force) }
+        $script:RunLogPath = Join-Path $script:RunsDir ("run-{0:yyyyMMdd-HHmmss}-log.txt" -f $script:RunStart)
+        $script:RunLogWritten = 0
+        if($script:Headless){
+            if($script:AutoLogFile){
+                [IO.File]::WriteAllText($script:RunLogPath, (Get-LogText), [Text.UTF8Encoding]::new($false))
+                $script:LogFilePath = $script:RunLogPath   # Write-Log appends every line from now on
+            } else {
+                $script:RunLogPath = $script:LogFilePath   # -LogFile given: that file IS the run log (the report names it)
+            }
+        } else {
+            # The file holds THIS run (a window can run several times): it starts at the marker line, not at the
+            # window's whole history. STATE BEFORE each step repeats what the Check page showed.
+            $script:RunLogWritten = (Get-LogText).Length
+            if(-not $script:RunLogTimer){
+                $t = New-Object Windows.Forms.Timer
+                $t.Interval = 3000
+                $t.Add_Tick({ Write-RunLogPart })
+                $script:RunLogTimer = $t
+            }
+            $script:RunLogTimer.Start()
+        }
+        Write-Log ("========== RUN {0:yyyy-MM-dd HH:mm:ss} on {1} ==========" -f $script:RunStart,$env:COMPUTERNAME)
+        if(-not $script:Headless){ Write-RunLogPart }
+    } catch {}
+}
+# Run end: the final full write of the run log and the timer stops.
+function Complete-RunLog {
+    try {
+        if($script:RunLogTimer){ $script:RunLogTimer.Stop() }
+        if($script:RunLogPath -and -not $script:Headless){ Write-RunLogPart }   # the rest of this run's lines (headless appends line by line)
+    } catch {}
+}
+# Pure: the exit code a ServerConfigurator text names ('exited 1', 'exit code: 1'), '' if none.
+function Get-ExitCodeText { param([string]$Text)
+    $m = [regex]::Match([string]$Text, '(?i)exited\s+(-?\d+)|exit code:?\s+(-?\d+)')
+    if(-not $m.Success){ return '' }
+    if($m.Groups[1].Success){ $m.Groups[1].Value } else { $m.Groups[2].Value }
+}
+# ES / MS / REC for one result row ('' if unknown): from the certificate group the worker used, else from the box.
+function Get-RowStep { param($Row)
+    $g = [string]$Row.CertificateGroup
+    if($g -eq 'Event Server'){ return 'ES' }
+    if($g -match 'mgmt'){ return 'MS' }
+    if($g -match 'recorder'){ return 'REC' }
+    $hk = ([string]$Row.HostKey).ToLowerInvariant(); $fq = ([string]$Row.Fqdn).ToLowerInvariant()
+    foreach($b in @(Get-AllBoxes)){
+        if((Get-BoxKind $b) -eq 'ES'){ continue }
+        if(([string]$b.Target).ToLowerInvariant() -eq $hk -or ([string]$b.Addr).ToLowerInvariant() -eq $fq){ return (Get-BoxKind $b) }
+    }
+    ''
+}
+# Pure: one result row as a readable block (nothing cut, the error one part per line).
+function Format-ReportBlock { param($Row,[string]$Step='')
+    $l = [System.Collections.Generic.List[string]]::new()
+    $who = [string]$Row.HostKey
+    if($Row.Fqdn -and [string]$Row.Fqdn -ne $who){ $who += " ($($Row.Fqdn))" }
+    [void]$l.Add("$(if([bool]$Row.Success){'OK    '}else{'FAILED'}) $who")
+    $code = Get-ExitCodeText "$($Row.Status) $($Row.Error)"
+    $dur = try { '{0:N1} s' -f [double]$Row.DurationSec } catch { '' }
+    [void]$l.Add("    Step: $Step   Action: $($Row.Action)   Duration: $dur   Exit code: $code")
+    $add = { param($Label,$Text)
+        $ls = @(Expand-LogEntry $Text)
+        if($ls.Count -eq 1){ [void]$l.Add("    ${Label}: $($ls[0])") }
+        elseif($ls.Count -gt 1){ [void]$l.Add("    ${Label}:"); foreach($x in $ls){ [void]$l.Add('        ' + $x) } } }
+    & $add 'Status' ([string]$Row.Status)
+    & $add 'Error' ([string]$Row.Error)
+    if($Row.Thumbprint){ [void]$l.Add("    Thumbprint: $($Row.Thumbprint)") }
+    if($Row.CertificateGroup){ [void]$l.Add("    Certificate group: $($Row.CertificateGroup)") }
+    $tm = { param($v) try { '{0:yyyy-MM-dd HH:mm:ss}' -f [datetime]$v } catch { [string]$v } }
+    [void]$l.Add("    Started: $(& $tm $Row.Started)   Ended: $(& $tm $Row.Ended)")
+    $l.ToArray()
+}
+# Pure: the whole results.txt - the header lines, then one block per row.
+function Format-ReportText { param([string[]]$Header,[object[]]$Items)
+    $o = [System.Collections.Generic.List[string]]::new()
+    foreach($h in @($Header)){ [void]$o.Add([string]$h) }
+    [void]$o.Add('')
+    foreach($it in @($Items)){ foreach($x in @(Format-ReportBlock $it.Row $it.Step)){ [void]$o.Add($x) }; [void]$o.Add('') }
+    $o -join "`r`n"
+}
+# results.csv rows: every column of the run results plus Step and ExitCode.
+function Get-ReportCsvRows { param([object[]]$Rows)
+    foreach($r in @($Rows)){
+        $o = [ordered]@{}
+        foreach($p in $r.PSObject.Properties){ $o[$p.Name] = $p.Value }
+        $o['Step'] = Get-RowStep $r
+        $o['ExitCode'] = Get-ExitCodeText "$($r.Status) $($r.Error)"
+        [pscustomobject]$o
+    }
+}
+# STATE BEFORE a step, for the computers of that step (recording servers: at most 10 lines), plus one FACTS line.
+function Write-StepFacts { param([string]$Key,[object[]]$Boxes)
+    try {
+        $b = Get-First -Items @($Boxes)
+        $acct = if($b -and $b.Cred){ [string]$b.Cred.UserName } else { '(the account running the wizard)' }
+        $t = "FACTS: account $acct; ServerConfigurator search paths: $(if($script:ScSearchPaths){ $script:ScSearchPaths } else { '(default locations)' })"
+        $cl = Get-ClusterObj $Key
+        if($cl){ $t += "; cluster role '$($cl.Group)' runs on $($cl.Owner); nodes: $((@($cl.Nodes) | ForEach-Object { "$($_.Name)=$($_.State)" }) -join ', ')" }
+        Write-Log $t
+    } catch {}
+}
+function Write-StepState { param([string]$Key,[object[]]$Boxes)
+    $all = @($Boxes); $name = Get-StageName $Key
+    if($all.Count -gt 10){ Write-StateLog "STATE BEFORE $name" @($all | Select-Object -First 10); Write-Log " ... and $($all.Count - 10) more" }
+    else { Write-StateLog "STATE BEFORE $name" $all }
+    Write-StepFacts $Key $all
+}
+# READ-ONLY collector, run ON the failed computer (in-process or over WinRM): Milestone services, cluster state, the
+# Application/System warnings and errors around the step, and the ServerConfigurator logs of the step (full, not a
+# tail). Returns text lines; never throws. tools\Test-GuidedHelpers.ps1 scans this text for anything that changes a system.
+$script:NodeDiagSb = {
+    param([datetime]$Since)
+    $ErrorActionPreference = 'Continue'
+    $o = [System.Collections.Generic.List[string]]::new()
+    $cut = $Since.AddMinutes(-1)
+    [void]$o.Add("=== $env:COMPUTERNAME - diagnostics at $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss')), events and logs since $($Since.ToString('yyyy-MM-dd HH:mm:ss'))")
+    [void]$o.Add('--- Milestone services (name | display name | state | start type | account)')
+    try {
+        $svc = @(Get-CimInstance -ClassName Win32_Service -ErrorAction Stop | Where-Object { $_.DisplayName -like 'Milestone*' } | Sort-Object DisplayName)
+        foreach($s in $svc){ [void]$o.Add(("{0} | {1} | {2} | {3} | {4}" -f $s.Name,$s.DisplayName,$s.State,$s.StartMode,$s.StartName)) }
+        if(-not $svc.Count){ [void]$o.Add('(no Milestone service found)') }
+    } catch { [void]$o.Add("(services could not be read: $($_.Exception.Message))") }
+    [void]$o.Add('--- Windows failover cluster')
+    try {
+        $cs = @(Get-CimInstance -ClassName Win32_Service -Filter "Name='ClusSvc'" -ErrorAction Stop)
+        if(-not (Get-Command Get-ClusterGroup -ErrorAction SilentlyContinue) -or -not $cs.Count -or [string]$cs[0].State -ne 'Running'){ [void]$o.Add('(not a running cluster node)') }
+        else {
+            foreach($n in @(Get-ClusterNode -ErrorAction Stop)){ [void]$o.Add("node $($n.Name): $($n.State)") }
+            foreach($g in @(Get-ClusterGroup -ErrorAction Stop)){ [void]$o.Add("group $($g.Name): $($g.State), owner $($g.OwnerNode)") }
+            foreach($r in @(Get-ClusterResource -ErrorAction Stop)){ [void]$o.Add("resource $($r.Name): $($r.State), owner $($r.OwnerNode), group $($r.OwnerGroup)") }
+        }
+    } catch { [void]$o.Add("(cluster state could not be read: $($_.Exception.Message))") }
+    [void]$o.Add('--- Application and System events, level critical / error / warning, from 2 min before the step (at most 300, newest first)')
+    try {
+        $ev = @(Get-WinEvent -FilterHashtable @{ LogName=@('Application','System'); Level=@(1,2,3); StartTime=$Since.AddMinutes(-2) } -MaxEvents 300 -ErrorAction Stop)
+        foreach($e in $ev){
+            $m = ([string]$e.Message) -replace '\s+',' '
+            if($m.Length -gt 600){ $m = $m.Substring(0,600) + '...' }
+            [void]$o.Add(("{0:yyyy-MM-dd HH:mm:ss} {1} {2} id={3}: {4}" -f $e.TimeCreated,$e.LogName,$e.ProviderName,$e.Id,$m))
+        }
+        if(-not $ev.Count){ [void]$o.Add('(no events)') }
+    } catch {
+        if($_.Exception.Message -match 'No events'){ [void]$o.Add('(no events)') }
+        else { [void]$o.Add("(events could not be read: $($_.Exception.Message))") }
+    }
+    [void]$o.Add('--- ServerConfigurator logs written since 1 min before the step (lines from that time on)')
+    try {
+        $files = @(Get-ChildItem -Path (Join-Path $env:ProgramData 'Milestone') -Recurse -Filter '*.log' -ErrorAction SilentlyContinue |
+                   Where-Object { $_.FullName -match 'erver.?onfigurator' -and $_.LastWriteTime -ge $cut } | Sort-Object LastWriteTime)
+        if(-not $files.Count){ [void]$o.Add('(no ServerConfigurator log was written in that time)') }
+        foreach($f in $files){
+            [void]$o.Add("[$($f.FullName)] last written $($f.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss'))")
+            $keep = $false
+            foreach($line in @(Get-Content -LiteralPath $f.FullName -ErrorAction SilentlyContinue)){
+                $ln = [string]$line
+                if($ln -match '^\s*(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})'){ $keep = ([datetime]$Matches[1] -ge $cut) }
+                if($keep){ [void]$o.Add($ln) }
+            }
+        }
+    } catch { [void]$o.Add("(ServerConfigurator logs could not be read: $($_.Exception.Message))") }
+    $o.ToArray()
+}
+# Run the collector on a failed computer the way the step reached it, save run-<start>-diag-<NODE>.txt, log its path.
+# Once per computer and run (recording servers: at most 5). A failure here is one log line, never a run failure.
+function Save-NodeDiagnostics { param($Box,[datetime]$Since,[string]$Why='')
+    try {
+        $key = ([string]$Box.Target).ToUpperInvariant(); $kind = Get-BoxKind $Box
+        if($script:DiagDone.ContainsKey($key)){ return }
+        if($kind -eq 'REC' -and $script:DiagRecCount -ge 5){ Write-Log "[$($Box.Name)] diagnostics not collected (at most 5 recording servers per run)"; return }
+        if(-not $Box.Reachable){ Write-Log "[$($Box.Name)] diagnostics not collected: the computer cannot be reached" 'Err'; return }
+        $script:DiagDone[$key] = $true; if($kind -eq 'REC'){ $script:DiagRecCount++ }
+        $lines = if($Box.IsNode){ @(Invoke-OnNode -Node $Box.Target -Cred $Box.Cred -Sb $script:NodeDiagSb -ArgumentList @($Since)) }
+                 else { @(Invoke-OnBox -Computer $Box.Addr -Cred $Box.Cred -Sb $script:NodeDiagSb -ArgumentList @($Since)) }
+        if(-not (Test-Path -LiteralPath $script:RunsDir)){ [void](New-Item -ItemType Directory -Path $script:RunsDir -Force) }
+        $safe = ([string]$Box.Target) -replace '[^A-Za-z0-9._-]','_'
+        $path = Join-Path $script:RunsDir ("run-{0:yyyyMMdd-HHmmss}-diag-{1}.txt" -f $script:RunStart,$safe)
+        $head = @("Diagnostics of $($Box.Name) ($($Box.Role)) - read only, collected after a failure", "Why: $Why", '')
+        [IO.File]::WriteAllText($path, ((@($head) + @($lines | ForEach-Object { [string]$_ })) -join "`r`n"), [Text.UTF8Encoding]::new($false))
+        $script:DiagFiles = @(@($script:DiagFiles) + $path)
+        Write-Log "[$($Box.Name)] diagnostics saved: $path (Windows events, services, cluster state, ServerConfigurator log of this step)" 'Err'
+    } catch { Write-Log "Diagnostics of $($Box.Name) could not be collected: $(Format-Err $_)" 'Err' }
+}
+
 # -- run bookkeeping ----------------------------------------------------------------------
 function Add-GuidedRow { param($Box,[string]$Act,[bool]$Ok,[string]$Status,[string]$Err='')
     $now=Get-Date
@@ -4481,20 +4712,37 @@ function Add-GuidedRow { param($Box,[string]$Act,[bool]$Ok,[string]$Status,[stri
         Error=$Err; CertificateGroup=$(if($Box.Role -eq 'Event Server'){'Event Server'}else{'Server'}); Action=$Act
         Started=$now; Ended=$now; DurationSec=0.0 }) }
 function Save-Report {
+    $rows = @($script:RunResults.ToArray())   # Export-RunResults clears the list
     Export-RunResults
     $txt = Get-ChildItem -LiteralPath $script:RunsDir -Filter 'run-*-results.txt' -ErrorAction SilentlyContinue |
            Where-Object { $_.LastWriteTime -ge $script:RunStart } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
     if($txt){
         $script:LastReportPath=$txt.FullName
-        # Owner 2026-11-06: the report says which wave the run covered (the CSV columns stay as they are).
-        if($script:RunWaveLine){ try { Set-Content -LiteralPath $txt.FullName -Value ($script:RunWaveLine + "`r`n`r`n" + (Get-Content -LiteralPath $txt.FullName -Raw)) -Encoding UTF8 } catch {} }
-        $logPath = $txt.FullName -replace '-results\.txt$','-log.txt'
-        try { Set-Content -LiteralPath $logPath -Value $script:Log.Text -Encoding UTF8 } catch {}
+        # Owner 2026-11-06: results.txt is rewritten as one readable block per computer (nothing cut), and results.csv
+        # gets the Step and ExitCode columns; the report says which wave the run covered and where the log and the
+        # diagnostics files are.
+        try {
+            $hdr = [System.Collections.Generic.List[string]]::new()
+            if($script:RunWaveLine){ [void]$hdr.Add($script:RunWaveLine); [void]$hdr.Add('') }
+            [void]$hdr.Add(("Run started: {0:yyyy-MM-dd HH:mm:ss}   finished: {1:yyyy-MM-dd HH:mm:ss}" -f $script:RunStart,(Get-Date)))
+            $acct = try { [string]$script:AdminCred.UserName } catch { '' }
+            if($acct){ [void]$hdr.Add("Account: $acct") }
+            [void]$hdr.Add("Log file: $($script:RunLogPath)")
+            if($script:LastSnapshotPath){ [void]$hdr.Add("State before the run (used for rollback): $($script:LastSnapshotPath)") }
+            foreach($d in @($script:DiagFiles)){ [void]$hdr.Add("Diagnostics file: $d") }
+            $items = @(foreach($r in $rows){ [pscustomobject]@{ Row=$r; Step=(Get-RowStep $r) } })
+            [IO.File]::WriteAllText($txt.FullName, (Format-ReportText $hdr.ToArray() $items), [Text.UTF8Encoding]::new($false))
+            $csvPath = $txt.FullName -replace '-results\.txt$','-results.csv'
+            @(Get-ReportCsvRows $rows) | Export-Csv -LiteralPath $csvPath -NoTypeInformation -Encoding UTF8
+        } catch { Write-Log "The readable report could not be written: $(Format-Err $_)" 'Err' }
     }
+    Complete-RunLog   # the final full write of the run log (replaces the old results-stamp -log.txt)
 }
 function Set-RunFailure { param([string]$Step,[string]$Who,[string]$Reason,[string]$Tech='',[string]$Next='')
     $script:RunFailure=[pscustomobject]@{ Step=$Step; Who=$Who; Reason=$Reason; Tech=$Tech; Next=$Next }
-    Write-Log "STOPPED at step '$Step' ($Who): $Reason$(if($Tech){' | ' + $Tech})" 'Err'
+    Write-Log "STOPPED at step '$Step' ($Who): $Reason" 'Err'
+    if(-not [string]::IsNullOrWhiteSpace($Tech)){ Write-LogLines 'Technical detail: ' $Tech 'Err' }
+    Write-RunLogPart   # a hung or closed window after a failure still leaves the log on disk
 }
 # Map an engine status/error text to a sentence an operator can act on.
 function Get-PlainReason { param([string]$Text)
@@ -4503,12 +4751,17 @@ function Get-PlainReason { param([string]$Text)
     if($t -match '(Cannot reach cluster node .+? Nothing was changed on [^.\s]+\.)'){ return $Matches[1] }
     if($t -match 'NOT REGISTERED'){ return 'The Event Server changed its own setting but could not register the change with the Management Server, so the two now disagree.' }
     if($t -match 'exit1\(|refused before applying'){ return 'ServerConfigurator on that computer refused the change, so nothing was changed there.' }
+    # Owner 2026-11-06: the engine writes "ServerConfigurator exited 1" (not 10, 100, 10000 ...).
+    if($t -match 'exited 1(?!\d)|exit code:? 1(?!\d)'){ return 'ServerConfigurator on that computer refused the change before changing anything (exit code 1; Milestone writes no reason). Known causes: the Management Server is not cleanly in the state this server must follow (for example an earlier run half-done on one node), or the order is wrong.' }
     if($t -match 'exit100\(|not authorized'){ return 'The account is not allowed to change Milestone settings. It must be a member of the Milestone Administrators role.' }
     if($t -match 'exit300000|exit100000'){ return 'The certificate was applied, but the server could not register with it (the certificate name may not match the server address).' }
     if($t -match 'WEDGE|cannot accept control messages|Unable to (?:stop|restart)'){ return 'A Milestone service on that computer was stuck and could not be restarted.' }
     if($t -match 'Access is denied|logon failure|user name or password|LogonUser failed'){ return 'The account or password was not accepted by that computer.' }
     if($t -match 'WinRM|cannot connect|Connecting to remote server|network path|could not reconnect'){ return 'Could not connect to that computer (it may be switched off, WinRM may be disabled, or a firewall blocks it).' }
     if($t -match 'No root CA|signer'){ return 'The signing CA (certificate authority) was not found on this computer.' }
+    if($t -match 'services did not start again'){ return 'The certificate was applied, but the Milestone services on that computer did not start again (ServerConfigurator finished; the service start failed afterwards).' }
+    $code = Get-ExitCodeText $t
+    if($code -and $code -ne '0'){ return "The change did not take effect (ServerConfigurator exit code $code)." }
     'The change did not take effect.'
 }
 
@@ -4564,6 +4817,7 @@ function Invoke-EsStage { param([bool]$Want)
     if($script:EsCluster){ [void](Update-ClusterInfo 'ES') }
     $esBoxes=@(Get-EsBoxes)
     Update-BoxStates $esBoxes
+    Write-StepState 'ES' $esBoxes
     $unk=@($esBoxes | Where-Object { (Test-InScope $_) -and (-not $_.Reachable -or $null -eq $_.Encrypted) })
     if($unk.Count){ $u=$unk[0]
         Set-StageStatus 'ES' 'FAILED - cannot read its state' 'Bad'; Add-GuidedRow $u $act $false 'cannot read state' $u.Detail
@@ -4591,13 +4845,16 @@ function Invoke-EsStage { param([bool]$Want)
     $P=@{ Target=$es.Target; Fqdn=$esConn; Cred=$es.Cred; SignerTp=$script:SignerTp; CaCer=$script:CaCer; Domain=$script:DomainName; OutputDir=$script:OutputDir
           Guid=$script:CertGroupEvent; GroupName='Event Server'; Action=$(if($Want){'enable'}else{'disable'}); ExtraSans=''; ScPaths=$script:ScSearchPaths }
     Set-RoleCertParams $P 'ES'
+    $t0 = Get-Date
     $r = & $script:EsHostWorker $P
     Add-RunResult $r
     Update-EsPending $es $Want $r
-    foreach($l in $r.Logs){ Write-Log "[$($r.Target)] $l" }
-    Write-Log "[$($r.Target)] $(if($r.Ok){'OK'}else{'FAILED'}): $($r.Status)" $(if($r.Ok){'Good'}else{'Err'})
-    $gt = Confirm-BoxStates @($es) $Want -TotalSec 180
+    foreach($l in $r.Logs){ Write-LogLines "[$($r.Target)] " ([string]$l) }
+    Write-LogLines "[$($r.Target)] $(if($r.Ok){'OK'}else{'FAILED'}): " ([string]$r.Status) $(if($r.Ok){'Good'}else{'Err'})
+    # Owner 2026-11-06: a failed ServerConfigurator run reads the state once instead of waiting 180 s.
+    $gt = Confirm-BoxStates @($es) $Want -TotalSec $(if($r.Ok){ 180 } else { 0 })
     if($r.Ok -and $gt){ Set-StageStatus 'ES' "Done - encryption $wt" 'Good'; return $true }
+    Save-NodeDiagnostics $es $t0 $(if(-not $r.Ok){ 'ServerConfigurator failed on the Event Server' } else { 'the Event Server still reports the old state' })
     $reason = if($r.Ok){ "ServerConfigurator reported success, but the Event Server still reports: $(Get-StateText $es)." } else { Get-PlainReason "$($r.Status) $($r.Error)" }
     Set-StageStatus 'ES' 'FAILED' 'Bad'; Set-RunFailure 'Event Server' $es.Name $reason "$($r.Status) $($r.Error)"
     $false
@@ -4608,6 +4865,7 @@ function Invoke-MsStage { param([bool]$Want)
     if($script:MsCluster){ [void](Update-ClusterInfo 'MS') }
     $msBoxes=@(Get-MsBoxes)
     Update-BoxStates $msBoxes
+    Write-StepState 'MS' $msBoxes
     $unk=@($msBoxes | Where-Object { (Test-InScope $_) -and (-not $_.Reachable -or $null -eq $_.Encrypted) })
     if($unk.Count){ $u=$unk[0]
         Set-StageStatus 'MS' 'FAILED - cannot read its state' 'Bad'; Add-GuidedRow $u $act $false 'cannot read state' $u.Detail
@@ -4638,15 +4896,18 @@ function Invoke-MsStage { param([bool]$Want)
     Set-RoleCertParams $P 'MS'
     $gwOld = Set-GatewayStopLimit $ms $script:GatewayStopLimit
     $mobStopped = Set-MobileServerStop $ms
+    $t0 = Get-Date
     try { $r = & $script:HostWorker $P }
     finally {
         if($gwOld){ [void](Set-GatewayStopLimit $ms $gwOld -Restore) }
         if($mobStopped){ [void](Set-MobileServerStop $ms -Restore) } }
     Add-RunResult $r
-    foreach($l in $r.Logs){ Write-Log "[$($r.Target)] $l" }
-    Write-Log "[$($r.Target)] $(if($r.Ok){'OK'}else{'FAILED'}): $($r.Status)" $(if($r.Ok){'Good'}else{'Err'})
-    $gt = Confirm-BoxStates @($ms) $Want -TotalSec 300
+    foreach($l in $r.Logs){ Write-LogLines "[$($r.Target)] " ([string]$l) }
+    Write-LogLines "[$($r.Target)] $(if($r.Ok){'OK'}else{'FAILED'}): " ([string]$r.Status) $(if($r.Ok){'Good'}else{'Err'})
+    # Owner 2026-11-06: a failed ServerConfigurator run reads the state once instead of waiting 300 s.
+    $gt = Confirm-BoxStates @($ms) $Want -TotalSec $(if($r.Ok){ 300 } else { 0 })
     if($r.Ok -and $gt){ Set-StageStatus 'MS' "Done - encryption $wt" 'Good'; return $true }
+    Save-NodeDiagnostics $ms $t0 $(if(-not $r.Ok){ 'ServerConfigurator failed on the Management Server' } else { 'the Management Server still reports the old state' })
     $reason = if($r.Ok){ "ServerConfigurator reported success, but this Management Server still reports: $(Get-StateText $ms)." } else { Get-PlainReason "$($r.Status) $($r.Error)" }
     Set-StageStatus 'MS' 'FAILED' 'Bad'; Set-RunFailure 'Management Server' $ms.Name $reason "$($r.Status) $($r.Error)"
     $false
@@ -4657,6 +4918,7 @@ function Invoke-RecStage { param([bool]$Want)
     $recs=@($script:RecBoxes | Where-Object { -not $_.Excluded -and (Test-InScope $_) })
     if(-not $recs.Count){ Set-StageStatus 'REC' $(if($null -ne $script:Scope){'Nothing to change back'}elseif(@($script:RecBoxes).Count){'None reachable - left as they are'}else{'No recording servers to handle'}) 'Skip'; return $true }
     Update-BoxStates $recs
+    Write-StepState 'REC' $recs
     $todo=@()
     foreach($b in $recs){
         # Owner 2026-11-06: a recording server outside the chosen wave is left exactly as it is.
@@ -4711,6 +4973,7 @@ function Invoke-RecStage { param([bool]$Want)
         Set-StageStatus 'REC' 'BLOCKED - Management Server state changed' 'Bad'
         foreach($b in $todo){ Add-GuidedRow $b $act $false 'blocked by order check' $why }
         Set-RunFailure 'Recording servers' "$($todo.Count) computer(s)" $why $gb2.Detail 'Click Check again to see the current state, then run the same action again.'; return $false }
+    $t0 = Get-Date
     $results=@(Invoke-RecordersParallel -Boxes $todo -Action $(if($Want){'enable'}else{'disable'}) -Common $common -Throttle 32)
     [void](Confirm-BoxStates $todo $Want -TotalSec 300)
     $failed=@()
@@ -4721,6 +4984,7 @@ function Invoke-RecStage { param([bool]$Want)
             $txt = if($rr.Count){ "$($rr[0].Result.Status) $($rr[0].Result.Error)" } else { 'no result' }
             $why = if($wok){ "ServerConfigurator reported success, but it still reports: $(Get-StateText $b)." } else { Get-PlainReason "$txt $($b.Detail)" }
             $failed += [pscustomobject]@{ Name=$b.Name; Why=$why; Tech=$txt }
+            Save-NodeDiagnostics $b $t0 "the recording server change did not work on $($b.Name)"
         }
     }
     if(-not $failed.Count){ Set-StageStatus 'REC' "Done - $($todo.Count) recording server(s) $wt" 'Good'; return $true }
@@ -4743,6 +5007,8 @@ function Reset-RunState {
     $script:FailoverResults=@(); $script:Scope=$null; $script:FinalOwners=@{}
     $script:MsTouched=$false; $script:MsLive=$null; $script:PausedByRun=@{}; $script:PausedBeforeNote=''
     $script:RoleMoveNotes=@(); $script:RoleLost=@(); $script:RunWaveLine=''
+    $script:DiagFiles=@(); $script:DiagDone=@{}; $script:DiagRecCount=0
+    Start-RunLog   # the live run log file starts with the run (GUI and headless)
 }
 
 # Full ON/OFF sequence in the lab-verified order, stopping at the first step whose real state is wrong.
@@ -4788,6 +5054,7 @@ function Invoke-WithRunLock { param([string]$Kind,$Want,[scriptblock]$Body)
         Reset-RunState
         Write-Log "REFUSED: $err" 'Err'
         Set-RunFailure 'Before starting' $env:COMPUTERNAME $err '' 'Wait for the other run to finish, then try again.'
+        Complete-RunLog
         $script:HasResult = $true
         return [pscustomobject]@{ Kind=$Kind; Success=$false; Want=$Want; Failure=$script:RunFailure; Report='' }
     }
@@ -5032,6 +5299,10 @@ function Get-OutcomeText { param($Res)
     $notes = @(Get-ClusterNotes)
     $notesTxt = if($notes.Count){ "`r`n`r`n" + ($notes -join "`r`n") } else { '' }
     $snapTxt = if($Res.Kind -in 'on','off' -and $script:LastSnapshotPath){ "`r`n`r`nState before the run (used for rollback):`r`n$($script:LastSnapshotPath)" } else { '' }
+    # Owner 2026-11-06: the run log and the diagnostics files of failed computers are named next to the report.
+    $logTxt = if($script:RunLogPath){ "`r`n`r`nLog file:`r`n$($script:RunLogPath)" } else { '' }
+    $diagList = @($script:DiagFiles)
+    $diagTxt = if($diagList.Count){ "`r`n`r`nDiagnostics of the failed computer(s):`r`n" + ($diagList -join "`r`n") } else { '' }
     if($Res.Success){
         $head = switch($Res.Kind){
             'register' { 'This node is registered again, and the Management Server runs on it.' }
@@ -5044,7 +5315,7 @@ function Get-OutcomeText { param($Res)
                     "Encryption done, but the failover test FAILED: $badDet"
                 } else { "Encryption is now $(Get-DoneText ([bool]$Res.Want) $script:RunWave)." }
             } }
-        return "$head`r`n`r`nCurrent state:`r`n$lines$notesTxt$snapTxt`r`n`r`nReport file:`r`n$rep"
+        return "$head`r`n`r`nCurrent state:`r`n$lines$notesTxt$snapTxt`r`n`r`nReport file:`r`n$rep$logTxt$diagTxt"
     }
     $f=$Res.Failure
     $head = switch($Res.Kind){ 'register' { 'Re-register was NOT completed.' } 'rollback' { 'Rollback was NOT completed.' } default { 'Encryption was NOT completed.' } }
@@ -5055,7 +5326,7 @@ function Get-OutcomeText { param($Res)
         'rollback' { 'Fix the problem above and start the rollback again (it only changes what still differs). If it fails again, send the report file to support.' }
         default    { "Fix the problem and click 'Turn encryption $wt' again$(if($script:LastSnapshotPath){", or click 'Undo this run (roll back)' to undo what this run changed"}). If it fails again, send the report file to support." } }
     $next = if($f -and $f.Next){ $f.Next } else { $defNext }
-    "$head`r`n`r`nWhat failed: $step`r`n$why`r`n`r`nCurrent state:`r`n$lines$notesTxt`r`n`r`nWhat to do next: $next$snapTxt`r`n`r`nReport file:`r`n$rep"
+    "$head`r`n`r`nWhat failed: $step`r`n$why`r`n`r`nCurrent state:`r`n$lines$notesTxt`r`n`r`nWhat to do next: $next$snapTxt`r`n`r`nReport file:`r`n$rep$logTxt$diagTxt"
 }
 
 # -- wizard UI -------------------------------------------------------------------------------
@@ -5314,6 +5585,7 @@ function Show-RunOutcome { param($Res)
         default    { if($Res.Success){ "Done. Encryption is $(Get-DoneText ([bool]$Res.Want) $script:RunWave)." } else { "NOT complete. Encryption could not be turned $wt everywhere - see the message and the table below." } } }
     $script:ResultLabel.ForeColor = if($Res.Success){ [Drawing.Color]::DarkGreen } else { [Drawing.Color]::DarkRed }
     $script:ReportBox.Text = $Res.Report
+    $script:LogFileBox.Text = $script:RunLogPath
     $script:NotesBox.Text = (@(Get-ClusterNotes) -join "`r`n")
     $script:BusyLabel.Visible=$false
     Update-ClusterUi
@@ -5609,7 +5881,9 @@ $repLbl=New-UiLabel 'Report file:' 24 468 120; $repLbl.Anchor='Bottom,Left'; $p4
 $script:ReportBox=New-UiText 150 470 620 ''; $script:ReportBox.ReadOnly=$true; $script:ReportBox.Anchor='Bottom,Left,Right'; $p4.Controls.Add($script:ReportBox)
 $openBtn=New-UiButton 'Open report folder' 780 466 194; $openBtn.Anchor='Bottom,Right'; $p4.Controls.Add($openBtn)
 $openBtn.Add_Click({ if($script:ReportBox.Text -and (Test-Path -LiteralPath $script:ReportBox.Text)){ Start-Process explorer.exe -ArgumentList "/select,`"$($script:ReportBox.Text)`"" } elseif(Test-Path -LiteralPath $script:RunsDir){ Start-Process explorer.exe -ArgumentList "`"$($script:RunsDir)`"" } })
-$repHint=New-UiLabel 'Keep this file. If something failed, send it (and the -log.txt file next to it) to support.' 24 508 950 30; $repHint.Anchor='Bottom,Left'; $p4.Controls.Add($repHint)
+$logLbl=New-UiLabel 'Log file:' 24 498 120; $logLbl.Anchor='Bottom,Left'; $p4.Controls.Add($logLbl)
+$script:LogFileBox=New-UiText 150 500 620 ''; $script:LogFileBox.ReadOnly=$true; $script:LogFileBox.Anchor='Bottom,Left,Right'; $p4.Controls.Add($script:LogFileBox)
+$repHint=New-UiLabel 'Keep these files. If something failed, send the report file, the log file and any diagnostics file (run-...-diag-...) to support.' 24 526 950 18; $repHint.Anchor='Bottom,Left'; $p4.Controls.Add($repHint)
 $script:RollbackBtn=New-UiButton 'Undo this run (roll back)' 24 544 320 40; $script:RollbackBtn.Anchor='Bottom,Left'; $script:RollbackBtn.Enabled=$false; $p4.Controls.Add($script:RollbackBtn)
 $script:RollbackBtn.Add_Click({ Start-RollbackAction $script:LastSnapshotPath })
 $rbHint=New-UiLabel 'Changes back only what the last run changed. Available only while there is something to undo.' 354 544 620 40; $rbHint.Anchor='Bottom,Left,Right'; $rbHint.TextAlign='MiddleLeft'; $p4.Controls.Add($rbHint)
@@ -5697,7 +5971,7 @@ if($script:Headless){
             exit ([int](-not $res.Success))
         }
         if($Action -eq 'status'){
-            $script:RunStart=Get-Date
+            $script:RunStart=Get-Date; Start-RunLog
             $all=@(Get-AllBoxes); Update-BoxStates $all
             Write-StateLog 'CURRENT STATE' $all
             # Registration check: reported only (a status run changes nothing).
@@ -5707,6 +5981,7 @@ if($script:Headless){
             Write-Log "OVERALL: $(if($allOk){'every computer reachable'}else{'some computers could not be read'})" $(if($allOk){'Good'}else{'Err'})
             Save-Report
             if($script:LastReportPath){ Write-Log "Report: $script:LastReportPath" 'Good' }
+            if($script:RunLogPath){ Write-Log "Log file: $script:RunLogPath" 'Good' }
             exit ([int](-not $allOk))
         }
         $script:TestFailoverOn = [bool]$TestFailover
