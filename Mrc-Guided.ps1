@@ -5610,6 +5610,7 @@ function Show-Page { param([int]$N)
     for($i=0; $i -lt $script:Pages.Count; $i++){ $script:Pages[$i].Visible = (($i+1) -eq $N) }
     $script:StepLabel.Text = "Step $N of 4:  $($script:PageTitles[$N-1])"
     $script:BackBtn.Enabled = ($N -gt 1)
+    $sb = Get-Variable -Name SearchBtn -Scope Script -ValueOnly -ErrorAction SilentlyContinue; if($sb){ $sb.Visible = ($N -eq 1) }
     $script:NextBtn.Text = if($N -eq 4){ 'Close' } else { 'Next >' }
     $script:NextBtn.Enabled = if($N -eq 3){ $script:HasResult } else { $true }
 }
@@ -5848,20 +5849,20 @@ function Start-RegisterAction {
 $script:Form=[Windows.Forms.Form]::new()
 $script:Form.Text='Milestone Encryption - Guided'
 $script:Form.StartPosition='CenterScreen'; $script:Form.Font=$script:UiFont
-$script:Form.ClientSize=[Drawing.Size]::new(1000,760); $script:Form.MinimumSize=[Drawing.Size]::new(900,640)
+$script:Form.ClientSize=[Drawing.Size]::new(1000,760); $script:Form.MinimumSize=[Drawing.Size]::new($script:Form.Width,660)   # never narrower than the layout: nothing is cut off on the right
 
 # Layout: Fill child FIRST, then Top and Bottom (WinForms docks in reverse z-order).
 $script:Content=[Windows.Forms.Panel]::new(); $script:Content.Size=[Drawing.Size]::new(1000,622); $script:Content.Dock='Fill'
-$script:Header=[Windows.Forms.Panel]::new(); $script:Header.Size=[Drawing.Size]::new(1000,74); $script:Header.Dock='Top'; $script:Header.BackColor=[Drawing.Color]::FromArgb(32,56,100)
-$script:Nav=[Windows.Forms.Panel]::new(); $script:Nav.Size=[Drawing.Size]::new(1000,64); $script:Nav.Dock='Bottom'
+$script:Header=[Windows.Forms.Panel]::new(); $script:Header.Size=[Drawing.Size]::new(1000,62); $script:Header.Dock='Top'; $script:Header.BackColor=[Drawing.Color]::FromArgb(32,56,100)
+$script:Nav=[Windows.Forms.Panel]::new(); $script:Nav.Size=[Drawing.Size]::new(1000,56); $script:Nav.Dock='Bottom'
 $script:Form.Controls.Add($script:Content); $script:Form.Controls.Add($script:Header); $script:Form.Controls.Add($script:Nav)
 
-$hdrTitle=New-UiLabel 'Milestone XProtect - turn encryption ON or OFF' 20 6 900 34; $hdrTitle.Font=[Drawing.Font]::new('Segoe UI',15,[Drawing.FontStyle]::Bold); $hdrTitle.ForeColor=[Drawing.Color]::White
-$script:StepLabel=New-UiLabel '' 22 40 900 28; $script:StepLabel.ForeColor=[Drawing.Color]::White
+$hdrTitle=New-UiLabel 'Milestone XProtect - turn encryption ON or OFF' 20 4 900 30; $hdrTitle.Font=[Drawing.Font]::new('Segoe UI',15,[Drawing.FontStyle]::Bold); $hdrTitle.ForeColor=[Drawing.Color]::White
+$script:StepLabel=New-UiLabel '' 22 34 900 24; $script:StepLabel.ForeColor=[Drawing.Color]::White
 $script:Header.Controls.Add($hdrTitle); $script:Header.Controls.Add($script:StepLabel)
 
-$script:BackBtn=New-UiButton '< Back' 610 12 170 40; $script:BackBtn.Anchor='Top,Right'
-$script:NextBtn=New-UiButton 'Next >' 800 12 170 40; $script:NextBtn.Anchor='Top,Right'; $script:NextBtn.Font=$script:UiBold
+$script:BackBtn=New-UiButton '< Back' 610 8 170 40; $script:BackBtn.Anchor='Top,Right'
+$script:NextBtn=New-UiButton 'Next >' 800 8 170 40; $script:NextBtn.Anchor='Top,Right'; $script:NextBtn.Font=$script:UiBold
 $script:Nav.Controls.Add($script:BackBtn); $script:Nav.Controls.Add($script:NextBtn)
 
 $script:Pages=@()
@@ -5876,48 +5877,48 @@ $domainPrefill = if($Domain){ $Domain } else { '' }
 if(-not $domainPrefill){ try { $domainPrefill = [System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().DomainName } catch {} }
 if(-not $domainPrefill -and [string]$script:Defaults.Domain -notmatch '<[^>]+>'){ $domainPrefill=[string]$script:Defaults.Domain }
 $clearPh = { param([string]$v) if([string]$v -match '<[^>]+>'){ '' } else { [string]$v } }
-$intro1=New-UiLabel 'Fill in the details and click Next. Nothing is changed until you choose an action in step 3.' 24 10 950 36
+$intro1=New-UiLabel 'Fill in the details and click Next. Nothing is changed until you choose an action in step 3.' 24 6 950 28
 $p1.Controls.Add($intro1)
-$p1.Controls.Add((New-UiLabel 'This computer (Management Server):' 24 56))
-$msShow=New-UiText 320 58 320 $env:COMPUTERNAME; $msShow.ReadOnly=$true; $msShow.TabStop=$false; $p1.Controls.Add($msShow)
-$p1.Controls.Add((New-UiLabel 'DNS domain of these computers:' 24 94))
-$script:DomainBox=New-UiText 320 96 320 $domainPrefill; $p1.Controls.Add($script:DomainBox)
-$p1.Controls.Add((New-UiLabel 'for example company.local' 656 94 320))
-$p1.Controls.Add((New-UiLabel 'Event Server computer:' 24 132))
-$script:EsHostBox=New-UiText 320 134 320 (& $clearPh $EsHost); $p1.Controls.Add($script:EsHostBox)
-$p1.Controls.Add((New-UiLabel 'its name or IP address' 656 132 320))
-$script:NoEsChk=New-UiCheck 'The Event Server is on this computer, or not installed' 320 168; $script:NoEsChk.Checked=[bool]$NoEventServer; $p1.Controls.Add($script:NoEsChk)
+$p1.Controls.Add((New-UiLabel 'This computer (Management Server):' 24 38))
+$msShow=New-UiText 320 40 320 $env:COMPUTERNAME; $msShow.ReadOnly=$true; $msShow.TabStop=$false; $p1.Controls.Add($msShow)
+$p1.Controls.Add((New-UiLabel 'DNS domain of these computers:' 24 70))
+$script:DomainBox=New-UiText 320 72 320 $domainPrefill; $p1.Controls.Add($script:DomainBox)
+$p1.Controls.Add((New-UiLabel 'for example company.local' 656 70 320))
+$p1.Controls.Add((New-UiLabel 'Event Server computer:' 24 102))
+$script:EsHostBox=New-UiText 320 104 320 (& $clearPh $EsHost); $p1.Controls.Add($script:EsHostBox)
+$p1.Controls.Add((New-UiLabel 'its name or IP address' 656 102 320))
+$script:NoEsChk=New-UiCheck 'The Event Server is on this computer, or not installed' 320 132; $script:NoEsChk.Checked=[bool]$NoEventServer; $p1.Controls.Add($script:NoEsChk)
 $script:NoEsChk.Add_CheckedChanged({ $script:EsHostBox.Enabled = -not $script:NoEsChk.Checked })
 $script:EsHostBox.Enabled = -not $script:NoEsChk.Checked
-$p1.Controls.Add((New-UiLabel 'Admin account:' 24 204))
-$script:AdminUserBox=New-UiText 320 206 320 (& $clearPh $AdminUser); $p1.Controls.Add($script:AdminUserBox)
-$p1.Controls.Add((New-UiLabel 'for example COMPANY\Administrator' 656 204 320))
-$p1.Controls.Add((New-UiLabel 'Admin password:' 24 242))
-$script:AdminPwBox=New-UiText 320 244 320 '' $true; $p1.Controls.Add($script:AdminPwBox)
-$script:RecSepChk=New-UiCheck 'Recording servers use a different account' 320 278; $p1.Controls.Add($script:RecSepChk)
-$p1.Controls.Add((New-UiLabel 'Recording server account:' 24 314))
-$script:RecUserBox=New-UiText 320 316 320 (& $clearPh $RecUser); $p1.Controls.Add($script:RecUserBox)
-$p1.Controls.Add((New-UiLabel 'Recording server password:' 24 352))
-$script:RecPwBox=New-UiText 320 354 320 '' $true; $p1.Controls.Add($script:RecPwBox)
+$p1.Controls.Add((New-UiLabel 'Admin account:' 24 162))
+$script:AdminUserBox=New-UiText 320 164 320 (& $clearPh $AdminUser); $p1.Controls.Add($script:AdminUserBox)
+$p1.Controls.Add((New-UiLabel 'for example COMPANY\Administrator' 656 162 320))
+$p1.Controls.Add((New-UiLabel 'Admin password:' 24 194))
+$script:AdminPwBox=New-UiText 320 196 320 '' $true; $p1.Controls.Add($script:AdminPwBox)
+$script:RecSepChk=New-UiCheck 'Recording servers use a different account' 320 224; $p1.Controls.Add($script:RecSepChk)
+$p1.Controls.Add((New-UiLabel 'Recording server account:' 24 254))
+$script:RecUserBox=New-UiText 320 256 320 (& $clearPh $RecUser); $p1.Controls.Add($script:RecUserBox)
+$p1.Controls.Add((New-UiLabel 'Recording server password:' 24 286))
+$script:RecPwBox=New-UiText 320 288 320 '' $true; $p1.Controls.Add($script:RecPwBox)
 $script:RecUserBox.Enabled=$false; $script:RecPwBox.Enabled=$false
-$script:RecRegChk=New-UiCheck 'Recording servers register with the Management Server as the admin account above' 320 386 650; $script:RecRegChk.Name='RecRegChk'; $script:RecRegChk.Enabled=$false; $p1.Controls.Add($script:RecRegChk)
+$script:RecRegChk=New-UiCheck 'Recording servers register with the Management Server as the admin account above' 320 316 650; $script:RecRegChk.Name='RecRegChk'; $script:RecRegChk.Enabled=$false; $p1.Controls.Add($script:RecRegChk)
 $script:RecSepChk.Add_CheckedChanged({ $script:RecUserBox.Enabled=$script:RecSepChk.Checked; $script:RecPwBox.Enabled=$script:RecSepChk.Checked; $script:RecRegChk.Enabled=$script:RecSepChk.Checked; if(-not $script:RecSepChk.Checked){ $script:RecRegChk.Checked=$false } })
-$p1.Controls.Add((New-UiLabel 'Signing CA (certificate authority):' 24 420))
-$script:SignerSubjectBox=New-UiText 320 422 320 (& $clearPh $RootSubject); $p1.Controls.Add($script:SignerSubjectBox)
-$findCaBtn=New-UiButton 'Look again' 656 418 130; $p1.Controls.Add($findCaBtn); $findCaBtn.Add_Click({ [void](Update-CaStatus) })
-$createCaBtn=New-UiButton 'Create signing CA' 796 418 180; $p1.Controls.Add($createCaBtn); $createCaBtn.Add_Click({ New-SigningCaInteractive })
-$script:CaStatus=New-UiLabel '' 320 454 656 30; $p1.Controls.Add($script:CaStatus)
-$recLbl=New-UiLabel 'Extra recording servers (optional, one per line):' 24 486 290 52; $recLbl.TextAlign='TopLeft'; $p1.Controls.Add($recLbl)
+$p1.Controls.Add((New-UiLabel 'Signing CA (certificate authority):' 24 348))
+$script:SignerSubjectBox=New-UiText 320 350 320 (& $clearPh $RootSubject); $p1.Controls.Add($script:SignerSubjectBox)
+$findCaBtn=New-UiButton 'Look again' 656 346 130 32; $p1.Controls.Add($findCaBtn); $findCaBtn.Add_Click({ [void](Update-CaStatus) })
+$createCaBtn=New-UiButton 'Create signing CA' 796 346 180 32; $p1.Controls.Add($createCaBtn); $createCaBtn.Add_Click({ New-SigningCaInteractive })
+$script:CaStatus=New-UiLabel '' 320 378 656 26; $p1.Controls.Add($script:CaStatus)
+$recLbl=New-UiLabel 'Extra recording servers (optional, one per line):' 24 406 290 46; $recLbl.TextAlign='TopLeft'; $p1.Controls.Add($recLbl)
 $script:ManualRecBox=[Windows.Forms.TextBox]::new(); $script:ManualRecBox.Multiline=$true; $script:ManualRecBox.ScrollBars='Vertical'
-$script:ManualRecBox.Location=[Drawing.Point]::new(320,486); $script:ManualRecBox.Size=[Drawing.Size]::new(320,52); $p1.Controls.Add($script:ManualRecBox)
-$recHint=New-UiLabel 'Recording servers are found automatically. Add them here only if they are missing.' 656 486 320 52; $recHint.TextAlign='TopLeft'; $p1.Controls.Add($recHint)
-$p1.Controls.Add((New-UiLabel 'Certificate files (your own CA):' 24 548))
-$script:CertFilesBtn=New-UiButton 'Certificate files...' 320 544 320 34; $p1.Controls.Add($script:CertFilesBtn); $script:CertFilesBtn.Add_Click({ Show-CertFilesDialog })
-$script:CertFilesStatus=New-UiLabel '' 656 542 320 38; $script:CertFilesStatus.TextAlign='TopLeft'; $p1.Controls.Add($script:CertFilesStatus)
-$script:ConnectStatus=New-UiLabel '' 24 588 570 30; $script:ConnectStatus.Font=$script:UiBold; $script:ConnectStatus.ForeColor=[Drawing.Color]::DarkOrange; $p1.Controls.Add($script:ConnectStatus)
+$script:ManualRecBox.Location=[Drawing.Point]::new(320,406); $script:ManualRecBox.Size=[Drawing.Size]::new(320,46); $p1.Controls.Add($script:ManualRecBox)
+$recHint=New-UiLabel 'Recording servers are found automatically. Add them here only if they are missing.' 656 406 320 46; $recHint.TextAlign='TopLeft'; $p1.Controls.Add($recHint)
+$p1.Controls.Add((New-UiLabel 'Certificate files (your own CA):' 24 456))
+$script:CertFilesBtn=New-UiButton 'Certificate files...' 320 456 320 32; $p1.Controls.Add($script:CertFilesBtn); $script:CertFilesBtn.Add_Click({ Show-CertFilesDialog })
+$script:CertFilesStatus=New-UiLabel '' 656 452 320 42; $script:CertFilesStatus.TextAlign='TopLeft'; $p1.Controls.Add($script:CertFilesStatus)
+$script:ConnectStatus=New-UiLabel '' 24 494 950 26; $script:ConnectStatus.Font=$script:UiBold; $script:ConnectStatus.ForeColor=[Drawing.Color]::DarkOrange; $p1.Controls.Add($script:ConnectStatus)
 # Milestone installed outside C:\Program Files: folders to search for ServerConfigurator.exe (on every server)
 # and MilestonePSTools (on this computer). One folder per line.
-$searchBtn=New-UiButton 'Search folders...' 604 584 180 34; $p1.Controls.Add($searchBtn)
+$searchBtn=New-UiButton 'Search folders...' 24 10 190 36; $script:SearchBtn=$searchBtn; $script:Nav.Controls.Add($searchBtn)   # step 1 only (Show-Page)
 $searchBtn.Add_Click({
     $dlg=[Windows.Forms.Form]::new(); $dlg.Text='Search folders'; $dlg.Size=[Drawing.Size]::new(620,330); $dlg.StartPosition='CenterParent'; $dlg.FormBorderStyle='FixedDialog'; $dlg.MaximizeBox=$false; $dlg.MinimizeBox=$false
     $lb=[Windows.Forms.Label]::new(); $lb.Text="Only needed if Milestone is NOT installed in C:\Program Files\Milestone.`r`nOne folder per line, for example D:\Milestone. The wizard looks there (and below) for`r`nServerConfigurator.exe on every server, and for MilestonePSTools on this computer.`r`nThe Milestone install folder is also found automatically from the Milestone services."; $lb.Location=[Drawing.Point]::new(12,10); $lb.Size=[Drawing.Size]::new(580,70); $dlg.Controls.Add($lb)
@@ -5932,7 +5933,7 @@ $searchBtn.Add_Click({
     }
     $dlg.Dispose()
 })
-$openLogBtn=New-UiButton 'Open log' 794 584 180 34; $p1.Controls.Add($openLogBtn)
+$openLogBtn=New-UiButton 'Open log' 224 10 150 36; $script:Nav.Controls.Add($openLogBtn)   # on every step
 $openLogBtn.Add_Click({ $lp = Save-UiLog; if($lp){ Start-Process notepad.exe -ArgumentList "`"$lp`"" } else { [Windows.Forms.MessageBox]::Show('The log could not be saved.','Log',0,'Warning')|Out-Null } })
 # Resolve-Signer (verbatim) reads these: store mode only in the wizard; the PFX controls are never shown.
 $script:SignerStoreRadio=[Windows.Forms.RadioButton]::new(); $script:SignerStoreRadio.Checked=$true
@@ -5984,20 +5985,23 @@ $detailsBtn.Add_Click({ $script:Log.Visible = -not $script:Log.Visible; $this.Te
 # ---- page 4: Result ----
 $p4=$script:Pages[3]
 $script:ResultLabel=New-UiLabel '' 24 10 950 60; $script:ResultLabel.Font=[Drawing.Font]::new('Segoe UI',14,[Drawing.FontStyle]::Bold); $script:ResultLabel.TextAlign='TopLeft'; $p4.Controls.Add($script:ResultLabel)
-$script:FinalGrid=New-StateGrid 24 76 950 250; $script:FinalGrid.Anchor='Top,Left,Right'; $p4.Controls.Add($script:FinalGrid)
+$script:FinalGrid=New-StateGrid 24 76 950 220; $script:FinalGrid.Anchor='Top,Left,Right'; $p4.Controls.Add($script:FinalGrid)
 $script:NotesBox=[Windows.Forms.TextBox]::new(); $script:NotesBox.Multiline=$true; $script:NotesBox.ReadOnly=$true; $script:NotesBox.ScrollBars='Vertical'
-$script:NotesBox.Location=[Drawing.Point]::new(24,332); $script:NotesBox.Size=[Drawing.Size]::new(950,128); $script:NotesBox.Anchor='Top,Bottom,Left,Right'; $p4.Controls.Add($script:NotesBox)
+$script:NotesBox.Location=[Drawing.Point]::new(24,302); $script:NotesBox.Size=[Drawing.Size]::new(950,158); $script:NotesBox.Anchor='Top,Bottom,Left,Right'; $p4.Controls.Add($script:NotesBox)
 $repLbl=New-UiLabel 'Report file:' 24 468 120; $repLbl.Anchor='Bottom,Left'; $p4.Controls.Add($repLbl)
 $script:ReportBox=New-UiText 150 470 620 ''; $script:ReportBox.ReadOnly=$true; $script:ReportBox.Anchor='Bottom,Left,Right'; $p4.Controls.Add($script:ReportBox)
 $openBtn=New-UiButton 'Open report folder' 780 466 194; $openBtn.Anchor='Bottom,Right'; $p4.Controls.Add($openBtn)
 $openBtn.Add_Click({ if($script:ReportBox.Text -and (Test-Path -LiteralPath $script:ReportBox.Text)){ Start-Process explorer.exe -ArgumentList "/select,`"$($script:ReportBox.Text)`"" } elseif(Test-Path -LiteralPath $script:RunsDir){ Start-Process explorer.exe -ArgumentList "`"$($script:RunsDir)`"" } })
 $logLbl=New-UiLabel 'Log file:' 24 498 120; $logLbl.Anchor='Bottom,Left'; $p4.Controls.Add($logLbl)
 $script:LogFileBox=New-UiText 150 500 620 ''; $script:LogFileBox.ReadOnly=$true; $script:LogFileBox.Anchor='Bottom,Left,Right'; $p4.Controls.Add($script:LogFileBox)
-$repHint=New-UiLabel 'Keep these files. If something failed, send the report file, the log file and any diagnostics file (run-...-diag-...) to support.' 24 526 950 18; $repHint.Anchor='Bottom,Left'; $p4.Controls.Add($repHint)
-$script:RollbackBtn=New-UiButton 'Undo this run (roll back)' 24 544 320 40; $script:RollbackBtn.Anchor='Bottom,Left'; $script:RollbackBtn.Enabled=$false; $p4.Controls.Add($script:RollbackBtn)
+$repHint=New-UiLabel 'Keep these files. If something failed, send the report file, the log file and any diagnostics file (run-...-diag-...) to support.' 24 530 950 22; $repHint.Anchor='Bottom,Left'; $p4.Controls.Add($repHint)
+$script:RollbackBtn=New-UiButton 'Undo this run (roll back)' 24 556 320 40; $script:RollbackBtn.Anchor='Bottom,Left'; $script:RollbackBtn.Enabled=$false; $p4.Controls.Add($script:RollbackBtn)
 $script:RollbackBtn.Add_Click({ Start-RollbackAction $script:LastSnapshotPath })
-$rbHint=New-UiLabel 'Changes back only what the last run changed. Available only while there is something to undo.' 354 544 620 40; $rbHint.Anchor='Bottom,Left,Right'; $rbHint.TextAlign='MiddleLeft'; $p4.Controls.Add($rbHint)
+$rbHint=New-UiLabel 'Changes back only what the last run changed. Available only while there is something to undo.' 354 556 620 40; $rbHint.Anchor='Bottom,Left,Right'; $rbHint.TextAlign='MiddleLeft'; $p4.Controls.Add($rbHint)
 
+# Short screens (1366 x 768, or 1920 x 1080 at 150 %): a step is never squeezed below this height - it scrolls
+# instead, so bottom-anchored controls cannot slide over the grid and no box collapses (tools\Test-GuidedLayout.ps1).
+$script:Pages[1].AutoScrollMinSize=[Drawing.Size]::new(0,420); $script:Pages[2].AutoScrollMinSize=[Drawing.Size]::new(0,520); $script:Pages[3].AutoScrollMinSize=[Drawing.Size]::new(0,510)
 $script:BackBtn.Add_Click({ if($script:Page -gt 1){ Show-Page ($script:Page - 1) } })
 $script:NextBtn.Add_Click({ switch($script:Page){ 1 { Do-Connect } 2 { Show-Page 3 } 3 { Show-Page 4 } default { $script:Form.Close() } } })
 

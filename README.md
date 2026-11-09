@@ -130,7 +130,7 @@ servers are checked 32 at a time.
 | --- | --- |
 | Inventory | Management Server (single or cluster), Event Server, all recording servers; the Milestone version on every server |
 | Reachability | WinRM (with the exact reason and fix), DNS forward and reverse, Milestone ports, clock differences |
-| Services | Milestone services, start type, state, accounts; ServerConfigurator can be found |
+| Services | Milestone services, start type, state, accounts; ServerConfigurator can be found; a Recording Server installed on a Management Server computer (stopped or not set to Automatic = WARN, disabled = note) |
 | Registration | The management-server address that each component (Data Collector, Event Server, Log Server, Incident Manager, API Gateway, recording servers) is registered to |
 | Encryption | Real state per server, valid combinations, certificate expiry / names / trust / private-key access |
 | Cluster | Role and node health, resources, which Management Server node can take over after a failover |

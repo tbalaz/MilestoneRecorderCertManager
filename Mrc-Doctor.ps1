@@ -1899,10 +1899,28 @@ function Test-COL1 { param($Result)
 }
 
 # ---- SVC: services ----
+# A Recording Server installed on a Management Server computer (standalone MS or any cluster node): the
+# same SVC-1 state/startup rules a recorder box gets (WARN when stopped or not Automatic), read from the
+# services the Common collector already returns. Not installed -> no row. Disabled and stopped -> INFO.
+# WARN/INFO never block the install gate (a recorder finding - see Get-DoctorGate).
+function Get-MsBoxRecorderSvcRows { param($Box)
+    $rows=@()
+    $recName = 'Milestone XProtect Recording Server'
+    $svc = @($Box.Common.Services) | Where-Object { $_.DisplayName -eq $recName } | Select-Object -First 1
+    if(-not $svc){ return $rows }
+    $who = "$($Box.Name): the Recording Server on this Management Server computer ($($Box.Name))"
+    $startMode = Get-NormalizedStartMode $svc.StartMode
+    if($svc.State -ne 'Running' -and $startMode -eq 'Disabled'){ $rows += New-Row 'SVC-1' 'SVC' 'INFO' $Box.Name 'Recording Server service on the Management Server computer' "$who is Disabled and stopped (switched off on purpose)." '' }
+    elseif($svc.State -ne 'Running'){ $rows += New-Row 'SVC-1' 'SVC' 'WARN' $Box.Name 'Recording Server service on the Management Server computer' "$who is $($svc.State) (startup type $($svc.StartMode))." 'Start the service (net start, or Services.msc), or disable it if this computer should not record.' }
+    elseif($startMode -ne 'Automatic'){ $rows += New-Row 'SVC-1' 'SVC' 'WARN' $Box.Name 'Recording Server startup type on the Management Server computer' "$who is Running but its startup type is $($svc.StartMode), not Automatic." "Set the service's startup type to Automatic." }
+    else { $rows += New-Row 'SVC-1' 'SVC' 'PASS' $Box.Name 'Recording Server service on the Management Server computer' "$who is Running (Automatic)." '' }
+    $rows
+}
 function Test-SVC1 { param($Result)
     $rows=@()
     foreach($b in @($Result.Boxes)){
         if(-not $b.Reachable){ continue }
+        if($b.Kind -eq 'MS'){ $rows += @(Get-MsBoxRecorderSvcRows $b) }
         $coreName = switch($b.Kind){ 'MS'{'Milestone XProtect Management Server'} 'ES'{'Milestone XProtect Event Server'} default {'Milestone XProtect Recording Server'} }
         $svc = @($b.Common.Services) | Where-Object { $_.DisplayName -eq $coreName } | Select-Object -First 1
         if(-not $svc){
@@ -2686,7 +2704,7 @@ function Build-DoctorWindow {
     $script:Form.Text = 'Milestone XProtect Doctor (read-only health check)'
     $script:Form.Size = [Drawing.Size]::new(720,760)
     $script:Form.StartPosition = 'CenterScreen'
-    $script:Form.MinimumSize = [Drawing.Size]::new(640,600)
+    $script:Form.MinimumSize = [Drawing.Size]::new(720,660)   # nothing is cut off at the smallest size (tools\Test-GuidedLayout.ps1 -Script Mrc-Doctor.ps1)
 
     $y=16
     $script:Form.Controls.Add((New-DoctorLabel 'Domain (DNS suffix):' 16 $y 200)); $script:DomainBox=New-UiText 230 $y 300 ([string]$script:Defaults.Domain); $script:Form.Controls.Add($script:DomainBox); $y+=34
@@ -2697,17 +2715,17 @@ function Build-DoctorWindow {
     $script:RecSepChk = New-DoctorCheck 'Recording servers use a different account' 16 $y 500; $script:Form.Controls.Add($script:RecSepChk); $y+=30
     $script:Form.Controls.Add((New-DoctorLabel 'Recording server account:' 16 $y 200)); $script:RecUserBox=New-UiText 230 $y 300 ([string]$script:Defaults.RecUser); $script:Form.Controls.Add($script:RecUserBox); $y+=34
     $script:Form.Controls.Add((New-DoctorLabel 'Recording server password:' 16 $y 200)); $script:RecPwBox=New-UiText 230 $y 300 '' $true; $script:Form.Controls.Add($script:RecPwBox); $y+=34
-    $script:Form.Controls.Add((New-DoctorLabel 'Extra recording servers (one per line, name or name=IP; blank = discover from the VMS):' 16 $y 660)); $y+=22
+    $script:Form.Controls.Add((New-DoctorLabel 'Extra recording servers (one per line, name or name=IP; blank = discover from the VMS):' 16 $y 660)); $y+=24
     $script:ManualRecBox=[Windows.Forms.TextBox]::new(); $script:ManualRecBox.Multiline=$true; $script:ManualRecBox.ScrollBars='Vertical'
-    $script:ManualRecBox.Location=[Drawing.Point]::new(16,$y); $script:ManualRecBox.Size=[Drawing.Size]::new(660,64); $script:Form.Controls.Add($script:ManualRecBox); $y+=74
-    $script:Form.Controls.Add((New-DoctorLabel 'Search folders for ServerConfigurator.exe (; separated):' 16 $y 660)); $y+=22
-    $script:SearchPathsBox=New-UiText 16 $y 660 ([string]$script:Defaults.SearchPaths); $script:Form.Controls.Add($script:SearchPathsBox); $y+=36
+    $script:ManualRecBox.Location=[Drawing.Point]::new(16,$y); $script:ManualRecBox.Size=[Drawing.Size]::new(($script:Form.ClientSize.Width-32),64); $script:ManualRecBox.Anchor='Top,Left,Right'; $script:Form.Controls.Add($script:ManualRecBox); $y+=74
+    $script:Form.Controls.Add((New-DoctorLabel 'Search folders for ServerConfigurator.exe (; separated):' 16 $y 660)); $y+=24
+    $script:SearchPathsBox=New-UiText 16 $y ($script:Form.ClientSize.Width-32) ([string]$script:Defaults.SearchPaths); $script:SearchPathsBox.Anchor='Top,Left,Right'; $script:Form.Controls.Add($script:SearchPathsBox); $y+=36
     $script:RunBtn = New-DoctorButton 'Run checks' 16 $y 200 40; $script:Form.Controls.Add($script:RunBtn)
     $script:OpenReportBtn = New-DoctorButton 'Open report' 230 $y 200 40; $script:OpenReportBtn.Enabled=$false; $script:Form.Controls.Add($script:OpenReportBtn)
     $script:OpenLogBtn = New-DoctorButton 'Open log' 444 $y 200 40; $script:Form.Controls.Add($script:OpenLogBtn); $y+=50
     $script:StatusLabel = New-DoctorLabel '' 16 $y 660 24; $script:StatusLabel.ForeColor=[Drawing.Color]::DarkOrange; $script:Form.Controls.Add($script:StatusLabel); $y+=26
     $script:CountsLabel = New-DoctorLabel '' 16 $y 660 24; $script:Form.Controls.Add($script:CountsLabel); $y+=30
-    $script:Log = [Windows.Forms.RichTextBox]::new(); $script:Log.Location=[Drawing.Point]::new(16,$y); $script:Log.Size=[Drawing.Size]::new(660,220); $script:Log.ReadOnly=$true
+    $script:Log = [Windows.Forms.RichTextBox]::new(); $script:Log.Location=[Drawing.Point]::new(16,$y); $script:Log.Size=[Drawing.Size]::new(($script:Form.ClientSize.Width-32),[Math]::Max(60,($script:Form.ClientSize.Height-$y-12))); $script:Log.ReadOnly=$true   # ends inside the window: it used to run 39 px below the edge
     $script:Log.Anchor='Top,Bottom,Left,Right'; $script:Log.Font=[Drawing.Font]::new('Consolas',9); $script:Form.Controls.Add($script:Log)
 
     $script:RunBtn.Add_Click({
@@ -2725,6 +2743,8 @@ function Build-DoctorWindow {
     })
     $script:OpenReportBtn.Add_Click({ if($script:LastReportHtml -and (Test-Path -LiteralPath $script:LastReportHtml)){ Start-Process $script:LastReportHtml } })
     $script:OpenLogBtn.Add_Click({ $p=Save-UiLog; if($p -and (Test-Path -LiteralPath $p)){ Start-Process notepad.exe $p } })
+    # A screen lower than the window (1366 x 768, or 1920 x 1080 at 150 %): fit the window to the working area.
+    $script:Form.Add_Shown({ $wa=[Windows.Forms.Screen]::FromControl($script:Form).WorkingArea; if($script:Form.Height -gt $wa.Height){ $script:Form.Top=$wa.Top; $script:Form.Height=$wa.Height } })
 }
 
 # ===================== DOCTOR: MAIN =====================
