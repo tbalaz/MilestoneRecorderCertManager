@@ -139,6 +139,7 @@ param(
     [switch]$FixRegistration,                           # headless: register computers that point to a different management server
     [string]$EsHost = '',                               # standalone Event Server host (FQDN, short name or IP)
     [switch]$NoEventServer,                             # there is no standalone Event Server
+    [switch]$NoEventServerSection,                      # headless on/off: leave Server Configurator's "Event server and add-ons" section as it is
     [string]$RecTargets = '',                           # comma list of recorders ('host' or 'name=ip'); empty = discover from the VMS
     [ValidateSet('all','canary','group')][string]$Wave = 'all',   # headless ON: which recording servers (all / canary only / canary + canary group)
     [string]$CanaryRecorders = '',                      # comma list of recorder names / targets / addresses for the canary wave (replaces the saved ticks)
@@ -2177,6 +2178,8 @@ $script:MsStaleNodes = @(); $script:MsLastRegistered = ''; $script:FailoverResul
 $script:RoleMoveNotes = @(); $script:RoleLost = @()
 $script:EsWaitSec = 180; $script:EsHoldPolls = 12
 $script:Scope = $null; $script:FinalOwners = @{}; $script:LastSnapshotPath = ''; $script:TestFailoverOn = $false
+# Owner 2026-11-09: the "Event server and add-ons" section is optional (step 3 check box / -NoEventServerSection).
+$script:EsSectionOn = $true
 # Owner 2026-11-06: which recording servers an ON run configures: 'all' (default, as before), 'canary', 'group' (canary + group).
 $script:RunWave = 'all'; $script:RunWaveLine = ''; $script:WaveGridLoading = $false
 function Get-First { param($Items) $a=@($Items); if($a.Count){ $a[0] } else { $null } }
@@ -2289,6 +2292,28 @@ $script:EsStateSb = {
     $x = [xml](Get-Content -LiteralPath $p -Raw)
     $n = $x.SelectSingleNode('/eventserverconfig/CertificateEnabled')
     [pscustomobject]@{ Found=$true; Value=$(if($n){ ([string]$n.InnerText).Trim() } else { '(element missing)' }); Path=$p }
+}
+# Owner 2026-11-09 / lab window 11: Server Configurator's "Server certificate" section on an Event Server computer.
+# Ground truth = the Data Collector's appsettings.json: Kestrel endpoint https (+ CertificateThumbprint) = on,
+# http = off. EsTp = the Event Server's own certificate (ServiceEndpoints.xml), which the section reuses.
+$script:EsSrvStateSb = {
+    $o = [ordered]@{ Found=$false; Https=$null; Tp=''; MsAddr=''; EsTp=''; EsTpPresent=$false; Path=''; Error='' }
+    try {
+        $dir = Join-Path $env:ProgramFiles 'Milestone\XProtect Data Collector Server'
+        $svc = Get-CimInstance Win32_Service -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like '*Data Collector Server*' } | Select-Object -First 1
+        if ($svc) { $pn = ([string]$svc.PathName).Trim(); $exe = if ($pn -match '^"([^"]+)"') { $Matches[1] } elseif ($pn -match '^(.+?\.exe)') { $Matches[1] } else { '' }; if ($exe) { $dir = Split-Path -Path $exe -Parent } }
+        $f = Join-Path $dir 'appsettings.json'; $o.Path = $f
+        if (Test-Path -LiteralPath $f) {
+            $j = Get-Content -LiteralPath $f -Raw | ConvertFrom-Json
+            $o.Found = $true; $h = $false
+            foreach ($p in @($j.Kestrel.Endpoints.PSObject.Properties)) { if ([string]$p.Value.Url -match '^https://') { $h = $true; $o.Tp = [string]$p.Value.CertificateThumbprint } }
+            $o.Https = $h; $o.MsAddr = [string]$j.ManagementServerAddress
+        }
+        $x = Join-Path $env:ProgramData 'Milestone\XProtect Event Server\config\ServiceEndpoints.xml'
+        if (Test-Path -LiteralPath $x) { $n = ([xml](Get-Content -LiteralPath $x -Raw)).SelectSingleNode('/eventserverconfig/CertificateHash'); if ($n) { $o.EsTp = ([string]$n.InnerText).Trim() } }
+        if ($o.EsTp) { $o.EsTpPresent = [bool](Test-Path -LiteralPath ('Cert:\LocalMachine\My\' + $o.EsTp)) }
+    } catch { $o.Error = $_.Exception.Message; $o.Https = $null }
+    [pscustomobject]$o
 }
 # -- connection helpers (lab findings: cluster names break Kerberos AND can point at the wrong node) ---
 # Two strictly separate paths:
@@ -4944,13 +4969,14 @@ function Get-PlainReason { param([string]$Text)
 }
 
 # -- step list (page 3) ------------------------------------------------------------------
-function Get-StageName { param([string]$Key) switch($Key){ 'ES' { 'Event Server' } 'MS' { 'Management Server' } 'FT' { 'Failover test' } 'REG' { 'Re-register this node' } 'ROLE' { 'Move cluster roles back' } default { 'Recording servers' } } }
+function Get-StageName { param([string]$Key) switch($Key){ 'ES' { 'Event Server' } 'ESS' { 'Event Server computer - Server certificate' } 'MS' { 'Management Server' } 'FT' { 'Failover test' } 'REG' { 'Re-register this node' } 'ROLE' { 'Move cluster roles back' } default { 'Recording servers' } } }
 function Reset-Stages { param([string[]]$Keys)
     $script:StageGrid.Rows.Clear(); $script:StageRows=@{}
     $n=1
     foreach($k in $Keys){
         $who = switch($k){
             'ES'   { if($script:EsCluster){ "cluster '$($script:EsCluster.Group)': $(@($script:EsCluster.Nodes).Count) nodes" } else { $script:EsAddr } }
+            'ESS'  { if($script:EsCluster){ "cluster '$($script:EsCluster.Group)': $(@($script:EsCluster.Nodes).Count) nodes" } else { $script:EsAddr } }
             'MS'   { if($script:MsCluster){ "cluster '$($script:MsCluster.Group)': $(@($script:MsCluster.Nodes).Count) nodes" } else { "$env:COMPUTERNAME (this computer)" } }
             'FT'   { 'every cluster node' }
             'REG'  { "$env:COMPUTERNAME (this computer)" }
@@ -5036,6 +5062,114 @@ function Invoke-EsStage { param([bool]$Want)
     $reason = if($r.Ok){ "ServerConfigurator reported success, but the Event Server still reports: $(Get-StateText $es)." } else { Get-PlainReason "$($r.Status) $($r.Error)" }
     Set-StageStatus 'ES' 'FAILED' 'Bad'; Set-RunFailure 'Event Server' $es.Name $reason "$($r.Status) $($r.Error)"
     $false
+}
+# Owner 2026-11-09: Server Configurator's "Server certificate" section on every Event Server computer follows the
+# Management Server (MS encrypted + section off = the Event Server refuses tokens, alarms route 401). ON: after the
+# MS; OFF: right after the MS. Lab window 11: no role takeover needed - SC runs on each node by its own address,
+# passive nodes first; on the node that runs the role the cluster restarts the Event Server once. It always follows
+# the Management Server, also in a rollback (no scope).
+function Get-EsSrvState { param($Box)
+    Get-First -Items @(if($Box.IsNode){ Invoke-OnNode -Node $Box.Target -Cred $Box.Cred -Sb $script:EsSrvStateSb } else { Invoke-OnBox -Computer $Box.Addr -Cred $Box.Cred -Sb $script:EsSrvStateSb }) }
+function Invoke-EssStage { param([bool]$Want)
+    $wt=$(if($Want){'ON'}else{'OFF'}); $act=$(if($Want){'on'}else{'off'}); $gn='Server certificate (Event Server computer)'
+    Set-StageStatus 'ESS' 'Checking...' 'Work'
+    if($script:EsCluster){ [void](Update-ClusterInfo 'ES') }
+    $msNames=@(@(Get-MsBoxes | ForEach-Object { (([string]$_.Target) -split '\.')[0].ToUpperInvariant() }) + @($env:COMPUTERNAME.ToUpperInvariant()))
+    $boxes=@()
+    foreach($b in @(Get-EsBoxes)){
+        if($msNames -contains (([string]$b.Target) -split '\.')[0].ToUpperInvariant()){ Write-Log "[$($b.Name)] same computer as the Management Server - the Management Server step covers it" 'Good'; continue }
+        $boxes+=$b }
+    if(-not $boxes.Count){ Set-StageStatus 'ESS' 'Nothing to do - no separate Event Server computer' 'Skip'; return $true }
+    $todo=@()
+    foreach($b in $boxes){
+        $r=$null; $err=''
+        try { $r = Get-EsSrvState $b } catch { $err = Get-FirstLine $_.Exception.Message }
+        if($r -and -not $r.Found -and -not $r.Error){ Write-Log "[$($b.Name)] no Data Collector on this computer - nothing to change" 'Good'; Add-GuidedRow $b $act $true 'no Data Collector - nothing to change'; continue }
+        if(-not $r -or $null -eq $r.Https){
+            $why = if($err){ $err } elseif($r -and $r.Error){ [string]$r.Error } else { 'no answer' }
+            Set-StageStatus 'ESS' 'FAILED - cannot read its state' 'Bad'; Add-GuidedRow $b $act $false "cannot read the 'Server certificate' state" $why
+            Set-RunFailure $gn $b.Name "Could not read the 'Server certificate' state on $($b.Name)." $why; return $false }
+        Write-Log "  real state [$gn] $($b.Name): $(if($r.Https){'Encrypted'}else{'Not encrypted'}) (Data Collector $(if($r.Https){'https'}else{'http'}); management server address $($r.MsAddr))"
+        if([bool]$r.Https -eq $Want){ Write-Log "[$($b.Name)] 'Server certificate' already $wt - skipped" 'Good'; Add-GuidedRow $b $act $true "Server certificate already $wt - skipped"; continue }
+        $todo+=[pscustomobject]@{ Box=$b; State=$r }
+    }
+    if(-not $todo.Count){ Set-StageStatus 'ESS' "Already $wt - skipped" 'Skip'; return $true }
+    # Order: like the recording servers, only to the state the Management Server is already in.
+    $gb = Get-MsGateBox
+    if($gb.Encrypted -ne $Want -or $gb.Half){
+        $why = "The Management Server is $(Get-StateText $gb) (checked on $($gb.Name)). 'Server certificate' on the Event Server computer must match the Management Server, so it is turned $wt only after the Management Server is $wt."
+        Set-StageStatus 'ESS' 'BLOCKED - wrong order' 'Bad'; foreach($t in $todo){ Add-GuidedRow $t.Box $act $false 'blocked by order check' $why }
+        Set-RunFailure $gn $todo[0].Box.Name $why $gb.Detail; return $false }
+    Write-Log "ORDER CHECK: the Management Server is $wt - OK to turn 'Server certificate' $wt on the Event Server computer" 'Good'
+    $todo=@($todo | Sort-Object { [bool]$_.Box.Active })   # passive nodes first, the node that runs the role last
+    $n=0
+    foreach($t in $todo){
+        $b=$t.Box; $n++; $tp=''
+        if($Want){
+            if(-not $t.State.EsTp -or -not $t.State.EsTpPresent){
+                $why = "The Event Server on $($b.Name) has no certificate yet (ServiceEndpoints.xml CertificateHash '$($t.State.EsTp)'). 'Server certificate' uses that certificate."
+                Set-StageStatus 'ESS' 'FAILED - no certificate' 'Bad'; Add-GuidedRow $b $act $false 'no Event Server certificate' $why
+                Set-RunFailure $gn $b.Name $why '' "Tick 'Event server and add-ons', click 'Turn encryption OFF', then 'Turn encryption ON': the Event Server step makes the certificate."; return $false }
+            $tp=[string]$t.State.EsTp }
+        Set-StageStatus 'ESS' "$(if($todo.Count -gt 1){"Computer $n of $($todo.Count): "})$($b.Name): ServerConfigurator is running (turn 'Server certificate' $wt)..." 'Work'
+        $t0=Get-Date; $logs=[System.Collections.Generic.List[string]]::new()
+        $res=[pscustomobject]@{Target=$b.Target;Fqdn=$b.Addr;Ok=$false;Status='';Tp=$tp;Error='';Groups=$gn;Action=$(if($Want){'enable'}else{'disable'});Started=$t0;Ended=$null;DurationSec=0.0;Logs=$logs}
+        try {
+            $conn = if($b.IsNode){ Get-VerifiedNodeAddr $b } else { try { Get-ConnAddr $b.Addr $b.Cred } catch { $b.Addr } }
+            if(Test-IpAddress $conn){ Ensure-TrustedHosts -Hosts @($conn) }
+            # Lab 2026-11-09 14:34: on the node that runs the role, ServerConfigurator restarts the Data Collector and
+            # the Event Server behind the cluster's back; after the Event Server step's role moves that exceeded the
+            # failover threshold and left the role Failed (services running). Like the MS step: take the role's
+            # services offline first (IP / name stay online), SC starts them, then the cluster resources are started.
+            $roleNode = $false
+            if($b.IsNode){ [void](Update-ClusterInfo 'ES'); $roleNode = [bool]$b.Active }
+            if($roleNode){
+                Set-StageStatus 'ESS' "$($b.Name): taking the role's services offline in the cluster before ServerConfigurator..." 'Work'
+                $sv = Invoke-ClusterOp 'ES' 'stopsvc'
+                if(-not $sv.Ok){ throw "Could not take the services of role '$($script:EsCluster.Group)' offline: $($sv.Detail)" } }
+            try {
+                $e = Invoke-ScWithWedgeRetry -ComputerName $conn -Credential $b.Cred -Thumbprint $tp -CertificateGroup $script:CertGroupServer `
+                         -Action $(if($Want){'enableencryption'}else{'disableencryption'}) -WorkLog $logs -GroupName $gn -ScPaths $script:ScSearchPaths
+            } finally {
+                if($roleNode){
+                    Set-StageStatus 'ESS' "$($b.Name): starting the role's cluster resources again..." 'Work'
+                    $rs = Invoke-ClusterOp 'ES' 'start'
+                    if([string]$rs.State -ne 'Online'){ $logs.Add("role '$($script:EsCluster.Group)' is $($rs.State) after the start: $($rs.Detail)") } }
+            }
+            foreach($l in $e.Logs){ $logs.Add("[$gn] $l") }
+            $scOk = if($Want){ ($e.ExitCode -in 0,200000) -or $e.CertApplied } else { $e.CertApplied -or ($e.ExitCode -in 0,100,200000) }
+            if(-not $scOk){ $res.Status = "FAILED exit $($e.ExitCode)$(if($e.ExitCode -eq 1){" (ServerConfigurator refused - the Management Server must be $wt first)"})" }
+            else {
+                $st=$null; $deadline=(Get-Date).AddSeconds(90)
+                do {
+                    try { $st = Get-EsSrvState $b } catch {}
+                    if($st -and $null -ne $st.Https -and [bool]$st.Https -eq $Want){ break }
+                    Wait-Ui 5
+                } while((Get-Date) -lt $deadline)
+                if(-not ($st -and $null -ne $st.Https -and [bool]$st.Https -eq $Want)){ $res.Status = "FAILED: ServerConfigurator reported success, but the Data Collector still says $(if($st -and $st.Https){'https'}else{'http'})" }
+                else {
+                    $svcOk=$true; $svcTxt=''
+                    if($roleNode){
+                        $up = Wait-EsRoleService $b; $svcOk=[bool]$up.Up; $svcTxt=[string]$up.Detail
+                        $cl = Update-ClusterInfo 'ES'
+                        if($svcOk -and $cl -and [string]$cl.State -ne 'Online'){ $svcOk=$false; $svcTxt="the cluster role '$($cl.Group)' is $($cl.State), not Online" } }
+                    elseif(-not $b.IsNode){ $conf = Confirm-EventServerEncryption -ComputerName $conn -Credential $b.Cred -UseSsl:$false; foreach($l in $conf.Logs){ $logs.Add($l) }; $svcOk=[bool]$conf.AllServicesRunning; $svcTxt=(@($conf.Stopped) -join ',') }
+                    $res.Ok=$svcOk
+                    $res.Status = if($svcOk){ "$(if($Want){'Encrypted'}else{'Disabled'}): $gn (Data Collector $(if($Want){'https'}else{'http'}))" } else { "FAILED: the Event Server did not come back ($svcTxt)" }
+                }
+            }
+        } catch { $res.Status='FAILED'; $res.Error=$_.Exception.Message; $logs.Add("ERROR: $($_.Exception.Message)") }
+        $res.Ended=Get-Date; $res.DurationSec=[math]::Round((New-TimeSpan -Start $t0 -End $res.Ended).TotalSeconds,1)
+        Add-RunResult $res
+        foreach($l in $logs){ Write-LogLines "[$($b.Name)] " ([string]$l) }
+        Write-LogLines "[$($b.Name)] $(if($res.Ok){'OK'}else{'FAILED'}): " ([string]$res.Status) $(if($res.Ok){'Good'}else{'Err'})
+        Add-GuidedRow $b $act $res.Ok ([string]$res.Status) ([string]$res.Error)
+        if(-not $res.Ok){
+            Save-NodeDiagnostics $b $t0 "ServerConfigurator 'Server certificate' failed on the Event Server computer"
+            Set-StageStatus 'ESS' 'FAILED' 'Bad'; Set-RunFailure $gn $b.Name (Get-PlainReason "$($res.Status) $($res.Error)") "$($res.Status) $($res.Error)"; return $false }
+    }
+    Set-StageStatus 'ESS' "Done - 'Server certificate' $wt on $($todo.Count) Event Server computer(s)" 'Good'
+    $true
 }
 function Invoke-MsStage { param([bool]$Want)
     $wt=$(if($Want){'ON'}else{'OFF'}); $act=$(if($Want){'on'}else{'off'})
@@ -5173,9 +5307,20 @@ function Invoke-RecStage { param([bool]$Want)
 }
 
 # Run the ON/OFF stages in the given order, stopping at the first stage that does not return $true.
+# ON: [Event server and add-ons], Management Server, Server certificate on the Event Server computer, recording
+# servers. OFF: Management Server, Server certificate on the Event Server computer, recording servers, [Event server
+# and add-ons]. [..] only when that section is ticked (owner 2026-11-09).
+function Get-RunKeys { param([bool]$Want)
+    $keys = @(if($Want){ @('ES','MS','ESS','REC') } else { @('MS','ESS','REC','ES') })
+    if(-not $script:EsBox){ $keys=@($keys | Where-Object { $_ -notin 'ES','ESS' }) }
+    elseif(-not $script:EsSectionOn){ $keys=@($keys | Where-Object { $_ -ne 'ES' }) }
+    $keys
+}
+# Left as it is in this run: a recording server outside the wave, or the Event Server's own section when unticked.
+function Test-LeftAsIs { param($Box,[bool]$Want) (Test-OutOfWave $Box $Want) -or ((Get-BoxKind $Box) -eq 'ES' -and -not $script:EsSectionOn) }
 function Invoke-StageSequence { param([string[]]$Keys,[bool]$Want)
     foreach($k in $Keys){
-        $res=@(switch($k){ 'ES' { Invoke-EsStage $Want } 'MS' { Invoke-MsStage $Want } default { Invoke-RecStage $Want } })
+        $res=@(switch($k){ 'ES' { Invoke-EsStage $Want } 'ESS' { Invoke-EssStage $Want } 'MS' { Invoke-MsStage $Want } default { Invoke-RecStage $Want } })
         if(-not ($res.Count -and $res[-1] -eq $true)){ return $false }
     }
     $true
@@ -5247,9 +5392,8 @@ function Invoke-RegisterAction { Invoke-WithRunLock 'register' $null { Invoke-Re
 function Invoke-GuidedRunCore { param([ValidateSet('on','off')][string]$Act)
     $want=($Act -eq 'on'); $wt=$Act.ToUpper()
     Reset-RunState
-    $keys = @(if($want){ @('ES','MS','REC') } else { @('MS','REC','ES') })
-    if(-not $script:EsBox){ $keys=@($keys | Where-Object { $_ -ne 'ES' }) }
-    $doFt = [bool]$script:TestFailoverOn -and [bool]($script:MsCluster -or $script:EsCluster)
+    $keys = @(Get-RunKeys $want)
+    $doFt =[bool]$script:TestFailoverOn -and [bool]($script:MsCluster -or $script:EsCluster)
     Reset-Stages ($keys + @(if($doFt){ 'FT' }))
     Write-Log "========== TURN ENCRYPTION $wt ==========" 'Good'
     Write-Log "Order: $(@($keys | ForEach-Object { Get-StageName $_ }) -join ', then ')"
@@ -5294,12 +5438,12 @@ function Invoke-GuidedRunCore { param([ValidateSet('on','off')][string]$Act)
     Write-StateLog "STATE AFTER (target: encryption $wt)" $all
     foreach($b in $all){
         # Owner 2026-11-06: a recording server outside the wave is not part of the final check.
-        if(Test-OutOfWave $b $want){ Add-GuidedRow $b 'final-state' $true "final state $(Get-StateText $b) - not in this wave, left as it is"; continue }
+        if(Test-LeftAsIs $b $want){ Add-GuidedRow $b 'final-state' $true "final state $(Get-StateText $b) - $(if(Test-OutOfWave $b $want){'not in this wave'}else{"'Event server and add-ons' not ticked"}), left as it is"; continue }
         $fine = ($b.Encrypted -eq $want) -and -not $b.Half
         Add-GuidedRow $b 'final-state' $fine "final state $(Get-StateText $b) (target $wt)" $(if(-not $fine){$b.Detail}else{''}) }
-    $allMatch = (@($all | Where-Object { -not (Test-OutOfWave $_ $want) -and ($_.Encrypted -ne $want -or $_.Half) }).Count -eq 0)
+    $allMatch = (@($all | Where-Object { -not (Test-LeftAsIs $_ $want) -and ($_.Encrypted -ne $want -or $_.Half) }).Count -eq 0)
     if($ok -and -not $allMatch){
-        $bad=@($all | Where-Object { -not (Test-OutOfWave $_ $want) -and ($_.Encrypted -ne $want -or $_.Half) } | ForEach-Object { $_.Name })
+        $bad=@($all | Where-Object { -not (Test-LeftAsIs $_ $want) -and ($_.Encrypted -ne $want -or $_.Half) } | ForEach-Object { $_.Name })
         Set-RunFailure 'Final check' ($bad -join ', ') 'These computers are not in the wanted state (for example they could not be reached).' '' 'Make sure every computer is switched on and reachable, then run the same action again.'
     }
     $success = $ok -and $allMatch
@@ -5335,8 +5479,8 @@ function Invoke-GuidedRollbackCore { param([string]$Path)
         Save-Report; $script:HasResult=$true
         return [pscustomobject]@{ Kind='rollback'; Success=$false; Want=$false; Failure=$script:RunFailure; Report=$script:LastReportPath } }
     $want=([string]$snap.Action -ne 'on'); $wt=$(if($want){'ON'}else{'OFF'}); $act="rollback-$($wt.ToLower())"
-    $keys = @(if($want){ @('ES','MS','REC') } else { @('MS','REC','ES') })
-    if(-not $script:EsBox){ $keys=@($keys | Where-Object { $_ -ne 'ES' }) }
+    $script:EsSectionOn = $true   # rollback: the Event Server section goes back too where that run changed it (scope)
+    $keys = @(Get-RunKeys $want)
     Reset-Stages ($keys + @('ROLE'))
     Write-Log "========== ROLLBACK: turn encryption $wt again where the run of $($snap.Created) changed it ==========" 'Good'
     Write-Log "Snapshot: $Path"
@@ -5742,7 +5886,7 @@ function Get-ClusterConfirmLines {
 }
 function Get-ConfirmText { param([string]$Act)
     $want=($Act -eq 'on'); $wt=$Act.ToUpper()
-    $order = if($want){ 'Event Server, then Management Server, then recording servers' } else { 'Management Server, then recording servers, then Event Server' }
+    $order = (@(Get-RunKeys $want | ForEach-Object { Get-StageName $_ }) -join ', then ')
     $l=@("Turn encryption $wt for the whole system?",'','What will happen:',
          ' - The current state is saved to a file first, so this run can be rolled back.',
          ' - Every computer is checked first. If something is wrong, nothing is changed and you get a list of what to fix.',
@@ -5777,6 +5921,7 @@ function Start-GuidedAction { param([ValidateSet('on','off')][string]$Act)
     # Owner 2026-11-06: the wave choice only counts for ON; OFF always does every recording server.
     $script:RunWave = if($Act -eq 'on'){ switch($script:WaveBox.SelectedIndex){ 1 { 'canary' } 2 { 'group' } default { 'all' } } } else { 'all' }
     $script:TestFailoverOn = [bool]($script:FailoverChk.Visible -and $script:FailoverChk.Checked)
+    $script:EsSectionOn = [bool]$script:EsSectionChk.Checked
     $q=Get-ConfirmText $Act
     if([Windows.Forms.MessageBox]::Show($q,'Please confirm',4,'Question') -ne 'Yes'){ return }
     $offer=$false
@@ -6029,15 +6174,17 @@ $onBtn=New-UiButton 'Turn encryption ON' 24 56 460 64; $onBtn.Font=[Drawing.Font
 $offBtn=New-UiButton 'Turn encryption OFF' 514 56 460 64; $offBtn.Font=[Drawing.Font]::new('Segoe UI',14,[Drawing.FontStyle]::Bold); $offBtn.BackColor=[Drawing.Color]::FromArgb(84,110,122); $offBtn.ForeColor=[Drawing.Color]::White; $offBtn.FlatStyle='Flat'
 $p3.Controls.Add($onBtn); $p3.Controls.Add($offBtn)
 $onBtn.Add_Click({ Start-GuidedAction 'on' }); $offBtn.Add_Click({ Start-GuidedAction 'off' })
-$order3=New-UiLabel "ON order: Event Server, then Management Server, then recording servers.`r`nOFF order: Management Server, then recording servers, then Event Server." 24 128 560 50; $order3.TextAlign='TopLeft'; $p3.Controls.Add($order3)
+$order3=New-UiLabel "The safe order is automatic. ON: Event Server first, recording servers last.`r`nOFF: Management Server first, Event Server last." 24 128 560 50; $order3.TextAlign='TopLeft'; $p3.Controls.Add($order3)
 # Owner 2026-11-06: which recording servers ON covers (waves: canary, then canary group, then all). OFF always does all.
 $waveLbl=New-UiLabel 'Turn ON for (OFF always does all recording servers):' 600 126 374 22; $p3.Controls.Add($waveLbl)
 $script:WaveBox=[Windows.Forms.ComboBox]::new(); $script:WaveBox.Name='WaveBox'; $script:WaveBox.DropDownStyle='DropDownList'; $script:WaveBox.Location=[Drawing.Point]::new(600,150); $script:WaveBox.Size=[Drawing.Size]::new(374,26)
 [void]$script:WaveBox.Items.AddRange(@('All recording servers','Canary only','Canary + canary group')); $script:WaveBox.SelectedIndex=0; $p3.Controls.Add($script:WaveBox)
-$script:FailoverChk=New-UiCheck 'Test failover after the change (move each cluster role to every other node and back)' 24 178 950; $script:FailoverChk.Checked=$true; $script:FailoverChk.Visible=$false; $p3.Controls.Add($script:FailoverChk)
+$script:FailoverChk=New-UiCheck 'Test failover after the change (move each cluster role to every other node and back)' 24 178 584; $script:FailoverChk.Checked=$true; $script:FailoverChk.Visible=$false; $p3.Controls.Add($script:FailoverChk)
+# Owner 2026-11-09: like Server Configurator - "Event server and add-ons" is optional; "Server certificate" always follows the MS.
+$script:EsSectionChk=New-UiCheck "Change the 'Event server and add-ons' section" 610 178 364; $script:EsSectionChk.Name='EsSectionChk'; $script:EsSectionChk.Checked=$true; $p3.Controls.Add($script:EsSectionChk)
 $script:StageGrid=[Windows.Forms.DataGridView]::new(); $script:StageGrid.Location=[Drawing.Point]::new(24,212); $script:StageGrid.Size=[Drawing.Size]::new(950,160); $script:StageGrid.Anchor='Top,Left,Right'
 $script:StageGrid.AllowUserToAddRows=$false; $script:StageGrid.AllowUserToDeleteRows=$false; $script:StageGrid.RowHeadersVisible=$false; $script:StageGrid.ReadOnly=$true
-$script:StageGrid.BackgroundColor=[Drawing.Color]::White; $script:StageGrid.RowTemplate.Height=30; $script:StageGrid.ColumnHeadersHeight=34
+$script:StageGrid.BackgroundColor=[Drawing.Color]::White; $script:StageGrid.RowTemplate.Height=24; $script:StageGrid.ColumnHeadersHeight=34
 foreach($c in @(@('Step','Step',260),@('Who','Computers',280),@('Status','Status',400))){
     $col=[Windows.Forms.DataGridViewTextBoxColumn]::new(); $col.Name=$c[0]; $col.HeaderText=$c[1]; $col.Width=$c[2]; $col.SortMode='NotSortable'; [void]$script:StageGrid.Columns.Add($col) }
 $script:StageGrid.Columns['Status'].AutoSizeMode='Fill'
@@ -6076,7 +6223,7 @@ $script:Pages[1].AutoScrollMinSize=[Drawing.Size]::new(0,420); $script:Pages[2].
 $script:BackBtn.Add_Click({ if($script:Page -gt 1){ Show-Page ($script:Page - 1) } })
 $script:NextBtn.Add_Click({ switch($script:Page){ 1 { Do-Connect } 2 { Show-Page 3 } 3 { Show-Page 4 } default { $script:Form.Close() } } })
 
-$script:BusyCtrls=@($script:BackBtn,$script:NextBtn,$onBtn,$offBtn,$script:WaveBox,$recheckBtn,$findCaBtn,$createCaBtn,$script:CertFilesBtn,$script:RegBtn,$undoOldBtn,$script:FailoverChk)   # RollbackBtn: Update-RollbackButton decides
+$script:BusyCtrls=@($script:BackBtn,$script:NextBtn,$onBtn,$offBtn,$script:WaveBox,$recheckBtn,$findCaBtn,$createCaBtn,$script:CertFilesBtn,$script:RegBtn,$undoOldBtn,$script:FailoverChk,$script:EsSectionChk)   # RollbackBtn: Update-RollbackButton decides
 
 # Closing the window in the middle of a change can leave cluster nodes paused or a role elsewhere.
 $script:Form.Add_FormClosing({
@@ -6174,6 +6321,7 @@ if($script:Headless){
             exit ([int](-not $allOk))
         }
         $script:TestFailoverOn = [bool]$TestFailover
+        $script:EsSectionOn = -not [bool]$NoEventServerSection
         # Owner 2026-11-06: waves. Given lists replace (and save) the ticks; not given = the saved ticks.
         $script:RunWave = $(if($Action -eq 'on'){ $Wave } else { 'all' })
         if($CanaryRecorders -or $CanaryGroupRecorders){

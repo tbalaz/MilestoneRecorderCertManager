@@ -781,7 +781,7 @@ $script:ClusterInfoSb = {
     [pscustomobject]$o
 }
 
-function Get-StageName { param([string]$Key) switch($Key){ 'ES' { 'Event Server' } 'MS' { 'Management Server' } 'FT' { 'Failover test' } 'REG' { 'Re-register this node' } 'ROLE' { 'Move cluster roles back' } default { 'Recording servers' } } }
+function Get-StageName { param([string]$Key) switch($Key){ 'ES' { 'Event Server' } 'ESS' { 'Event Server computer - Server certificate' } 'MS' { 'Management Server' } 'FT' { 'Failover test' } 'REG' { 'Re-register this node' } 'ROLE' { 'Move cluster roles back' } default { 'Recording servers' } } }
 function New-ClusterObj { param([string]$Key,$Info,[string]$Via)
     [pscustomobject]@{ Key=$Key; Group=[string]$Info.Group; Address=[string]$Info.Address; NetName=[string]$Info.NetName; Domain=[string]$Info.Domain
                        Owner=[string]$Info.Owner; State=[string]$Info.State; Nodes=@($Info.Nodes); Offline=@($Info.Offline)
@@ -2224,7 +2224,9 @@ function Test-REG3 { param($Result)
     if($st -eq 200){ $rows += New-Row 'REG-3' 'REG' 'PASS' $g.Host $chk "GET $where/API/rest/v1/alarms answered 200 - the API Gateway reaches the Event Server." '' }
     elseif($st -ge 500){ $rows += New-Row 'REG-3' 'REG' 'FAIL' $g.Host $chk "GET $where/API/rest/v1/alarms answered HTTP $st - the API Gateway cannot reach the Event Server, so Estate Monitor would show every camera and recorder as unknown." $fixFail }
     elseif($st -eq 0){ $rows += New-Row 'REG-3' 'REG' 'FAIL' $g.Host $chk "GET $where/API/rest/v1/alarms got no answer ($($g.Error))." $fixFail }
-    elseif($st -eq 401 -or $st -eq 403){ $rows += New-Row 'REG-3' 'REG' 'WARN' $g.Host $chk "Could not check the alarms route: $where refused the token (HTTP $st)." $fixWarn }
+    # Lab 2026-11-09: token ok + alarms 401 = the Event Server refuses the token. Cause seen: the Management Server is
+    # encrypted but Server Configurator's 'Server certificate' section is still off on the Event Server computer.
+    elseif($st -eq 401 -or $st -eq 403){ $rows += New-Row 'REG-3' 'REG' 'WARN' $g.Host $chk "The IDP gave a token, but GET $where/API/rest/v1/alarms answered HTTP ${st}: the Event Server refused it. When the Management Server is encrypted, the usual cause is that 'Server certificate' is still off on the Event Server computer." "On every Event Server computer open Server Configurator > Server certificate and turn encryption on with the Event Server's certificate (Mrc-Guided.ps1 'Turn encryption ON' does this), then re-run the doctor. If it is already on: $fixWarn" }
     else { $rows += New-Row 'REG-3' 'REG' 'WARN' $g.Host $chk "Could not check the alarms route: GET $where/API/rest/v1/alarms answered an unexpected HTTP $st." 'Open the URL with an XProtect client or check the API Gateway log, then re-run the doctor.' }
     $rows
 }

@@ -46,12 +46,23 @@ powershell -ExecutionPolicy Bypass -STA -File .\Mrc-Guided.ps1
 Milestone only accepts encryption changes in a specific order. The guided script applies
 it for you. The role GUIs block wrong-order runs.
 
-- **ON:** Event Server, then Management Server, then Recording Servers.
-- **OFF:** Management Server, then Recording Servers, then Event Server.
+- **ON:** Event Server ("Event server and add-ons"), then Management Server, then "Server
+  certificate" on the Event Server computer, then Recording Servers.
+- **OFF:** Management Server, then "Server certificate" on the Event Server computer, then
+  Recording Servers, then Event Server ("Event server and add-ons").
 
-The Event Server can only change while the Management Server is **not** encrypted.
-Recording Servers can only move to the state the Management Server is already in. In the
-wrong order, ServerConfigurator quits without changing anything and logs no reason.
+On an Event Server computer, Server Configurator has two sections. **Server certificate**
+(Data Collector) must always match the Management Server: with the Management Server
+encrypted and this section off, the Event Server refuses sign-in tokens (the alarms route
+answers 401). The wizard turns it on and off with the Management Server, on every Event
+Server node (on a cluster: passive nodes first, no role move). **Event server and add-ons**
+is optional: untick "Change the 'Event server and add-ons' section" on the Action page
+(headless: `-NoEventServerSection`) to leave it as it is.
+
+The "Event server and add-ons" section can only change while the Management Server is **not**
+encrypted and "Server certificate" is off. Recording Servers and "Server certificate" can
+only move to the state the Management Server is already in. In the wrong order,
+ServerConfigurator quits without changing anything and logs no reason.
 
 ## What the guided script does for you
 
@@ -275,6 +286,7 @@ share: it is listed in `.gitignore`.
     [-RecTargets '<rec1-fqdn>,<REC2>=<rec2-ip>'] [-RecUser <user> -RecPwFile <path> [-RecRegisterAsAdmin]] `
     [-CertFolder <folder> -CertPwFile <path> -RootCaFile <root-ca.cer>]   # own CA: -RootSubject not needed
     [-Wave canary|group|all -CanaryRecorders '<rec1>' -CanaryGroupRecorders '<rec2>,<rec3>']   # ON in waves
+    [-NoEventServerSection]   # leave the Event Server's "Event server and add-ons" section as it is
 .\Mrc-Guided.ps1 -Action register -AdminUser <DOMAIN\user> -AdminPwFile <path>   # this cluster node
 .\Mrc-Guided.ps1 -Action rollback -Snapshot <run-...-snapshot.json> -AdminUser ... -AdminPwFile ...
 ```
