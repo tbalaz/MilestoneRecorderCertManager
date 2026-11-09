@@ -230,6 +230,19 @@ skipped with a message.
   name and password in Management Client > Security > Roles > Administrators (each node's account
   is a separate entry; the local Administrators group only helps when that role contains it). The
   wizard reaches workgroup servers by IP address.
+- Alternative for Recording Servers outside the domain, without that account on the Management
+  Server nodes: also tick "Recording servers register with the Management Server as the admin
+  account above" (headless `-RecRegisterAsAdmin`, needs `-RecUser`). The Recording Servers are
+  still reached with their local account, but when their encryption changes they log on to the
+  Management Server as the admin account, which must then be a domain account (`DOMAIN\user` or
+  `user@domain`). **Security note:** with this option the admin account's password travels to
+  every Recording Server for the run (encrypted in the script text that runs there; the key comes
+  from the local account's password), so an administrator of a Recording Server can recover it.
+  Use it only where those administrators may hold the admin account.
+- A Recording Server that Milestone knows by a computer name without a domain is reached by its
+  full name only when that name resolves from the Management Server; otherwise by the name
+  Milestone has. If neither resolves, the log says so: add the server under "Extra recording
+  servers" as `NAME=<its IP address>`. An address you type there wins over the discovered one.
 - A signing CA with its private key in the Management Server's certificate store, or certificate
   files from your own CA (see above). All certificates must chain to the same CA. Use "Create
   signing CA" only if encryption was never set up in the system.
@@ -257,7 +270,7 @@ share: it is listed in `.gitignore`.
 .\Mrc-Guided.ps1 -Action status|on|off -EsHost <event-server> -AdminUser <DOMAIN\user> `
     -AdminPwFile <path-to-password-file> -RootSubject '<signing-CA-subject>' `
     [-TestFailover] [-FixRegistration] [-SearchPaths 'D:\Milestone'] `
-    [-RecTargets '<rec1-fqdn>,<REC2>=<rec2-ip>'] [-RecUser <user> -RecPwFile <path>] `
+    [-RecTargets '<rec1-fqdn>,<REC2>=<rec2-ip>'] [-RecUser <user> -RecPwFile <path> [-RecRegisterAsAdmin]] `
     [-CertFolder <folder> -CertPwFile <path> -RootCaFile <root-ca.cer>]   # own CA: -RootSubject not needed
     [-Wave canary|group|all -CanaryRecorders '<rec1>' -CanaryGroupRecorders '<rec2>,<rec3>']   # ON in waves
 .\Mrc-Guided.ps1 -Action register -AdminUser <DOMAIN\user> -AdminPwFile <path>   # this cluster node

@@ -91,6 +91,14 @@
             -EsHost <event-server-fqdn> -AdminUser '<DOMAIN>\Administrator' -AdminPwFile <path-to-pw-file> `
             -RecTargets '<rec1-fqdn>,<REC2>=<rec2-ip>' -RecUser Administrator -RecPwFile <path-to-pw-file> `
             -RootSubject 'CN=<Your Organization> CA' -ExtraSans '<ms-alias-fqdn>' -LogFile <path-to-log>
+    -RecRegisterAsAdmin (with -RecUser) is for recording servers that are NOT in the domain: they are still
+    reached (remote management, certificate import, the ServerConfigurator task) with the local -RecUser
+    account, but ServerConfigurator on them logs on to the Management Server as the admin account
+    (-AdminUser, which must then be DOMAIN\user or user@domain) through a network-only logon, so the local
+    account does not have to exist on every Management Server node. Refused (exit 3) without -RecUser.
+    SECURITY: with this option the admin account's password travels to every recording server for the run
+    (encrypted in the launcher text; the key comes from the local account's password). An administrator of a
+    recording server can recover it. Use it only where those administrators may hold the admin account.
     -Wave all|canary|group (default all) turns ON in waves: canary = only the recording servers listed in
     -CanaryRecorders, group = those plus -CanaryGroupRecorders, all = every recording server (as before).
     The lists are comma lists of recorder name, target or address (case-insensitive) and replace the
@@ -139,6 +147,7 @@ param(
     [string]$AdminPwFile,                               # file holding the admin password (headless only)
     [string]$RecUser = '',                              # optional separate recording-server account
     [string]$RecPwFile,                                 # file holding the recording-server password (headless only)
+    [switch]$RecRegisterAsAdmin,                        # recording servers register with the Management Server as the admin account (network-only logon); needs -RecUser
     [string]$RootSubject = '<signer-subject>',          # signing CA subject (store lookup by CN)
     [string]$ExtraSans = '',                            # extra SAN DNS names for the Management Server certificate
     [string]$SearchPaths = '',                          # ';' list of folders (or exe paths) to search for ServerConfigurator.exe / MilestonePSTools when not installed in the default folder
@@ -167,6 +176,7 @@ $script:Defaults = @{
     Domain        = '<domain-suffix>'                # DNS domain suffix (machine DNS suffix is tried first)
     MsUser        = '<DOMAIN>\Administrator'          # admin account (wizard 'Admin account')
     RecUser       = ''                                # optional separate recording-server account
+    RecRegisterAsAdmin = ''                           # '1' / 'true': recording servers register with the Management Server as the admin account
     SignerSubject = 'CN=<Your Organization> CA'       # signing CA subject (store lookup by CN / Create signing CA)
     MsFqdn        = '<mgmt-fqdn>'                     # this Management Server's certificate name (default: COMPUTERNAME.<domain>)
     EsHost        = '<event-server-host>'             # standalone Event Server host
@@ -194,6 +204,7 @@ function Resolve-Default { param([string]$Value,[string]$Key)
     if ([string]::IsNullOrWhiteSpace($Value) -or $Value -match '<[^>]+>') { [string]$script:Defaults[$Key] } else { $Value } }
 $AdminUser   = Resolve-Default $AdminUser   'MsUser'
 $RecUser     = Resolve-Default $RecUser     'RecUser'
+if(-not $RecRegisterAsAdmin -and [string]$script:Defaults['RecRegisterAsAdmin'] -match '^(1|true)$'){ $RecRegisterAsAdmin = [switch]$true }
 $RootSubject = Resolve-Default $RootSubject 'SignerSubject'
 $ExtraSans   = Resolve-Default $ExtraSans   'ExtraSans'
 $SearchPaths = Resolve-Default $SearchPaths 'SearchPaths'
@@ -1941,7 +1952,7 @@ function Invoke-RecordersParallel { param([object[]]$Boxes,[string]$Action,[hash
     $funcNames='Normalize-RecorderHostName','Get-DomainSuffix','Get-RecorderFqdn','ConvertTo-SanList','Resolve-CertFqdn','Test-SigningCertificate','Import-SignerCertificate','New-RecorderCertificatePackage','Invoke-RemoteRecorderInstall','Invoke-RemoteServerEncryption','Repair-WedgedService','Invoke-ScWithWedgeRetry','Confirm-ServerEncryption','Test-LocalTarget'
     $iss=[System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault2()
     foreach($fn in $funcNames){ $iss.Commands.Add((New-Object System.Management.Automation.Runspaces.SessionStateFunctionEntry $fn,((Get-Command $fn).Definition))) }
-    $iss.Variables.Add((New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry 'LauncherCSharp',$script:LauncherCSharp,''))
+    $iss.Variables.Add((New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry 'LauncherCSharp',(Get-RecLauncher),''))
     $pool=[runspacefactory]::CreateRunspacePool(1,[Math]::Max(1,$Throttle),$iss,$Host); $pool.Open()
     Write-Log "Parallel $Action of $(@($Boxes).Count) recorder(s), max $Throttle at once..."
     $jobs=@()
@@ -2039,6 +2050,20 @@ function Connect-VmsAny { param([string[]]$Urls,[pscredential]$Cred,[switch]$All
 # Recorder discovery from the VMS. ADAPTED from Mrc-Rec-Gui.ps1 Do-Load (same candidate-URL
 # logic and the same skip of the recorder co-located on the management server), returning plain
 # objects instead of filling a grid. Needs MilestonePSTools on this machine.
+# Connection name of a recording server that Milestone knows by a bare computer name (typical for a server
+# outside the domain). Owner 2026-11-09: never invent a name - '<name>.<Domain box>' is used only when it really
+# resolves from this computer; otherwise the name Milestone itself has is kept as it is. The certificate name is
+# not decided here (Resolve-CertFqdn).
+function Get-RecorderConnName { param([string]$HostName,[string]$DomainSuffix)
+    $short = Normalize-RecorderHostName $HostName
+    $full = ''
+    try { $full = ([string](Get-RecorderFqdn -HostName $short -DomainSuffix $DomainSuffix)).ToLowerInvariant() } catch {}
+    if($full -and @(Resolve-HostIPv4 $full).Count){ return $full }
+    $bare = $short.ToLowerInvariant()
+    if(@(Resolve-HostIPv4 $bare).Count){ Write-Log "Recording server '$short': no full DNS name exists for it$(if($full){" ('$full' does not resolve)"}) - it is reached by the name Milestone has, '$bare'." }
+    else { Write-Log "Recording server '$short': this computer cannot resolve the name$(if($full){" (also not as '$full')"}). It is kept as '$bare'. If it cannot be reached, add it to the extra recording servers as $short=<its IP address>." 'Err' }
+    $bare
+}
 function Get-VmsRecorderList { param([string]$Domain,[pscredential]$VmsCred,[string]$MsAddrText)
     if(-not (Get-Module -ListAvailable MilestonePSTools)){ throw 'MilestonePSTools is not installed on this computer, so the recording servers cannot be found automatically. Type them in the "Extra recording servers" box (headless: -RecTargets), or install MilestonePSTools.' }
     Import-Module MilestonePSTools -ErrorAction Stop
@@ -2089,12 +2114,13 @@ function Get-VmsRecorderList { param([string]$Domain,[pscredential]$VmsCred,[str
         # W13: keep a real discovered FQDN VERBATIM - never rebuild it from the wizard's own Domain box.
         # That silently rewrites cross-domain names (the same bug class Resolve-CertFqdn avoids for the
         # certificate CN); only a bare short name (or an IP) gets the Domain suffix appended here.
-        $fqdn = if($isIp){ $src } elseif($srcTrim -match '\.'){ $srcTrim.ToLowerInvariant() } else { Get-RecorderFqdn -HostName $short -DomainSuffix $Domain }
+        # Owner 2026-11-09: a bare name gets the Domain suffix only when that name really resolves (Get-RecorderConnName).
+        $fqdn = if($isIp){ $src } elseif($srcTrim -match '\.'){ $srcTrim.ToLowerInvariant() } else { Get-RecorderConnName -HostName $short -DomainSuffix $Domain }
         if($msNames -contains $short){
             Write-Log "Recording server '$($rec.Name)' runs on this Management Server - it is covered by the Management Server step, not handled separately."
             continue
         }
-        if(-not $isIp -and $srcTrim -notmatch '\.' -and $fqdn -notlike "*.$(Get-DomainSuffix $Domain)"){
+        if(-not $isIp -and $srcTrim -notmatch '\.' -and $fqdn -match '\.' -and $fqdn -notlike "*.$(Get-DomainSuffix $Domain)"){
             Write-Log "Recording server '$($rec.Name)': Milestone knows it only as '$srcTrim'; DNS names it $fqdn (domain differs from $(Get-DomainSuffix $Domain)). That name is used for the connection and its certificate - check it is right before you continue." 'Err' }
         # W13: dedup by the full FQDN (not the short name) - two entries can share a short name only when
         # they are genuinely the same recorder reported twice.
@@ -3483,6 +3509,72 @@ function Get-MsRegisterAddress { param([bool]$Encrypted)
     $a = [string]$script:MsCluster.Address
     if(-not $a){ throw "The Management Server cluster role '$($script:MsCluster.Group)' has no network name (cluster address), so the address to register with is unknown." }
     '{0}://{1}/' -f $(if($Encrypted){'https'}else{'http'}), $a }
+# Recording servers outside the domain, option "register as the admin account": ServerConfigurator on a recorder
+# keeps the local recorder account for everything on that computer (remote connection, certificate import, the
+# SYSTEM task) but logs on to the Management Server as the admin account through a NETWORK-ONLY logon
+# (LogonUser type 9 NEW_CREDENTIALS, provider 3 WINNT50; lab 2026-11-09). The engine launcher is never edited:
+# a patched COPY is built at run time. Pure: credentials in, launcher text out.
+# The launcher text lands on the recorder and PowerShell script-block logging (event 4104) records it, so the
+# registration password is AES-encrypted in it; the key is derived at run time from the recorder account's
+# password ($pw, read from pw.txt), exactly as the shipped launcher never carries a secret in its text.
+function Get-NetOnlyLauncher { param([pscredential]$Cred,[pscredential]$KeyCred)
+    if(-not $KeyCred -or [string]::IsNullOrEmpty($KeyCred.GetNetworkCredential().Password)){ throw 'the recorder account password is needed' }
+    $acct = [string]$Cred.UserName
+    if($acct -match '^([^\\@]+)\\([^\\@]+)$' -and $Matches[1] -ne '.'){ $u = $Matches[2]; $d = $Matches[1] }
+    elseif($acct -match '^[^\\@\s]+@[^\\@\s]+$'){ $u = $acct; $d = '' }
+    else { throw 'The registration account needs a domain account (DOMAIN\user or user@domain).' }
+    $text = [string]$script:LauncherCSharp
+    $old = 'LogonUser(user, dom, pw, LOGON32_LOGON_INTERACTIVE, LOGON32_PROVIDER_DEFAULT, out token)'
+    if(([regex]::Matches($text, [regex]::Escape($old))).Count -ne 1){ throw 'the engine launcher changed: the LogonUser call was not found exactly once' }
+    $anchor = 'Add-Type -TypeDefinition'
+    if(([regex]::Matches($text, [regex]::Escape($anchor))).Count -ne 1){ throw 'the engine launcher changed: Add-Type -TypeDefinition was not found exactly once' }
+    $b64 = { param([string]$s) [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($s)) }
+    $nl = if($text.Contains("`r`n")){ "`r`n" } else { "`n" }
+    $salt = New-Object byte[] 16; $iv = New-Object byte[] 16
+    $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $rng.GetBytes($salt); $rng.GetBytes($iv) } finally { $rng.Dispose() }
+    $kdf = New-Object Security.Cryptography.Rfc2898DeriveBytes($KeyCred.GetNetworkCredential().Password, $salt, 10000)
+    try { $key = $kdf.GetBytes(32) } finally { $kdf.Dispose() }
+    $aes = [Security.Cryptography.Aes]::Create()
+    try {
+        $aes.Key = $key; $aes.IV = $iv
+        $enc = $aes.CreateEncryptor()
+        try { $plain = [Text.Encoding]::Unicode.GetBytes($Cred.GetNetworkCredential().Password); $ct = $enc.TransformFinalBlock($plain, 0, $plain.Length) } finally { $enc.Dispose() }
+    } finally { $aes.Dispose() }
+    $line = '$user=[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String(''' + (& $b64 $u) + ''')); $dom=[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String(''' + (& $b64 $d) + '''));' +
+        ' $mrcK=(New-Object Security.Cryptography.Rfc2898DeriveBytes($pw,[Convert]::FromBase64String(''' + [Convert]::ToBase64String($salt) + '''),10000)).GetBytes(32);' +
+        ' $mrcA=[Security.Cryptography.Aes]::Create(); $mrcA.Key=$mrcK; $mrcA.IV=[Convert]::FromBase64String(''' + [Convert]::ToBase64String($iv) + ''');' +
+        ' $mrcD=$mrcA.CreateDecryptor(); $mrcC=[Convert]::FromBase64String(''' + [Convert]::ToBase64String($ct) + ''');' +
+        ' $pw=[Text.Encoding]::Unicode.GetString($mrcD.TransformFinalBlock($mrcC,0,$mrcC.Length)); $mrcD.Dispose(); $mrcA.Dispose()'
+    $text = $text.Replace($old, 'LogonUser(user, dom, pw, 9, 3, out token)')
+    $i = $text.IndexOf($anchor, [StringComparison]::Ordinal)
+    $text.Substring(0, $i) + $line + $nl + $text.Substring($i)
+}
+# Is the option "recording servers register as the admin account" in force? (needs a separate recorder account)
+function Test-RecRegAsAdminOn {
+    if(-not (Get-Variable -Name RecRegAsAdmin -Scope Script -ValueOnly -ErrorAction SilentlyContinue)){ return $false }
+    $rc = Get-Variable -Name RecCred -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+    $ac = Get-Variable -Name AdminCred -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+    if(-not $rc -or -not $ac){ return $false }
+    [string]$rc.UserName -ine [string]$ac.UserName
+}
+# The launcher text the RECORDERS get: the shipped one, or (option on) the net-only copy for the admin account.
+# Built once per run (cleared when the inputs are read / a run starts).
+$script:RecLauncherCache = $null
+$script:RecRegAsAdmin = $false   # option "Recording servers register with the Management Server as the admin account" (set by Read-Inputs)
+function Get-RecLauncher {
+    if(-not (Test-RecRegAsAdminOn)){ return [string]$script:LauncherCSharp }
+    if(-not $script:RecLauncherCache){ $script:RecLauncherCache = Get-NetOnlyLauncher $script:AdminCred $script:RecCred }
+    [string]$script:RecLauncherCache
+}
+# Option on but the admin account is not a domain account: the Management Server cannot be logged on to with it
+# from a computer outside the domain. '' = fine / option off.
+function Get-RecRegAdminFormProblem {
+    if(-not (Test-RecRegAsAdminOn)){ return '' }
+    $u = [string]$script:AdminCred.UserName
+    if(($u -match '^([^\\@]+)\\[^\\@]+$' -and $Matches[1] -ne '.' -and $Matches[1] -ine $env:COMPUTERNAME) -or $u -match '^[^\\@\s]+@[^\\@\s]+$'){ return '' }
+    "Registering the recording servers as the admin account needs a domain account. Type the admin account as DOMAIN\user, or untick 'Recording servers register with the Management Server as the admin account above'."
+}
 # ServerConfigurator /register on ONE box, as that box's credential (the admin account the wizard holds;
 # the recording-server account for recorders, as for their encryption runs), through the SYSTEM-jump
 # launcher in $script:ScRegisterSb. Cluster node -> node path (identity-guarded); the standalone
@@ -3492,7 +3584,8 @@ function Invoke-ScRegisterOn { param($Box,[string]$Address)
          elseif((Get-BoxKind $Box) -eq 'MS'){ Get-First -Items @(& $script:ScFindSb $script:ScSearchPaths) }
          else { Get-First -Items @(Invoke-OnBox -Computer $Box.Addr -Cred $Box.Cred -Sb $script:ScFindSb -ArgumentList @($script:ScSearchPaths)) }
     if(-not $f -or -not $f.Found){ throw "ServerConfigurator was not found on $($Box.Name) $(if($f){$f.Path})" }
-    $scArgs = @($Address,$Box.Cred,$script:LauncherCSharp,[string]$f.Path)
+    $launcher = if((Get-BoxKind $Box) -eq 'REC'){ Get-RecLauncher } else { $script:LauncherCSharp }
+    $scArgs = @($Address,$Box.Cred,$launcher,[string]$f.Path)
     if($Box.IsNode){ return (Get-First -Items @(Invoke-OnNode -Node $Box.Target -Cred $Box.Cred -Sb $script:ScRegisterSb -ArgumentList $scArgs)) }
     if((Get-BoxKind $Box) -eq 'MS'){ return (Get-First -Items @(& $script:ScRegisterSb @scArgs)) }
     Get-First -Items @(Invoke-OnBox -Computer $Box.Addr -Cred $Box.Cred -Sb $script:ScRegisterSb -ArgumentList $scArgs)
@@ -4037,6 +4130,7 @@ function Get-MilestoneAdminProblem {
 # node against the role members Get-MilestoneAdminProblem read ($script:AdminRoleSids). '' = OK / not checked.
 $script:AdminRoleSids = @()
 function Get-RecAccountProblem {
+    if(Test-RecRegAsAdminOn){ return '' }   # the recorders register as the admin account (checked by Get-MilestoneAdminProblem)
     if(-not $script:RecCred -or [string]$script:RecCred.UserName -eq [string]$script:AdminCred.UserName){ return '' }
     $n = ([string]$script:RecCred.UserName -split '\\')[-1]
     if($n -match '@'){ return '' }
@@ -4107,6 +4201,8 @@ function Get-PreFlightProblems { param([ValidateSet('on','off','register','rollb
         else { $a = Get-MilestoneAdminProblem; if($a){ $p.Add($a) } } }
     if($Want -and $Mode -ne 'register' -and @($script:RecBoxes | Where-Object { -not $_.Excluded -and (Test-InScope $_) -and $_.Encrypted -ne $true -and -not (Test-OutOfWave $_ $Want) }).Count){
         $ra = Get-RecAccountProblem; if($ra){ $p.Add($ra) } }
+    if($Mode -ne 'register' -and @($script:RecBoxes | Where-Object { -not $_.Excluded -and (Test-InScope $_) }).Count){
+        $rf = Get-RecRegAdminFormProblem; if($rf){ $p.Add($rf) } }
     # Register touches THIS node only (a peer may be Paused or Down); every other mode checks all boxes.
     $boxes = @(if($Mode -eq 'register'){ @(Get-MsBoxes | Where-Object { -not $_.IsNode -or (Test-NodeIsLocal ([string]$_.Target)) }) } else { @(Get-MsBoxes) })
     if($Mode -ne 'register'){ $boxes += @(Get-EsBoxes); $boxes += @($script:RecBoxes | Where-Object { -not $_.Excluded -and (Test-InScope $_) }) }
@@ -4403,6 +4499,8 @@ function Read-Inputs {
         if(-not $script:RecPwBox.Text){ throw 'Enter the password of the recording server account.' }
         $script:RecCred=Get-Cred $ru $script:RecPwBox.Text
     } else { $script:RecCred=$script:AdminCred }
+    $script:RecRegAsAdmin=[bool]($script:RecSepChk.Checked -and $script:RecRegChk.Checked)
+    $script:RecLauncherCache=$null
     $mf=[string]$script:Defaults.MsFqdn
     $script:MsFqdn = if($mf -and $mf -notmatch '<[^>]+>'){ $mf.Trim().ToLowerInvariant() } else { (Get-RecorderFqdn -HostName $env:COMPUTERNAME -DomainSuffix $script:DomainName).ToLowerInvariant() }
     [void](ConvertTo-SanList $script:MsExtraSans)   # validate early: an invalid SAN would only fail mid-run
@@ -4461,8 +4559,17 @@ function Initialize-Targets { param([string]$ManualList,[bool]$Discover)
     # On a clustered Management Server the VMS answers on the cluster address, not on a node name.
     $vmsAddr = [string]$script:MsAddrValue
     if($script:MsCluster -and $script:MsCluster.Address -and ([string]::IsNullOrWhiteSpace($vmsAddr) -or $vmsAddr -match '<[^>]+>')){ $vmsAddr = [string]$script:MsCluster.Address }
+    # Owner 2026-11-09: an address the operator typed (NAME=address) wins over the discovered one.
+    $typed=@{}
+    foreach($h in @(([string]$ManualList) -split '[;,\r\n]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ -and -not $_.StartsWith('#') })){
+        $tp=$h -split '=',2
+        if($tp.Count -ge 2 -and $tp[1].Trim()){ try { $typed[(Normalize-RecorderHostName $tp[0])]=$tp[1].Trim() } catch {} }
+    }
     if($Discover){
-        try { foreach($r in @(Get-VmsRecorderList -Domain $script:DomainName -VmsCred $script:AdminCred -MsAddrText $vmsAddr)){ & $add $r.Name $r.Target $r.Fqdn } }
+        try { foreach($r in @(Get-VmsRecorderList -Domain $script:DomainName -VmsCred $script:AdminCred -MsAddrText $vmsAddr)){
+                  $tk=([string]$r.Target).ToUpperInvariant()
+                  if($typed.ContainsKey($tk)){ Write-Log "Recording server '$($r.Name)': the address you typed ($($typed[$tk])) is used instead of the discovered $($r.Fqdn)." 'Good'; & $add $r.Name $r.Target $typed[$tk] }
+                  else { & $add $r.Name $r.Target $r.Fqdn } } }
         catch { $discErr=([string]$_.Exception.Message).Trim(); Write-Log "Recording server discovery failed: $(Format-Err $_)" 'Err' }
     }
     foreach($h in @(([string]$ManualList) -split '[;,\r\n]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ -and -not $_.StartsWith('#') })){
@@ -4973,6 +5080,7 @@ function Invoke-RecStage { param([bool]$Want)
         Set-StageStatus 'REC' 'BLOCKED - Management Server state changed' 'Bad'
         foreach($b in $todo){ Add-GuidedRow $b $act $false 'blocked by order check' $why }
         Set-RunFailure 'Recording servers' "$($todo.Count) computer(s)" $why $gb2.Detail 'Click Check again to see the current state, then run the same action again.'; return $false }
+    if(Test-RecRegAsAdminOn){ Write-Log "Recording servers: connection as $($script:RecCred.UserName); registration with the Management Server as $($script:AdminCred.UserName) (network-only logon)." }
     $t0 = Get-Date
     $results=@(Invoke-RecordersParallel -Boxes $todo -Action $(if($Want){'enable'}else{'disable'}) -Common $common -Throttle 32)
     [void](Confirm-BoxStates $todo $Want -TotalSec 300)
@@ -5002,6 +5110,7 @@ function Invoke-StageSequence { param([string[]]$Keys,[bool]$Want)
     $true
 }
 function Reset-RunState {
+    $script:RecLauncherCache=$null
     $script:RunFailure=$null; $script:SignerTp=''; $script:CaCer=''; $script:RunStart=Get-Date; $script:LastReportPath=''
     $script:RecCertMap=@{}; $script:RoleCertMap=@{}; $script:CertRootCer=''
     $script:FailoverResults=@(); $script:Scope=$null; $script:FinalOwners=@{}
@@ -5635,7 +5744,7 @@ function Update-RollbackButton {
 function Get-RollbackCommand {
     if(-not $script:LastSnapshotPath){ return '' }
     $u = if($script:AdminCred){ [string]$script:AdminCred.UserName } else { '<DOMAIN>\<admin>' }
-    $rec = if($script:RecSepChk -and $script:RecSepChk.Checked -and $script:RecCred){ " -RecUser '$($script:RecCred.UserName)' -RecPwFile <file-with-the-recording-server-password>" } else { '' }
+    $rec = if($script:RecSepChk -and $script:RecSepChk.Checked -and $script:RecCred){ " -RecUser '$($script:RecCred.UserName)' -RecPwFile <file-with-the-recording-server-password>$(if($script:RecRegAsAdmin){' -RecRegisterAsAdmin'})" } else { '' }
     $cert = ''
     if($script:CertFilesOn){
         $cert = ' -CertFolder "' + $script:CertFilesDir + '" -CertPwFile <file-with-the-certificate-passwords>'
@@ -5791,23 +5900,24 @@ $script:RecUserBox=New-UiText 320 316 320 (& $clearPh $RecUser); $p1.Controls.Ad
 $p1.Controls.Add((New-UiLabel 'Recording server password:' 24 352))
 $script:RecPwBox=New-UiText 320 354 320 '' $true; $p1.Controls.Add($script:RecPwBox)
 $script:RecUserBox.Enabled=$false; $script:RecPwBox.Enabled=$false
-$script:RecSepChk.Add_CheckedChanged({ $script:RecUserBox.Enabled=$script:RecSepChk.Checked; $script:RecPwBox.Enabled=$script:RecSepChk.Checked })
-$p1.Controls.Add((New-UiLabel 'Signing CA (certificate authority):' 24 392))
-$script:SignerSubjectBox=New-UiText 320 394 320 (& $clearPh $RootSubject); $p1.Controls.Add($script:SignerSubjectBox)
-$findCaBtn=New-UiButton 'Look again' 656 390 130; $p1.Controls.Add($findCaBtn); $findCaBtn.Add_Click({ [void](Update-CaStatus) })
-$createCaBtn=New-UiButton 'Create signing CA' 796 390 180; $p1.Controls.Add($createCaBtn); $createCaBtn.Add_Click({ New-SigningCaInteractive })
-$script:CaStatus=New-UiLabel '' 320 428 656 30; $p1.Controls.Add($script:CaStatus)
-$recLbl=New-UiLabel 'Extra recording servers (optional, one per line):' 24 466 290 56; $recLbl.TextAlign='TopLeft'; $p1.Controls.Add($recLbl)
+$script:RecRegChk=New-UiCheck 'Recording servers register with the Management Server as the admin account above' 320 386 650; $script:RecRegChk.Name='RecRegChk'; $script:RecRegChk.Enabled=$false; $p1.Controls.Add($script:RecRegChk)
+$script:RecSepChk.Add_CheckedChanged({ $script:RecUserBox.Enabled=$script:RecSepChk.Checked; $script:RecPwBox.Enabled=$script:RecSepChk.Checked; $script:RecRegChk.Enabled=$script:RecSepChk.Checked; if(-not $script:RecSepChk.Checked){ $script:RecRegChk.Checked=$false } })
+$p1.Controls.Add((New-UiLabel 'Signing CA (certificate authority):' 24 420))
+$script:SignerSubjectBox=New-UiText 320 422 320 (& $clearPh $RootSubject); $p1.Controls.Add($script:SignerSubjectBox)
+$findCaBtn=New-UiButton 'Look again' 656 418 130; $p1.Controls.Add($findCaBtn); $findCaBtn.Add_Click({ [void](Update-CaStatus) })
+$createCaBtn=New-UiButton 'Create signing CA' 796 418 180; $p1.Controls.Add($createCaBtn); $createCaBtn.Add_Click({ New-SigningCaInteractive })
+$script:CaStatus=New-UiLabel '' 320 454 656 30; $p1.Controls.Add($script:CaStatus)
+$recLbl=New-UiLabel 'Extra recording servers (optional, one per line):' 24 486 290 52; $recLbl.TextAlign='TopLeft'; $p1.Controls.Add($recLbl)
 $script:ManualRecBox=[Windows.Forms.TextBox]::new(); $script:ManualRecBox.Multiline=$true; $script:ManualRecBox.ScrollBars='Vertical'
-$script:ManualRecBox.Location=[Drawing.Point]::new(320,466); $script:ManualRecBox.Size=[Drawing.Size]::new(320,60); $p1.Controls.Add($script:ManualRecBox)
-$recHint=New-UiLabel 'Recording servers are found automatically. Add them here only if they are missing.' 656 466 320 60; $recHint.TextAlign='TopLeft'; $p1.Controls.Add($recHint)
-$p1.Controls.Add((New-UiLabel 'Certificate files (your own CA):' 24 534))
-$script:CertFilesBtn=New-UiButton 'Certificate files...' 320 530 320 34; $p1.Controls.Add($script:CertFilesBtn); $script:CertFilesBtn.Add_Click({ Show-CertFilesDialog })
-$script:CertFilesStatus=New-UiLabel '' 656 528 320 44; $script:CertFilesStatus.TextAlign='TopLeft'; $p1.Controls.Add($script:CertFilesStatus)
-$script:ConnectStatus=New-UiLabel '' 24 580 570 30; $script:ConnectStatus.Font=$script:UiBold; $script:ConnectStatus.ForeColor=[Drawing.Color]::DarkOrange; $p1.Controls.Add($script:ConnectStatus)
+$script:ManualRecBox.Location=[Drawing.Point]::new(320,486); $script:ManualRecBox.Size=[Drawing.Size]::new(320,52); $p1.Controls.Add($script:ManualRecBox)
+$recHint=New-UiLabel 'Recording servers are found automatically. Add them here only if they are missing.' 656 486 320 52; $recHint.TextAlign='TopLeft'; $p1.Controls.Add($recHint)
+$p1.Controls.Add((New-UiLabel 'Certificate files (your own CA):' 24 548))
+$script:CertFilesBtn=New-UiButton 'Certificate files...' 320 544 320 34; $p1.Controls.Add($script:CertFilesBtn); $script:CertFilesBtn.Add_Click({ Show-CertFilesDialog })
+$script:CertFilesStatus=New-UiLabel '' 656 542 320 38; $script:CertFilesStatus.TextAlign='TopLeft'; $p1.Controls.Add($script:CertFilesStatus)
+$script:ConnectStatus=New-UiLabel '' 24 588 570 30; $script:ConnectStatus.Font=$script:UiBold; $script:ConnectStatus.ForeColor=[Drawing.Color]::DarkOrange; $p1.Controls.Add($script:ConnectStatus)
 # Milestone installed outside C:\Program Files: folders to search for ServerConfigurator.exe (on every server)
 # and MilestonePSTools (on this computer). One folder per line.
-$searchBtn=New-UiButton 'Search folders...' 604 576 180 34; $p1.Controls.Add($searchBtn)
+$searchBtn=New-UiButton 'Search folders...' 604 584 180 34; $p1.Controls.Add($searchBtn)
 $searchBtn.Add_Click({
     $dlg=[Windows.Forms.Form]::new(); $dlg.Text='Search folders'; $dlg.Size=[Drawing.Size]::new(620,330); $dlg.StartPosition='CenterParent'; $dlg.FormBorderStyle='FixedDialog'; $dlg.MaximizeBox=$false; $dlg.MinimizeBox=$false
     $lb=[Windows.Forms.Label]::new(); $lb.Text="Only needed if Milestone is NOT installed in C:\Program Files\Milestone.`r`nOne folder per line, for example D:\Milestone. The wizard looks there (and below) for`r`nServerConfigurator.exe on every server, and for MilestonePSTools on this computer.`r`nThe Milestone install folder is also found automatically from the Milestone services."; $lb.Location=[Drawing.Point]::new(12,10); $lb.Size=[Drawing.Size]::new(580,70); $dlg.Controls.Add($lb)
@@ -5822,7 +5932,7 @@ $searchBtn.Add_Click({
     }
     $dlg.Dispose()
 })
-$openLogBtn=New-UiButton 'Open log' 794 576 180 34; $p1.Controls.Add($openLogBtn)
+$openLogBtn=New-UiButton 'Open log' 794 584 180 34; $p1.Controls.Add($openLogBtn)
 $openLogBtn.Add_Click({ $lp = Save-UiLog; if($lp){ Start-Process notepad.exe -ArgumentList "`"$lp`"" } else { [Windows.Forms.MessageBox]::Show('The log could not be saved.','Log',0,'Warning')|Out-Null } })
 # Resolve-Signer (verbatim) reads these: store mode only in the wizard; the PFX controls are never shown.
 $script:SignerStoreRadio=[Windows.Forms.RadioButton]::new(); $script:SignerStoreRadio.Checked=$true
@@ -5943,10 +6053,14 @@ if($script:Headless){
         if($Action -eq 'register' -and ([string]::IsNullOrWhiteSpace($EsHost) -or $EsHost -match '<[^>]+>')){ $NoEventServer = [switch]$true }   # register touches this node only
         $script:NoEsChk.Checked   = [bool]$NoEventServer
         $script:EsHostBox.Text    = $(if($NoEventServer){ '' } else { $EsHost })
+        if($PSBoundParameters.ContainsKey('RecRegisterAsAdmin') -and $RecRegisterAsAdmin){
+            if([string]::IsNullOrWhiteSpace($RecUser)){ Write-Log 'REFUSED: -RecRegisterAsAdmin needs -RecUser (the local recording-server account)' 'Err'; exit 3 }
+            if(-not $RecPwFile){ Write-Log 'REFUSED: -RecRegisterAsAdmin needs -RecPwFile (the password of the local recording-server account)' 'Err'; exit 3 } }
         if($RecPwFile){
             if(-not (Test-Path -LiteralPath $RecPwFile)){ Write-Log "REFUSED: -RecPwFile not found: $RecPwFile" 'Err'; exit 3 }
             if([string]::IsNullOrWhiteSpace($RecUser)){ Write-Log 'REFUSED: -RecPwFile given without -RecUser' 'Err'; exit 3 }
             $script:RecSepChk.Checked=$true; $script:RecUserBox.Text=$RecUser; $script:RecPwBox.Text=(Get-Content -Raw -LiteralPath $RecPwFile).Trim()
+            $script:RecRegChk.Checked=[bool]$RecRegisterAsAdmin
         }
         if($CertPwFile){
             if(-not $CertFolder){ Write-Log 'REFUSED: -CertPwFile given without -CertFolder' 'Err'; exit 3 }

@@ -281,6 +281,20 @@ function Get-RecorderFqdn {
 # Recorder discovery from the VMS. ADAPTED from Mrc-Rec-Gui.ps1 Do-Load (same candidate-URL
 # logic and the same skip of the recorder co-located on the management server), returning plain
 # objects instead of filling a grid. Needs MilestonePSTools on this machine.
+# Connection name of a recording server that Milestone knows by a bare computer name (typical for a server
+# outside the domain). Owner 2026-11-09: never invent a name - '<name>.<Domain box>' is used only when it really
+# resolves from this computer; otherwise the name Milestone itself has is kept as it is. The certificate name is
+# not decided here (Resolve-CertFqdn).
+function Get-RecorderConnName { param([string]$HostName,[string]$DomainSuffix)
+    $short = Normalize-RecorderHostName $HostName
+    $full = ''
+    try { $full = ([string](Get-RecorderFqdn -HostName $short -DomainSuffix $DomainSuffix)).ToLowerInvariant() } catch {}
+    if($full -and @(Resolve-HostIPv4 $full).Count){ return $full }
+    $bare = $short.ToLowerInvariant()
+    if(@(Resolve-HostIPv4 $bare).Count){ Write-Log "Recording server '$short': no full DNS name exists for it$(if($full){" ('$full' does not resolve)"}) - it is reached by the name Milestone has, '$bare'." }
+    else { Write-Log "Recording server '$short': this computer cannot resolve the name$(if($full){" (also not as '$full')"}). It is kept as '$bare'. If it cannot be reached, add it to the extra recording servers as $short=<its IP address>." 'Err' }
+    $bare
+}
 function Get-VmsRecorderList { param([string]$Domain,[pscredential]$VmsCred,[string]$MsAddrText)
     if(-not (Get-Module -ListAvailable MilestonePSTools)){ throw 'MilestonePSTools is not installed on this computer, so the recording servers cannot be found automatically. Type them in the "Extra recording servers" box (headless: -RecTargets), or install MilestonePSTools.' }
     Import-Module MilestonePSTools -ErrorAction Stop
@@ -331,12 +345,13 @@ function Get-VmsRecorderList { param([string]$Domain,[pscredential]$VmsCred,[str
         # W13: keep a real discovered FQDN VERBATIM - never rebuild it from the wizard's own Domain box.
         # That silently rewrites cross-domain names (the same bug class Resolve-CertFqdn avoids for the
         # certificate CN); only a bare short name (or an IP) gets the Domain suffix appended here.
-        $fqdn = if($isIp){ $src } elseif($srcTrim -match '\.'){ $srcTrim.ToLowerInvariant() } else { Get-RecorderFqdn -HostName $short -DomainSuffix $Domain }
+        # Owner 2026-11-09: a bare name gets the Domain suffix only when that name really resolves (Get-RecorderConnName).
+        $fqdn = if($isIp){ $src } elseif($srcTrim -match '\.'){ $srcTrim.ToLowerInvariant() } else { Get-RecorderConnName -HostName $short -DomainSuffix $Domain }
         if($msNames -contains $short){
             Write-Log "Recording server '$($rec.Name)' runs on this Management Server - it is covered by the Management Server step, not handled separately."
             continue
         }
-        if(-not $isIp -and $srcTrim -notmatch '\.' -and $fqdn -notlike "*.$(Get-DomainSuffix $Domain)"){
+        if(-not $isIp -and $srcTrim -notmatch '\.' -and $fqdn -match '\.' -and $fqdn -notlike "*.$(Get-DomainSuffix $Domain)"){
             Write-Log "Recording server '$($rec.Name)': Milestone knows it only as '$srcTrim'; DNS names it $fqdn (domain differs from $(Get-DomainSuffix $Domain)). That name is used for the connection and its certificate - check it is right before you continue." 'Err' }
         # W13: dedup by the full FQDN (not the short name) - two entries can share a short name only when
         # they are genuinely the same recorder reported twice.
@@ -944,8 +959,17 @@ function Initialize-Targets { param([string]$ManualList,[bool]$Discover)
     # On a clustered Management Server the VMS answers on the cluster address, not on a node name.
     $vmsAddr = [string]$script:MsAddrValue
     if($script:MsCluster -and $script:MsCluster.Address -and ([string]::IsNullOrWhiteSpace($vmsAddr) -or $vmsAddr -match '<[^>]+>')){ $vmsAddr = [string]$script:MsCluster.Address }
+    # Owner 2026-11-09: an address the operator typed (NAME=address) wins over the discovered one.
+    $typed=@{}
+    foreach($h in @(([string]$ManualList) -split '[;,\r\n]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ -and -not $_.StartsWith('#') })){
+        $tp=$h -split '=',2
+        if($tp.Count -ge 2 -and $tp[1].Trim()){ try { $typed[(Normalize-RecorderHostName $tp[0])]=$tp[1].Trim() } catch {} }
+    }
     if($Discover){
-        try { foreach($r in @(Get-VmsRecorderList -Domain $script:DomainName -VmsCred $script:AdminCred -MsAddrText $vmsAddr)){ & $add $r.Name $r.Target $r.Fqdn } }
+        try { foreach($r in @(Get-VmsRecorderList -Domain $script:DomainName -VmsCred $script:AdminCred -MsAddrText $vmsAddr)){
+                  $tk=([string]$r.Target).ToUpperInvariant()
+                  if($typed.ContainsKey($tk)){ Write-Log "Recording server '$($r.Name)': the address you typed ($($typed[$tk])) is used instead of the discovered $($r.Fqdn)." 'Good'; & $add $r.Name $r.Target $typed[$tk] }
+                  else { & $add $r.Name $r.Target $r.Fqdn } } }
         catch { $discErr=([string]$_.Exception.Message).Trim(); Write-Log "Recording server discovery failed: $(Format-Err $_)" 'Err' }
     }
     foreach($h in @(([string]$ManualList) -split '[;,\r\n]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ -and -not $_.StartsWith('#') })){
