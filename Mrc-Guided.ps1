@@ -5068,6 +5068,33 @@ function Invoke-EsStage { param([bool]$Want)
 # MS; OFF: right after the MS. Lab window 11: no role takeover needed - SC runs on each node by its own address,
 # passive nodes first; on the node that runs the role the cluster restarts the Event Server once. It always follows
 # the Management Server, also in a rollback (no scope).
+# Owner 2026-11-09: "Event server and add-ons" is optional, so an Event Server may have no certificate of its own yet.
+# Then "Server certificate" gets one here, made like the Event Server step makes it (same names; prepared file mode:
+# the Event Server's file). Cluster: one certificate for the role, on every given node. Returns the thumbprint.
+function New-EsSrvCertificate { param([object[]]$Boxes)
+    if($script:EsCluster){ return (New-ClusterCertificate 'ES' $Boxes) }
+    $b = $Boxes[0]
+    $conn = try { Get-ConnAddr $b.Addr $b.Cred } catch { $b.Addr }
+    if($script:CertFilesOn){
+        $rc = $script:RoleCertMap['ES']
+        if(-not $rc){ throw "No checked certificate file for the Event Server - nothing was changed. Click Check again, then run the same action again." }
+        $pfx = $rc.File; $pw = $rc.Pw; $tp = $rc.Tp; $ca = [string]$script:CertRootCer; $toRoot = [bool]$script:CertRootCer
+        Write-Log "Certificate file for the Event Server: $([IO.Path]::GetFileName($pfx)) [tp $tp]" 'Good'
+    } else {
+        $signer = Get-First -Items @(Get-ChildItem Cert:\LocalMachine\My,Cert:\CurrentUser\My -ErrorAction SilentlyContinue | Where-Object { $_.Thumbprint -eq $script:SignerTp -and $_.HasPrivateKey })
+        if(-not $signer){ throw "signer $($script:SignerTp) not found in cert store" }
+        $cn = Resolve-CertFqdn -Target $script:EsAddr -Fqdn '' -DomainSuffix $script:DomainName
+        $pw = [securestring]::new(); foreach($ch in ([guid]::NewGuid().ToString('N')).ToCharArray()){ $pw.AppendChar($ch) }; $pw.MakeReadOnly()
+        $pkg = New-RecorderCertificatePackage -HostName $cn -DomainSuffix $script:DomainName -Signer $signer -PfxPassword $pw -OutputDir $script:OutputDir -ExtraDnsNames @()
+        $pfx = $pkg.PfxPath; $tp = $pkg.Thumbprint; $ca = $script:CaCer; $toRoot = $true
+        Write-Log "Event Server certificate: CN=$($pkg.Fqdn) [tp $tp]" 'Good'
+    }
+    $r = Invoke-RemoteRecorderInstall -ComputerName $conn -Credential $b.Cred -UseSsl:$false -PfxPath $pfx -PfxPassword $pw -SignerCerPath $ca `
+             -InstallSignerToRoot $toRoot -InstallSignerToIntermediate $false -EnableEncryption $false -ServerConfiguratorPath '' -ScCredential $b.Cred -CertificateGroup ''
+    foreach($l in $r.Logs){ Write-LogLines "[$($b.Name)] " ([string]$l) }
+    foreach($l in @(Invoke-OnBox -Computer $b.Addr -Cred $b.Cred -Sb $script:KeyGrantSb -ArgumentList @($tp,$script:EsSvcDisplay))){ Write-Log ([string]$l) $(if([string]$l -match 'WARNING'){'Err'}else{'Info'}) }
+    $tp
+}
 function Get-EsSrvState { param($Box)
     Get-First -Items @(if($Box.IsNode){ Invoke-OnNode -Node $Box.Target -Cred $Box.Cred -Sb $script:EsSrvStateSb } else { Invoke-OnBox -Computer $Box.Addr -Cred $Box.Cred -Sb $script:EsSrvStateSb }) }
 function Invoke-EssStage { param([bool]$Want)
@@ -5102,15 +5129,23 @@ function Invoke-EssStage { param([bool]$Want)
         Set-RunFailure $gn $todo[0].Box.Name $why $gb.Detail; return $false }
     Write-Log "ORDER CHECK: the Management Server is $wt - OK to turn 'Server certificate' $wt on the Event Server computer" 'Good'
     $todo=@($todo | Sort-Object { [bool]$_.Box.Active })   # passive nodes first, the node that runs the role last
+    if($Want){
+        # No Event Server certificate yet ("Event server and add-ons" never turned on): make one now.
+        $noCert=@($todo | Where-Object { -not $_.State.EsTp -or -not $_.State.EsTpPresent })
+        if($noCert.Count){
+            Set-StageStatus 'ESS' 'Creating and installing the Event Server certificate...' 'Work'
+            try { $newTp = [string](@(New-EsSrvCertificate @($noCert | ForEach-Object { $_.Box }))[-1]) }
+            catch {
+                $why = "The Event Server certificate could not be made or installed: $(Get-FirstLine $_.Exception.Message)"
+                Set-StageStatus 'ESS' 'FAILED - no certificate' 'Bad'; foreach($t in $noCert){ Add-GuidedRow $t.Box $act $false 'no Event Server certificate' $why }
+                Set-RunFailure $gn $noCert[0].Box.Name $why (Format-Err $_); return $false }
+            foreach($t in $noCert){ $t.State.EsTp = $newTp; $t.State.EsTpPresent = $true }
+        }
+    }
     $n=0
     foreach($t in $todo){
         $b=$t.Box; $n++; $tp=''
-        if($Want){
-            if(-not $t.State.EsTp -or -not $t.State.EsTpPresent){
-                $why = "The Event Server on $($b.Name) has no certificate yet (ServiceEndpoints.xml CertificateHash '$($t.State.EsTp)'). 'Server certificate' uses that certificate."
-                Set-StageStatus 'ESS' 'FAILED - no certificate' 'Bad'; Add-GuidedRow $b $act $false 'no Event Server certificate' $why
-                Set-RunFailure $gn $b.Name $why '' "Tick 'Event server and add-ons', click 'Turn encryption OFF', then 'Turn encryption ON': the Event Server step makes the certificate."; return $false }
-            $tp=[string]$t.State.EsTp }
+        if($Want){ $tp=[string]$t.State.EsTp }
         Set-StageStatus 'ESS' "$(if($todo.Count -gt 1){"Computer $n of $($todo.Count): "})$($b.Name): ServerConfigurator is running (turn 'Server certificate' $wt)..." 'Work'
         $t0=Get-Date; $logs=[System.Collections.Generic.List[string]]::new()
         $res=[pscustomobject]@{Target=$b.Target;Fqdn=$b.Addr;Ok=$false;Status='';Tp=$tp;Error='';Groups=$gn;Action=$(if($Want){'enable'}else{'disable'});Started=$t0;Ended=$null;DurationSec=0.0;Logs=$logs}
@@ -5185,15 +5220,13 @@ function Invoke-MsStage { param([bool]$Want)
     $todo=@($msBoxes | Where-Object { (Test-InScope $_) -and ($_.Encrypted -ne $Want -or $_.Half) })
     Add-SkipRows $msBoxes $todo $act $wt 'Management Server'
     if(-not $todo.Count){ Set-StageStatus 'MS' $(if($null -ne $script:Scope){'Nothing to change back'}else{"Already $wt - skipped"}) 'Skip'; return $true }
+    # Owner 2026-11-09: the "Event server and add-ons" section is optional - it never blocks the Management Server.
+    # Ticked, the Event Server step already ran before this one; unticked, it is left as it is.
     $esBoxes=@(Get-EsBoxes)
     if($Want -and $esBoxes.Count){
         Update-BoxStates $esBoxes
         $notEnc=@($esBoxes | Where-Object { $_.Encrypted -ne $true })
-        if($notEnc.Count){
-            $why="The Event Server is not encrypted yet ($((@($notEnc | ForEach-Object { $_.Name })) -join ', ')). It must be encrypted BEFORE the Management Server (afterwards it can no longer be changed)."
-            Set-StageStatus 'MS' 'BLOCKED - wrong order' 'Bad'; foreach($b in $todo){ Add-GuidedRow $b $act $false 'blocked by order check' $why }
-            Set-RunFailure 'Management Server' $todo[0].Name $why $notEnc[0].Detail; return $false }
-        Write-Log 'ORDER CHECK: the Event Server is encrypted - OK to encrypt the Management Server' 'Good'
+        if($notEnc.Count){ Write-Log "Event server and add-ons is not encrypted on $((@($notEnc | ForEach-Object { $_.Name })) -join ', ') - optional, left as it is. It can only be changed later while the Management Server is not encrypted." 'Info' }
     }
     if($script:MsCluster){ return (Invoke-ClusterStage 'MS' $Want $todo) }
     $ms=$script:MsBox
