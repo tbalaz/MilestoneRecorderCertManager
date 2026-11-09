@@ -124,7 +124,9 @@ powershell -ExecutionPolicy Bypass -STA -File .\Mrc-Doctor.ps1
 Fill in the same details as step 1 of the wizard, then click **Run checks**. When the checks
 finish, click **Open report**. It is **read-only**: it never changes anything on any server,
 including the WinRM TrustedHosts list. It checks every server with one connection each; recording
-servers are checked 32 at a time.
+servers are checked 32 at a time, and their names, WinRM ports and DNS records are checked all at once,
+so a few hundred recording servers take minutes. A recording server whose WinRM port (5985) does not
+answer within 5 seconds is reported as not reachable.
 
 | Area | What it checks |
 | --- | --- |

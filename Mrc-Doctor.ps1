@@ -288,7 +288,12 @@ function Get-RecorderFqdn {
 function Get-RecorderConnName { param([string]$HostName,[string]$DomainSuffix)
     $short = Normalize-RecorderHostName $HostName
     $full = ''
-    try { $full = ([string](Get-RecorderFqdn -HostName $short -DomainSuffix $DomainSuffix)).ToLowerInvariant() } catch {}
+    $pk = ([string]$short).ToLowerInvariant()
+    if((Test-Path variable:script:DnsPrefetch) -and $script:DnsPrefetch.ContainsKey($pk)){
+        # looked up already (Invoke-DnsPrefetch): the same rule as Get-RecorderFqdn, without asking DNS again
+        $h = [string]$script:DnsPrefetch[$pk].Host
+        $full = if($short -notmatch '^\d+$' -and $h -match '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$' -and ($h -split '\.')[0] -ieq $short){ $h } else { ('{0}.{1}' -f $short, (Get-DomainSuffix $DomainSuffix)).ToLowerInvariant() }
+    } else { try { $full = ([string](Get-RecorderFqdn -HostName $short -DomainSuffix $DomainSuffix)).ToLowerInvariant() } catch {} }
     if($full -and @(Resolve-HostIPv4 $full).Count){ return $full }
     $bare = $short.ToLowerInvariant()
     if(@(Resolve-HostIPv4 $bare).Count){ Write-Log "Recording server '$short': no full DNS name exists for it$(if($full){" ('$full' does not resolve)"}) - it is reached by the name Milestone has, '$bare'." }
@@ -337,7 +342,25 @@ function Get-VmsRecorderList { param([string]$Domain,[pscredential]$VmsCred,[str
     & $addMs $env:COMPUTERNAME
     $found=[System.Collections.Generic.List[object]]::new()
     $seenFqdn=@{}
-    foreach($rec in (Get-VmsRecordingServer | Sort-Object Name)){
+    $recList = @(Get-VmsRecordingServer | Sort-Object Name)
+    # Owner 2026-11-09 (400 recording servers took hours): every name lookup of the loop below is done first, all at once.
+    Clear-DnsPrefetch
+    try {   # the looked-up names are dropped again in finally - also when the loop throws
+    $pfNames = New-Object System.Collections.Generic.List[string]
+    foreach($rec in $recList){
+        $src0 = if(-not [string]::IsNullOrWhiteSpace($rec.HostName)){ [string]$rec.HostName } else { [string]$rec.Name }
+        if($src0 -match '^\d{1,3}(\.\d{1,3}){3}$' -or $src0.Trim() -match '\.'){ continue }
+        $s0 = Normalize-RecorderHostName $src0
+        $pfNames.Add([string]$s0); $pfNames.Add(('{0}.{1}' -f $s0, (Get-DomainSuffix $Domain)))
+    }
+    if($pfNames.Count){
+        $pfT0 = Get-Date
+        Invoke-DnsPrefetch -Names $pfNames.ToArray()
+        # the full names DNS gave for the short names: Get-RecorderConnName checks that they resolve
+        Invoke-DnsPrefetch -Names @($pfNames | ForEach-Object { $pk=([string]$_).ToLowerInvariant(); if($script:DnsPrefetch.ContainsKey($pk)){ [string]$script:DnsPrefetch[$pk].Host } } | Where-Object { $_ -match '\.' })
+        Write-Log "Discovery: $($recList.Count) recording server(s), their names looked up all at once ($([int]((Get-Date)-$pfT0).TotalSeconds) s)."
+    }
+    foreach($rec in $recList){
         $src= if(-not [string]::IsNullOrWhiteSpace($rec.HostName)){$rec.HostName}else{$rec.Name}
         $isIp = $src -match '^\d{1,3}(\.\d{1,3}){3}$'
         $srcTrim = ([string]$src).Trim()
@@ -360,6 +383,7 @@ function Get-VmsRecorderList { param([string]$Domain,[pscredential]$VmsCred,[str
         $seenFqdn[$dedupKey] = $true
         [void]$found.Add([pscustomobject]@{ Name=[string]$rec.Name; Target=$short; Fqdn=$fqdn })
     }
+    } finally { Clear-DnsPrefetch }
     Write-Log "Discovered $($found.Count) recording server(s)." 'Good'
     Disconnect-ManagementServer -ErrorAction SilentlyContinue
     $found.ToArray()
@@ -478,7 +502,50 @@ function Get-NodeKey { param([string]$Node) ([string]$Node).Trim().ToUpperInvari
 function Test-NodeIsLocal { param([string]$Node) (Get-NodeKey $Node) -eq $env:COMPUTERNAME.ToUpperInvariant() }
 function Forget-NodeConn { param([string]$Node) [void]$script:NodeConn.Remove((Get-NodeKey $Node)) }
 function Resolve-HostIPv4 { param([string]$Name)
+    $pk = ([string]$Name).Trim().ToLowerInvariant()
+    if((Test-Path variable:script:DnsPrefetch) -and $script:DnsPrefetch.ContainsKey($pk)){ return @($script:DnsPrefetch[$pk].V4) }   # looked up already (Invoke-DnsPrefetch)
     try { @([System.Net.Dns]::GetHostAddresses($Name) | Where-Object { $_.AddressFamily -eq 'InterNetwork' } | ForEach-Object { $_.IPAddressToString }) } catch { @() } }
+# Many DNS lookups at once (owner 2026-11-09: a client's 400 recording servers took hours, one lookup after another -
+# a name that does not resolve waits for DNS, LLMNR and NetBIOS each time). Fills $script:DnsPrefetch with
+# name -> @{ Host = the name DNS returns ('' = does not resolve); V4 = its IPv4 addresses }. Resolve-HostIPv4 and
+# Get-RecorderConnName read it; Clear-DnsPrefetch empties it, so every later lookup asks DNS again. Names only (an IP
+# address passes through Resolve-HostIPv4 unchanged); a lookup still running after -TimeoutMs is simply not stored.
+function Invoke-DnsPrefetch { param([string[]]$Names,[int]$TimeoutMs=30000)
+    if(-not (Test-Path variable:script:DnsPrefetch)){ $script:DnsPrefetch=@{} }
+    $tasks=@{}
+    foreach($n in @($Names)){
+        $k=([string]$n).Trim().ToLowerInvariant()
+        if(-not $k -or $k -match '^\d{1,3}(\.\d{1,3}){3}$' -or $script:DnsPrefetch.ContainsKey($k) -or $tasks.ContainsKey($k)){ continue }
+        try { $tasks[$k]=[System.Net.Dns]::GetHostEntryAsync($k) } catch { $script:DnsPrefetch[$k]=@{ Host=''; V4=@() } }
+    }
+    if(-not $tasks.Count){ return }
+    # .NET runs each lookup on a pool thread; without more threads the pool adds about one per second.
+    $wt=0; $io=0; [System.Threading.ThreadPool]::GetMinThreads([ref]$wt,[ref]$io)
+    if($wt -lt 128){ [void][System.Threading.ThreadPool]::SetMinThreads(128,$io) }
+    $deadline=(Get-Date).AddMilliseconds($TimeoutMs)
+    while(@($tasks.Values | Where-Object { -not $_.IsCompleted }).Count -and (Get-Date) -lt $deadline){ [System.Threading.Thread]::Sleep(100) }
+    foreach($k in @($tasks.Keys)){
+        $t=$tasks[$k]
+        if($t.Status -eq 'RanToCompletion'){
+            $e=$t.Result
+            $script:DnsPrefetch[$k]=@{ Host=([string]$e.HostName).TrimEnd('.').ToLowerInvariant(); V4=@($e.AddressList | Where-Object { $_.AddressFamily -eq 'InterNetwork' } | ForEach-Object { $_.IPAddressToString }) }
+        } elseif($t.IsCompleted){ $script:DnsPrefetch[$k]=@{ Host=''; V4=@() } }
+    }
+}
+function Clear-DnsPrefetch { $script:DnsPrefetch=@{} }
+# Test-LocalTarget, but a name already looked up by Invoke-DnsPrefetch is not asked again (same rule otherwise). Only
+# for loops over many recording servers: the prefetch lives for that loop, so a cluster role address that moves
+# between nodes is never judged from an old answer.
+function Test-LocalTargetPf { param([string]$Target)
+    $t=([string]$Target).Trim().ToLowerInvariant()
+    if(-not $t -or -not (Test-Path variable:script:DnsPrefetch) -or -not $script:DnsPrefetch.ContainsKey($t)){ return (Test-LocalTarget $Target) }
+    if($t -in @('localhost','127.0.0.1','::1')){ return $true }
+    $cn=$env:COMPUTERNAME.ToLowerInvariant()
+    if($t -eq $cn -or $t.Split('.')[0] -eq $cn){ return $true }
+    $mine=@(); try { $mine=@([System.Net.Dns]::GetHostAddresses([System.Net.Dns]::GetHostName()) | ForEach-Object { $_.IPAddressToString }) } catch {}
+    foreach($ip in @($script:DnsPrefetch[$t].V4)){ if($mine -contains $ip){ return $true } }
+    $false
+}
 function Register-NodeAddresses { param($Cl)
     if($Cl.PSObject.Properties['ClusterIps']){ foreach($ip in @($Cl.ClusterIps)){ if($ip){ $script:ClusterIpSet[[string]$ip]=$true } } }
     foreach($n in @($Cl.Nodes)){
@@ -951,7 +1018,7 @@ function Initialize-Targets { param([string]$ManualList,[bool]$Discover)
     }
     $list=[System.Collections.Generic.List[object]]::new(); $seen=@{}
     $add={ param([string]$Name,[string]$Target,[string]$Addr)
-        if((Test-LocalTarget $Addr) -or (Test-LocalTarget $Target)){ Write-Log "Recording server '$Name' runs on this Management Server - it is covered by the Management Server step, not handled separately."; return }
+        if((Test-LocalTargetPf $Addr) -or (Test-LocalTargetPf $Target)){ Write-Log "Recording server '$Name' runs on this Management Server - it is covered by the Management Server step, not handled separately."; return }
         if($script:MsCluster -and @(@($script:MsCluster.Nodes) | Where-Object { [string]$_.Name -eq $Target -or [string]$_.Fqdn -eq $Addr }).Count){ Write-Log "Recording server '$Name' runs on Management Server cluster node $Target - it is covered by the Management Server step, not handled separately."; return }
         $k=$Target.ToUpperInvariant(); if($seen.ContainsKey($k)){ return }; $seen[$k]=$true
         [void]$list.Add((New-Box 'Recording server' $Name $Target $Addr $script:RecCred)) }
@@ -966,11 +1033,15 @@ function Initialize-Targets { param([string]$ManualList,[bool]$Discover)
         if($tp.Count -ge 2 -and $tp[1].Trim()){ try { $typed[(Normalize-RecorderHostName $tp[0])]=$tp[1].Trim() } catch {} }
     }
     if($Discover){
-        try { foreach($r in @(Get-VmsRecorderList -Domain $script:DomainName -VmsCred $script:AdminCred -MsAddrText $vmsAddr)){
+        try { $disc=@(Get-VmsRecorderList -Domain $script:DomainName -VmsCred $script:AdminCred -MsAddrText $vmsAddr)
+              # 'is it this computer?' for every recorder: the names looked up all at once first (owner 2026-11-09, 400 recorders)
+              Invoke-DnsPrefetch -Names @(@($disc | ForEach-Object { [string]$_.Target; [string]$_.Fqdn }) + @($typed.Values))
+              foreach($r in $disc){
                   $tk=([string]$r.Target).ToUpperInvariant()
                   if($typed.ContainsKey($tk)){ Write-Log "Recording server '$($r.Name)': the address you typed ($($typed[$tk])) is used instead of the discovered $($r.Fqdn)." 'Good'; & $add $r.Name $r.Target $typed[$tk] }
                   else { & $add $r.Name $r.Target $r.Fqdn } } }
         catch { $discErr=([string]$_.Exception.Message).Trim(); Write-Log "Recording server discovery failed: $(Format-Err $_)" 'Err' }
+        finally { Clear-DnsPrefetch }
     }
     foreach($h in @(([string]$ManualList) -split '[;,\r\n]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ -and -not $_.StartsWith('#') })){
         $parts=$h -split '=',2
@@ -1534,6 +1605,55 @@ function New-BoxFactsSkeleton { param($Box)
         ClockOffsetSec=$null; ClockUncertaintySec=$null
     }
 }
+# Ports probed from THIS computer per role (NET-3).
+function Get-ProbePorts { param([string]$Kind) switch ($Kind) { 'MS' { @(80,443,9000,9001) } 'ES' { @(22331) } default { @(7563,9001) } } }
+# One TCP port on many computers at once: host -> $true when it accepted the connection within -TimeoutMs.
+function Test-TcpPortMany { param([string[]]$Hosts,[int]$Port,[int]$TimeoutMs=3000)
+    $r=@{}; $pend=@{}
+    foreach($h in @(@($Hosts) | Where-Object { $_ } | Select-Object -Unique)){
+        $tc = New-Object System.Net.Sockets.TcpClient
+        try { $pend[$h]=@{ Tc=$tc; Iar=$tc.BeginConnect($h,$Port,$null,$null) } } catch { $r[$h]=$false; try { $tc.Close() } catch {} }
+    }
+    $deadline=(Get-Date).AddMilliseconds($TimeoutMs)
+    while(@($pend.Values | Where-Object { -not $_.Iar.IsCompleted }).Count -and (Get-Date) -lt $deadline){ [System.Threading.Thread]::Sleep(100) }
+    foreach($h in @($pend.Keys)){
+        $p=$pend[$h]; $ok=$false
+        if($p.Iar.IsCompleted){ try { $p.Tc.EndConnect($p.Iar); $ok=[bool]$p.Tc.Connected } catch {} }
+        try { $p.Tc.Close() } catch {}
+        $r[$h]=$ok
+    }
+    $r
+}
+# DNS (NET-2) and port probe (NET-3) for MANY boxes at once - the same facts as Add-LocalFacts (owner 2026-11-09:
+# one box after another took up to ~10 s for each recording server that does not answer). $Items: @{ F; Box } each.
+function Add-LocalFactsMany { param([object[]]$Items)
+    if(-not @($Items).Count){ return }
+    $t0 = Get-Date
+    $fwdOf=@{}
+    try {
+        Invoke-DnsPrefetch -Names @(@($Items) | ForEach-Object { [string]$_.Box.Target })
+        foreach($it in @($Items)){ $tg=[string]$it.Box.Target; if(-not $fwdOf.ContainsKey($tg)){ $fwdOf[$tg]=@(Resolve-HostIPv4 $tg) } }
+    } finally { Clear-DnsPrefetch }
+    $rev=@{}
+    foreach($ips in @($fwdOf.Values)){ foreach($ip in @($ips)){ if($ip -and -not $rev.ContainsKey($ip)){ try { $rev[$ip]=[System.Net.Dns]::GetHostEntryAsync($ip) } catch {} } } }
+    $deadline=(Get-Date).AddMilliseconds(30000)
+    while(@($rev.Values | Where-Object { -not $_.IsCompleted }).Count -and (Get-Date) -lt $deadline){ [System.Threading.Thread]::Sleep(100) }
+    $portOpen=@{}
+    $allPorts=@(@($Items) | ForEach-Object { Get-ProbePorts $_.F.Kind } | Select-Object -Unique)
+    foreach($p in $allPorts){
+        $hosts=@(@($Items) | Where-Object { @(Get-ProbePorts $_.F.Kind) -contains $p } | ForEach-Object { [string]$_.Box.Addr })
+        $portOpen[$p]=Test-TcpPortMany -Hosts $hosts -Port $p -TimeoutMs 3000
+    }
+    foreach($it in @($Items)){
+        $f=$it.F; $b=$it.Box
+        $fwd=@($fwdOf[[string]$b.Target])
+        $names=New-Object System.Collections.Generic.List[string]
+        foreach($ip in $fwd){ $t=$rev[$ip]; if($t -and $t.Status -eq 'RanToCompletion'){ $names.Add([string]$t.Result.HostName) } }
+        $f.Dns=[pscustomobject]@{ Forward=$fwd; Reverse=$names.ToArray() }
+        $f.PortProbe=@(foreach($p in @(Get-ProbePorts $f.Kind)){ [pscustomobject]@{ Port=$p; Open=[bool]$portOpen[$p][[string]$b.Addr] } })
+    }
+    Write-Log "Recording servers: DNS and port checks from this computer for $(@($Items).Count), all at once ($([int]((Get-Date)-$t0).TotalSeconds) s)."
+}
 # DNS (NET-2) and TCP port probe (NET-3) - always from THIS computer, regardless of WinRM reachability.
 function Add-LocalFacts { param($f,$Box)
     $kind = $f.Kind
@@ -1543,7 +1663,7 @@ function Add-LocalFacts { param($f,$Box)
         foreach ($ip in $fwd) { try { $rev.Add(([System.Net.Dns]::GetHostEntry($ip)).HostName) } catch {} }
         $f.Dns = [pscustomobject]@{ Forward=$fwd; Reverse=$rev.ToArray() }
     } catch { $f.Dns = [pscustomobject]@{ Forward=@(); Reverse=@() } }
-    $probePorts = switch ($kind) { 'MS' { @(80,443,9000,9001) } 'ES' { @(22331) } default { @(7563,9001) } }
+    $probePorts = Get-ProbePorts $kind
     $portRows = New-Object System.Collections.Generic.List[object]
     foreach ($p in $probePorts) {
         $open = $false
@@ -1568,18 +1688,85 @@ function Get-BoxFacts { param($Box)
 }
 # All recorders, ONE Invoke-Command -ComputerName @(addresses) -ThrottleLimit 32 fan-out (verbatim
 # Invoke-RecorderFanOut, resolved connection addresses via Get-ConnAddr first) - never one-by-one.
+# Owner 2026-11-09: a client's 400 recording servers took hours. Invoke-RecorderFanOut (verbatim with Mrc-Guided.ps1)
+# checks the connection of each recorder one after another first - up to 20 s for every one that does not answer.
+# This Doctor-only fan-out never goes one by one: 1. the WinRM port of every recorder is probed at once; one that does
+# not answer is not tried; 2. one fan-out to the others by their own address; 3. those that answered on the port but
+# not by name (Kerberos): their IPv4 addresses are asked who they are in ONE fan-out (with a local account the address
+# must answer as that computer, as in Find-IpConnection); 4. one more fan-out to the addresses found. Read-only.
+function Invoke-DoctorFanOut { param([object[]]$Boxes,[scriptblock]$Sb,[object[]]$ArgumentList=@())
+    $res=@{}; $connOf=@{}; $script:FanOutPortClosed=@{}
+    $c = Get-First -Items @(@($Boxes) | ForEach-Object { $_.Cred } | Where-Object { $_ })
+    $fan = { param([string[]]$Addrs,[scriptblock]$Block,[object[]]$ArgList)
+        $out=@{}
+        if(@($Addrs).Count){
+            $ev=$null
+            $p=@{ ComputerName=@($Addrs); ScriptBlock=$Block; SessionOption=$script:SessOpt; ThrottleLimit=32; ErrorAction='SilentlyContinue'; ErrorVariable='ev' }
+            if(@($ArgList).Count){ $p.ArgumentList=@($ArgList) }
+            if($c){ $p.Credential=$c }
+            foreach($o in @(Invoke-Command @p)){ $out[[string]$o.PSComputerName]=$o }
+        }
+        $out }
+    $t0 = Get-Date
+    Invoke-DnsPrefetch -Names @(@($Boxes) | ForEach-Object { [string]$_.Addr })
+    try {
+    $probe = @(@($Boxes) | ForEach-Object { [string]$_.Addr } | Where-Object { $_ -and -not (Test-LocalTargetPf $_) -and -not $script:ConnCache.ContainsKey(([string]$_).Trim().ToLowerInvariant()) } | Select-Object -Unique)
+    $open = Test-TcpPortMany -Hosts $probe -Port 5985 -TimeoutMs 5000
+    $direct = New-Object System.Collections.Generic.List[string]
+    foreach($b in @($Boxes)){
+        $a=[string]$b.Addr; $k=$a.Trim().ToLowerInvariant()
+        if(Test-LocalTargetPf $a){ $connOf[$a]=$a }
+        elseif($script:ConnCache.ContainsKey($k)){ $connOf[$a]=[string]$script:ConnCache[$k] }
+        elseif($open[$a]){ $connOf[$a]=$a; $direct.Add($a) }
+        else { $script:FanOutPortClosed[$a]=$true }
+    }
+    $nOpen = @($probe | Where-Object { $open[$_] }).Count
+    Write-Log "Recording servers: the WinRM port (5985) answers on $nOpen of $(@($probe).Count), all checked at once ($([int]((Get-Date)-$t0).TotalSeconds) s)$(if(@($probe).Count -gt $nOpen){'; the others are not tried'})."
+    $t1 = Get-Date
+    $byAddr = & $fan @(@($connOf.Values) | Select-Object -Unique) $Sb $ArgumentList
+    Write-Log "Recording servers: facts collected from $($byAddr.Count) in one fan-out, 32 at a time ($([int]((Get-Date)-$t1).TotalSeconds) s)."
+    $retry = @($direct | Where-Object { -not $byAddr.ContainsKey($_) })
+    if($retry.Count){
+        $t2 = Get-Date
+        $ipsOf=@{}; $allIps=@{}
+        foreach($a in $retry){ $ips=@(Resolve-HostIPv4 $a | Where-Object { $_ -ne $a -and -not (Test-LocalTarget $_) }); if($ips.Count){ $ipsOf[$a]=$ips; foreach($ip in $ips){ $allIps[$ip]=$true } } }
+        if($allIps.Count){
+            Ensure-TrustedHosts -Hosts @($allIps.Keys)
+            $who = & $fan @($allIps.Keys) { $env:COMPUTERNAME } @()
+            $second=@{}
+            foreach($a in @($ipsOf.Keys)){
+                $bx = Get-First -Items @(@($Boxes) | Where-Object { [string]$_.Addr -eq $a })
+                $same = Test-LocalCred $bx.Cred $a
+                foreach($ip in @($ipsOf[$a])){
+                    if(-not $who.ContainsKey($ip)){ continue }
+                    $cn=[string]$who[$ip]
+                    if($same -and -not (Test-SameHostName $cn $a)){ Write-Log "[$a] address ${ip} answers as $cn, not as $a - not used." 'Err'; continue }
+                    $script:ConnCache[$a.Trim().ToLowerInvariant()]=$ip; $connOf[$a]=$ip; $second[$ip]=$true
+                    Write-Log "[$a] connected by IP address $ip (answers as $cn) because the name could not be used."
+                    break
+                }
+            }
+            if($second.Count){ $more = & $fan @($second.Keys) $Sb $ArgumentList; foreach($kk in @($more.Keys)){ $byAddr[$kk]=$more[$kk] } }
+        }
+        Write-Log "Recording servers: $($retry.Count) answered on the port but not by name - tried by IP address, all at once ($([int]((Get-Date)-$t2).TotalSeconds) s)."
+    }
+    foreach($b in @($Boxes)){ $conn=$connOf[[string]$b.Addr]; if($conn -and $byAddr.ContainsKey($conn)){ $res[[string]$b.Addr]=$byAddr[$conn] } }
+    } finally { Clear-DnsPrefetch }
+    $res
+}
 function Invoke-CollectBundleFanOut { param([object[]]$Boxes)
     if (-not @($Boxes).Count) { return @() }
     $jobs = Get-CollectJobs 'REC'
     $ciText = $script:CertInfoSb.ToString(); $kaText = $script:KeyAccessSb.ToString(); $svcDn = Get-SvcDisplayFor 'REC'
     $t0 = [DateTime]::UtcNow
-    $byAddr = Invoke-RecorderFanOut -Boxes $Boxes -Sb $script:CollectBundleSb -ArgumentList @($jobs,$ciText,$kaText,$svcDn)
+    $byAddr = Invoke-DoctorFanOut -Boxes $Boxes -Sb $script:CollectBundleSb -ArgumentList @($jobs,$ciText,$kaText,$svcDn)
     $t1 = [DateTime]::UtcNow
-    foreach ($b in @($Boxes)) {
-        $f = [pscustomobject](New-BoxFactsSkeleton $b)
-        Add-LocalFacts $f $b
+    $items = @(foreach ($b in @($Boxes)) { @{ F=[pscustomobject](New-BoxFactsSkeleton $b); Box=$b } })
+    Add-LocalFactsMany $items
+    foreach ($it in $items) {
+        $b = $it.Box; $f = $it.F
         $out = if ($byAddr.ContainsKey([string]$b.Addr)) { $byAddr[[string]$b.Addr] } else { $null }
-        $connErr = if (-not $out) { 'could not be reached over WinRM (fan-out) - check it is powered on and WinRM is enabled' } else { '' }
+        $connErr = if (-not $out) { 'could not be reached over WinRM (fan-out) - check it is powered on and WinRM is enabled' + $(if ($script:FanOutPortClosed.ContainsKey([string]$b.Addr)) { ' (the WinRM port 5985 did not answer within 5 s)' } else { '' }) } else { '' }
         $bundle = [pscustomobject]@{ Out=$out; ConnError=$connErr; T0=$t0; T1=$t1 }
         Complete-BoxFacts $f $false $bundle
     }
@@ -1820,7 +2007,7 @@ function Test-NET2 { param($Result)
     if ($Result.ClusterMs) { foreach ($ip in @($Result.ClusterMs.ClusterIps)) { $clusterIps.Add([string]$ip) } }
     if ($Result.ClusterEs) { foreach ($ip in @($Result.ClusterEs.ClusterIps)) { $clusterIps.Add([string]$ip) } }
     foreach($b in @($Result.Boxes)){
-        if(Test-LocalTarget $b.Addr){ continue }
+        if(Test-LocalTargetPf $b.Addr){ continue }
         if(-not $b.Dns -or @($b.Dns.Forward).Count -eq 0){
             $rows += New-Row 'NET-2' 'NET' 'FAIL' $b.Name 'DNS resolution' "'$($b.Target)' does not resolve to an IP address from $($Result.MsComputer)." 'Add an A/host record for this computer, or use its IP address instead.'
             continue
@@ -2676,7 +2863,8 @@ function Invoke-DoctorRun {
     Write-Log 'Collecting facts (read-only)...'
     $result = Invoke-DoctorCollect
     Write-Log 'Evaluating...'
-    $rows = Invoke-DoctorEvaluate $result
+    Invoke-DnsPrefetch -Names @(@($result.Boxes) | ForEach-Object { [string]$_.Addr })   # NET-2 asks 'is it this computer?' per box
+    try { $rows = Invoke-DoctorEvaluate $result } finally { Clear-DnsPrefetch }
     $gate = $null
     if ($script:GateName) { $gate = Get-DoctorGate $result $rows $script:GateName @($script:AcceptList) $script:AcceptReasonText }
     $paths = Save-DoctorReport $result $rows $gate
@@ -2700,33 +2888,50 @@ function New-DoctorCheck { param([string]$Text,[int]$X,[int]$Y,[int]$W=560)
     $c=[Windows.Forms.CheckBox]::new(); $c.Text=$Text; $c.Location=[Drawing.Point]::new($X,$Y); $c.Size=[Drawing.Size]::new($W,26); $c }
 
 function Build-DoctorWindow {
+    # Same look as Mrc-Guided.ps1 (owner 2026-11-09: "so it looks like it's part of same set of scripts"): Segoe UI 11,
+    # the blue header, the bottom button bar, the 24 / 320 / 656 columns. Fill child first (WinForms docks in reverse z-order).
     $script:Form = [Windows.Forms.Form]::new()
     $script:Form.Text = 'Milestone XProtect Doctor (read-only health check)'
-    $script:Form.Size = [Drawing.Size]::new(720,760)
     $script:Form.StartPosition = 'CenterScreen'
-    $script:Form.MinimumSize = [Drawing.Size]::new(720,660)   # nothing is cut off at the smallest size (tools\Test-GuidedLayout.ps1 -Script Mrc-Doctor.ps1)
-
-    $y=16
-    $script:Form.Controls.Add((New-DoctorLabel 'Domain (DNS suffix):' 16 $y 200)); $script:DomainBox=New-UiText 230 $y 300 ([string]$script:Defaults.Domain); $script:Form.Controls.Add($script:DomainBox); $y+=34
-    $script:NoEsChk = New-DoctorCheck 'The Event Server is on this computer, or not installed' 16 $y 620; $script:Form.Controls.Add($script:NoEsChk); $y+=30
-    $script:Form.Controls.Add((New-DoctorLabel 'Event Server host:' 16 $y 200)); $script:EsHostBox=New-UiText 230 $y 300 ([string]$script:Defaults.EsHost); $script:Form.Controls.Add($script:EsHostBox); $y+=34
-    $script:Form.Controls.Add((New-DoctorLabel 'Admin account:' 16 $y 200)); $script:AdminUserBox=New-UiText 230 $y 300 ([string]$script:Defaults.MsUser); $script:Form.Controls.Add($script:AdminUserBox); $y+=34
-    $script:Form.Controls.Add((New-DoctorLabel 'Admin password:' 16 $y 200)); $script:AdminPwBox=New-UiText 230 $y 300 '' $true; $script:Form.Controls.Add($script:AdminPwBox); $y+=34
-    $script:RecSepChk = New-DoctorCheck 'Recording servers use a different account' 16 $y 500; $script:Form.Controls.Add($script:RecSepChk); $y+=30
-    $script:Form.Controls.Add((New-DoctorLabel 'Recording server account:' 16 $y 200)); $script:RecUserBox=New-UiText 230 $y 300 ([string]$script:Defaults.RecUser); $script:Form.Controls.Add($script:RecUserBox); $y+=34
-    $script:Form.Controls.Add((New-DoctorLabel 'Recording server password:' 16 $y 200)); $script:RecPwBox=New-UiText 230 $y 300 '' $true; $script:Form.Controls.Add($script:RecPwBox); $y+=34
-    $script:Form.Controls.Add((New-DoctorLabel 'Extra recording servers (one per line, name or name=IP; blank = discover from the VMS):' 16 $y 660)); $y+=24
+    $script:DocFont = [Drawing.Font]::new('Segoe UI',11); $script:DocBold = [Drawing.Font]::new('Segoe UI',11,[Drawing.FontStyle]::Bold)
+    $script:Form.Font = $script:DocFont
+    $script:Form.ClientSize = [Drawing.Size]::new(1000,700)
+    $script:Form.MinimumSize = [Drawing.Size]::new($script:Form.Width,600)   # never narrower than the layout (tools\Test-GuidedLayout.ps1 -Script Mrc-Doctor.ps1)
+    $script:Content = [Windows.Forms.Panel]::new(); $script:Content.Size=[Drawing.Size]::new(1000,582); $script:Content.Dock='Fill'; $script:Content.AutoScroll=$true
+    $hdr = [Windows.Forms.Panel]::new(); $hdr.Size=[Drawing.Size]::new(1000,62); $hdr.Dock='Top'; $hdr.BackColor=[Drawing.Color]::FromArgb(32,56,100)
+    $script:Nav = [Windows.Forms.Panel]::new(); $script:Nav.Size=[Drawing.Size]::new(1000,56); $script:Nav.Dock='Bottom'
+    $script:Form.Controls.Add($script:Content); $script:Form.Controls.Add($hdr); $script:Form.Controls.Add($script:Nav)
+    $t = New-DoctorLabel 'Milestone XProtect - health check' 20 4 900 30; $t.Font=[Drawing.Font]::new('Segoe UI',15,[Drawing.FontStyle]::Bold); $t.ForeColor=[Drawing.Color]::White; $hdr.Controls.Add($t)
+    $t = New-DoctorLabel 'Read-only: nothing is changed on any server.' 22 34 900 24; $t.ForeColor=[Drawing.Color]::White; $hdr.Controls.Add($t)
+    $c = $script:Content
+    $c.Controls.Add((New-DoctorLabel 'Fill in the same details as step 1 of the guided wizard, then click Run checks.' 24 6 950 28))
+    $c.Controls.Add((New-DoctorLabel 'DNS domain of these computers:' 24 38 290 30)); $script:DomainBox=New-UiText 320 40 320 ([string]$script:Defaults.Domain); $c.Controls.Add($script:DomainBox); $c.Controls.Add((New-DoctorLabel 'for example company.local' 656 38 320 30))
+    $c.Controls.Add((New-DoctorLabel 'Event Server computer:' 24 70 290 30)); $script:EsHostBox=New-UiText 320 72 320 ([string]$script:Defaults.EsHost); $c.Controls.Add($script:EsHostBox); $c.Controls.Add((New-DoctorLabel 'its name or IP address' 656 70 320 30))
+    $script:NoEsChk = New-DoctorCheck 'The Event Server is on this computer, or not installed' 320 100 560; $c.Controls.Add($script:NoEsChk)
+    $c.Controls.Add((New-DoctorLabel 'Admin account:' 24 130 290 30)); $script:AdminUserBox=New-UiText 320 132 320 ([string]$script:Defaults.MsUser); $c.Controls.Add($script:AdminUserBox); $c.Controls.Add((New-DoctorLabel 'for example COMPANY\Administrator' 656 130 320 30))
+    $c.Controls.Add((New-DoctorLabel 'Admin password:' 24 162 290 30)); $script:AdminPwBox=New-UiText 320 164 320 '' $true; $c.Controls.Add($script:AdminPwBox)
+    $script:RecSepChk = New-DoctorCheck 'Recording servers use a different account' 320 192 560; $c.Controls.Add($script:RecSepChk)
+    $c.Controls.Add((New-DoctorLabel 'Recording server account:' 24 222 290 30)); $script:RecUserBox=New-UiText 320 224 320 ([string]$script:Defaults.RecUser); $c.Controls.Add($script:RecUserBox)
+    $c.Controls.Add((New-DoctorLabel 'Recording server password:' 24 254 290 30)); $script:RecPwBox=New-UiText 320 256 320 '' $true; $c.Controls.Add($script:RecPwBox)
+    $t = New-DoctorLabel 'Extra recording servers (optional, one per line):' 24 290 290 46; $t.TextAlign='TopLeft'; $c.Controls.Add($t)
     $script:ManualRecBox=[Windows.Forms.TextBox]::new(); $script:ManualRecBox.Multiline=$true; $script:ManualRecBox.ScrollBars='Vertical'
-    $script:ManualRecBox.Location=[Drawing.Point]::new(16,$y); $script:ManualRecBox.Size=[Drawing.Size]::new(($script:Form.ClientSize.Width-32),64); $script:ManualRecBox.Anchor='Top,Left,Right'; $script:Form.Controls.Add($script:ManualRecBox); $y+=74
-    $script:Form.Controls.Add((New-DoctorLabel 'Search folders for ServerConfigurator.exe (; separated):' 16 $y 660)); $y+=24
-    $script:SearchPathsBox=New-UiText 16 $y ($script:Form.ClientSize.Width-32) ([string]$script:Defaults.SearchPaths); $script:SearchPathsBox.Anchor='Top,Left,Right'; $script:Form.Controls.Add($script:SearchPathsBox); $y+=36
-    $script:RunBtn = New-DoctorButton 'Run checks' 16 $y 200 40; $script:Form.Controls.Add($script:RunBtn)
-    $script:OpenReportBtn = New-DoctorButton 'Open report' 230 $y 200 40; $script:OpenReportBtn.Enabled=$false; $script:Form.Controls.Add($script:OpenReportBtn)
-    $script:OpenLogBtn = New-DoctorButton 'Open log' 444 $y 200 40; $script:Form.Controls.Add($script:OpenLogBtn); $y+=50
-    $script:StatusLabel = New-DoctorLabel '' 16 $y 660 24; $script:StatusLabel.ForeColor=[Drawing.Color]::DarkOrange; $script:Form.Controls.Add($script:StatusLabel); $y+=26
-    $script:CountsLabel = New-DoctorLabel '' 16 $y 660 24; $script:Form.Controls.Add($script:CountsLabel); $y+=30
-    $script:Log = [Windows.Forms.RichTextBox]::new(); $script:Log.Location=[Drawing.Point]::new(16,$y); $script:Log.Size=[Drawing.Size]::new(($script:Form.ClientSize.Width-32),[Math]::Max(60,($script:Form.ClientSize.Height-$y-12))); $script:Log.ReadOnly=$true   # ends inside the window: it used to run 39 px below the edge
-    $script:Log.Anchor='Top,Bottom,Left,Right'; $script:Log.Font=[Drawing.Font]::new('Consolas',9); $script:Form.Controls.Add($script:Log)
+    $script:ManualRecBox.Location=[Drawing.Point]::new(320,290); $script:ManualRecBox.Size=[Drawing.Size]::new(320,46); $c.Controls.Add($script:ManualRecBox)
+    $t = New-DoctorLabel 'NAME or NAME=IP. Blank = every recording server the Management Server knows.' 656 290 320 46; $t.TextAlign='TopLeft'; $c.Controls.Add($t)
+    $c.Controls.Add((New-DoctorLabel 'Search folders (optional):' 24 344 290 30))
+    $script:SearchPathsBox=New-UiText 320 346 320 ([string]$script:Defaults.SearchPaths); $c.Controls.Add($script:SearchPathsBox)
+    $t = New-DoctorLabel 'Only if Milestone is not in C:\Program Files. Separate folders with ;' 656 340 320 46; $t.TextAlign='TopLeft'; $c.Controls.Add($t)
+    $script:StatusLabel = New-DoctorLabel '' 24 388 950 26; $script:StatusLabel.Font=$script:DocBold; $script:StatusLabel.ForeColor=[Drawing.Color]::DarkOrange; $c.Controls.Add($script:StatusLabel)
+    $script:CountsLabel = New-DoctorLabel '' 24 416 950 28; $script:CountsLabel.Font=$script:DocBold; $c.Controls.Add($script:CountsLabel)
+    $script:Log = [Windows.Forms.RichTextBox]::new(); $script:Log.Location=[Drawing.Point]::new(24,448); $script:Log.Size=[Drawing.Size]::new(950,124); $script:Log.ReadOnly=$true
+    $script:Log.Anchor='Top,Bottom,Left,Right'; $script:Log.Font=[Drawing.Font]::new('Consolas',9); $c.Controls.Add($script:Log)
+    $c.AutoScrollMinSize=[Drawing.Size]::new(0,520)   # a short window scrolls instead of squeezing the log box
+    $script:OpenLogBtn = New-DoctorButton 'Open log' 24 8 150 40; $script:Nav.Controls.Add($script:OpenLogBtn)
+    $script:OpenReportBtn = New-DoctorButton 'Open report' 184 8 180 40; $script:OpenReportBtn.Enabled=$false; $script:Nav.Controls.Add($script:OpenReportBtn)
+    $script:RunBtn = New-DoctorButton 'Run checks' 800 8 170 40; $script:RunBtn.Anchor='Top,Right'; $script:RunBtn.Font=$script:DocBold; $script:Nav.Controls.Add($script:RunBtn)
+    # As in the wizard: the Event Server box only when the Event Server is elsewhere, the recorder account only when ticked.
+    $script:NoEsChk.Add_CheckedChanged({ $script:EsHostBox.Enabled = -not $script:NoEsChk.Checked })
+    $script:RecSepChk.Add_CheckedChanged({ $script:RecUserBox.Enabled=$script:RecSepChk.Checked; $script:RecPwBox.Enabled=$script:RecSepChk.Checked })
+    $script:RecUserBox.Enabled=$false; $script:RecPwBox.Enabled=$false
 
     $script:RunBtn.Add_Click({
         $script:RunBtn.Enabled=$false; $script:OpenReportBtn.Enabled=$false; $script:StatusLabel.Text='Running checks - this can take a few minutes (recorders are checked in parallel). Nothing is changed.'
@@ -2744,6 +2949,7 @@ function Build-DoctorWindow {
     $script:OpenReportBtn.Add_Click({ if($script:LastReportHtml -and (Test-Path -LiteralPath $script:LastReportHtml)){ Start-Process $script:LastReportHtml } })
     $script:OpenLogBtn.Add_Click({ $p=Save-UiLog; if($p -and (Test-Path -LiteralPath $p)){ Start-Process notepad.exe $p } })
     # A screen lower than the window (1366 x 768, or 1920 x 1080 at 150 %): fit the window to the working area.
+    $script:Form.AutoScaleDimensions=[Drawing.SizeF]::new(96,96); $script:Form.AutoScaleMode='Dpi'   # set AFTER all controls exist, as in the wizard
     $script:Form.Add_Shown({ $wa=[Windows.Forms.Screen]::FromControl($script:Form).WorkingArea; if($script:Form.Height -gt $wa.Height){ $script:Form.Top=$wa.Top; $script:Form.Height=$wa.Height } })
 }
 

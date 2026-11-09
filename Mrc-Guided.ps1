@@ -2057,7 +2057,12 @@ function Connect-VmsAny { param([string[]]$Urls,[pscredential]$Cred,[switch]$All
 function Get-RecorderConnName { param([string]$HostName,[string]$DomainSuffix)
     $short = Normalize-RecorderHostName $HostName
     $full = ''
-    try { $full = ([string](Get-RecorderFqdn -HostName $short -DomainSuffix $DomainSuffix)).ToLowerInvariant() } catch {}
+    $pk = ([string]$short).ToLowerInvariant()
+    if((Test-Path variable:script:DnsPrefetch) -and $script:DnsPrefetch.ContainsKey($pk)){
+        # looked up already (Invoke-DnsPrefetch): the same rule as Get-RecorderFqdn, without asking DNS again
+        $h = [string]$script:DnsPrefetch[$pk].Host
+        $full = if($short -notmatch '^\d+$' -and $h -match '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$' -and ($h -split '\.')[0] -ieq $short){ $h } else { ('{0}.{1}' -f $short, (Get-DomainSuffix $DomainSuffix)).ToLowerInvariant() }
+    } else { try { $full = ([string](Get-RecorderFqdn -HostName $short -DomainSuffix $DomainSuffix)).ToLowerInvariant() } catch {} }
     if($full -and @(Resolve-HostIPv4 $full).Count){ return $full }
     $bare = $short.ToLowerInvariant()
     if(@(Resolve-HostIPv4 $bare).Count){ Write-Log "Recording server '$short': no full DNS name exists for it$(if($full){" ('$full' does not resolve)"}) - it is reached by the name Milestone has, '$bare'." }
@@ -2106,7 +2111,25 @@ function Get-VmsRecorderList { param([string]$Domain,[pscredential]$VmsCred,[str
     & $addMs $env:COMPUTERNAME
     $found=[System.Collections.Generic.List[object]]::new()
     $seenFqdn=@{}
-    foreach($rec in (Get-VmsRecordingServer | Sort-Object Name)){
+    $recList = @(Get-VmsRecordingServer | Sort-Object Name)
+    # Owner 2026-11-09 (400 recording servers took hours): every name lookup of the loop below is done first, all at once.
+    Clear-DnsPrefetch
+    try {   # the looked-up names are dropped again in finally - also when the loop throws
+    $pfNames = New-Object System.Collections.Generic.List[string]
+    foreach($rec in $recList){
+        $src0 = if(-not [string]::IsNullOrWhiteSpace($rec.HostName)){ [string]$rec.HostName } else { [string]$rec.Name }
+        if($src0 -match '^\d{1,3}(\.\d{1,3}){3}$' -or $src0.Trim() -match '\.'){ continue }
+        $s0 = Normalize-RecorderHostName $src0
+        $pfNames.Add([string]$s0); $pfNames.Add(('{0}.{1}' -f $s0, (Get-DomainSuffix $Domain)))
+    }
+    if($pfNames.Count){
+        $pfT0 = Get-Date
+        Invoke-DnsPrefetch -Names $pfNames.ToArray()
+        # the full names DNS gave for the short names: Get-RecorderConnName checks that they resolve
+        Invoke-DnsPrefetch -Names @($pfNames | ForEach-Object { $pk=([string]$_).ToLowerInvariant(); if($script:DnsPrefetch.ContainsKey($pk)){ [string]$script:DnsPrefetch[$pk].Host } } | Where-Object { $_ -match '\.' })
+        Write-Log "Discovery: $($recList.Count) recording server(s), their names looked up all at once ($([int]((Get-Date)-$pfT0).TotalSeconds) s)."
+    }
+    foreach($rec in $recList){
         $src= if(-not [string]::IsNullOrWhiteSpace($rec.HostName)){$rec.HostName}else{$rec.Name}
         $isIp = $src -match '^\d{1,3}(\.\d{1,3}){3}$'
         $srcTrim = ([string]$src).Trim()
@@ -2129,6 +2152,7 @@ function Get-VmsRecorderList { param([string]$Domain,[pscredential]$VmsCred,[str
         $seenFqdn[$dedupKey] = $true
         [void]$found.Add([pscustomobject]@{ Name=[string]$rec.Name; Target=$short; Fqdn=$fqdn })
     }
+    } finally { Clear-DnsPrefetch }
     Write-Log "Discovered $($found.Count) recording server(s)." 'Good'
     Disconnect-ManagementServer -ErrorAction SilentlyContinue
     $found.ToArray()
@@ -2310,7 +2334,50 @@ function Get-NodeKey { param([string]$Node) ([string]$Node).Trim().ToUpperInvari
 function Test-NodeIsLocal { param([string]$Node) (Get-NodeKey $Node) -eq $env:COMPUTERNAME.ToUpperInvariant() }
 function Forget-NodeConn { param([string]$Node) [void]$script:NodeConn.Remove((Get-NodeKey $Node)) }
 function Resolve-HostIPv4 { param([string]$Name)
+    $pk = ([string]$Name).Trim().ToLowerInvariant()
+    if((Test-Path variable:script:DnsPrefetch) -and $script:DnsPrefetch.ContainsKey($pk)){ return @($script:DnsPrefetch[$pk].V4) }   # looked up already (Invoke-DnsPrefetch)
     try { @([System.Net.Dns]::GetHostAddresses($Name) | Where-Object { $_.AddressFamily -eq 'InterNetwork' } | ForEach-Object { $_.IPAddressToString }) } catch { @() } }
+# Many DNS lookups at once (owner 2026-11-09: a client's 400 recording servers took hours, one lookup after another -
+# a name that does not resolve waits for DNS, LLMNR and NetBIOS each time). Fills $script:DnsPrefetch with
+# name -> @{ Host = the name DNS returns ('' = does not resolve); V4 = its IPv4 addresses }. Resolve-HostIPv4 and
+# Get-RecorderConnName read it; Clear-DnsPrefetch empties it, so every later lookup asks DNS again. Names only (an IP
+# address passes through Resolve-HostIPv4 unchanged); a lookup still running after -TimeoutMs is simply not stored.
+function Invoke-DnsPrefetch { param([string[]]$Names,[int]$TimeoutMs=30000)
+    if(-not (Test-Path variable:script:DnsPrefetch)){ $script:DnsPrefetch=@{} }
+    $tasks=@{}
+    foreach($n in @($Names)){
+        $k=([string]$n).Trim().ToLowerInvariant()
+        if(-not $k -or $k -match '^\d{1,3}(\.\d{1,3}){3}$' -or $script:DnsPrefetch.ContainsKey($k) -or $tasks.ContainsKey($k)){ continue }
+        try { $tasks[$k]=[System.Net.Dns]::GetHostEntryAsync($k) } catch { $script:DnsPrefetch[$k]=@{ Host=''; V4=@() } }
+    }
+    if(-not $tasks.Count){ return }
+    # .NET runs each lookup on a pool thread; without more threads the pool adds about one per second.
+    $wt=0; $io=0; [System.Threading.ThreadPool]::GetMinThreads([ref]$wt,[ref]$io)
+    if($wt -lt 128){ [void][System.Threading.ThreadPool]::SetMinThreads(128,$io) }
+    $deadline=(Get-Date).AddMilliseconds($TimeoutMs)
+    while(@($tasks.Values | Where-Object { -not $_.IsCompleted }).Count -and (Get-Date) -lt $deadline){ [System.Threading.Thread]::Sleep(100) }
+    foreach($k in @($tasks.Keys)){
+        $t=$tasks[$k]
+        if($t.Status -eq 'RanToCompletion'){
+            $e=$t.Result
+            $script:DnsPrefetch[$k]=@{ Host=([string]$e.HostName).TrimEnd('.').ToLowerInvariant(); V4=@($e.AddressList | Where-Object { $_.AddressFamily -eq 'InterNetwork' } | ForEach-Object { $_.IPAddressToString }) }
+        } elseif($t.IsCompleted){ $script:DnsPrefetch[$k]=@{ Host=''; V4=@() } }
+    }
+}
+function Clear-DnsPrefetch { $script:DnsPrefetch=@{} }
+# Test-LocalTarget, but a name already looked up by Invoke-DnsPrefetch is not asked again (same rule otherwise). Only
+# for loops over many recording servers: the prefetch lives for that loop, so a cluster role address that moves
+# between nodes is never judged from an old answer.
+function Test-LocalTargetPf { param([string]$Target)
+    $t=([string]$Target).Trim().ToLowerInvariant()
+    if(-not $t -or -not (Test-Path variable:script:DnsPrefetch) -or -not $script:DnsPrefetch.ContainsKey($t)){ return (Test-LocalTarget $Target) }
+    if($t -in @('localhost','127.0.0.1','::1')){ return $true }
+    $cn=$env:COMPUTERNAME.ToLowerInvariant()
+    if($t -eq $cn -or $t.Split('.')[0] -eq $cn){ return $true }
+    $mine=@(); try { $mine=@([System.Net.Dns]::GetHostAddresses([System.Net.Dns]::GetHostName()) | ForEach-Object { $_.IPAddressToString }) } catch {}
+    foreach($ip in @($script:DnsPrefetch[$t].V4)){ if($mine -contains $ip){ return $true } }
+    $false
+}
 function Register-NodeAddresses { param($Cl)
     if($Cl.PSObject.Properties['ClusterIps']){ foreach($ip in @($Cl.ClusterIps)){ if($ip){ $script:ClusterIpSet[[string]$ip]=$true } } }
     foreach($n in @($Cl.Nodes)){
@@ -4551,7 +4618,7 @@ function Initialize-Targets { param([string]$ManualList,[bool]$Discover)
     }
     $list=[System.Collections.Generic.List[object]]::new(); $seen=@{}
     $add={ param([string]$Name,[string]$Target,[string]$Addr)
-        if((Test-LocalTarget $Addr) -or (Test-LocalTarget $Target)){ Write-Log "Recording server '$Name' runs on this Management Server - it is covered by the Management Server step, not handled separately."; return }
+        if((Test-LocalTargetPf $Addr) -or (Test-LocalTargetPf $Target)){ Write-Log "Recording server '$Name' runs on this Management Server - it is covered by the Management Server step, not handled separately."; return }
         if($script:MsCluster -and @(@($script:MsCluster.Nodes) | Where-Object { [string]$_.Name -eq $Target -or [string]$_.Fqdn -eq $Addr }).Count){ Write-Log "Recording server '$Name' runs on Management Server cluster node $Target - it is covered by the Management Server step, not handled separately."; return }
         $k=$Target.ToUpperInvariant(); if($seen.ContainsKey($k)){ return }; $seen[$k]=$true
         [void]$list.Add((New-Box 'Recording server' $Name $Target $Addr $script:RecCred)) }
@@ -4566,11 +4633,15 @@ function Initialize-Targets { param([string]$ManualList,[bool]$Discover)
         if($tp.Count -ge 2 -and $tp[1].Trim()){ try { $typed[(Normalize-RecorderHostName $tp[0])]=$tp[1].Trim() } catch {} }
     }
     if($Discover){
-        try { foreach($r in @(Get-VmsRecorderList -Domain $script:DomainName -VmsCred $script:AdminCred -MsAddrText $vmsAddr)){
+        try { $disc=@(Get-VmsRecorderList -Domain $script:DomainName -VmsCred $script:AdminCred -MsAddrText $vmsAddr)
+              # 'is it this computer?' for every recorder: the names looked up all at once first (owner 2026-11-09, 400 recorders)
+              Invoke-DnsPrefetch -Names @(@($disc | ForEach-Object { [string]$_.Target; [string]$_.Fqdn }) + @($typed.Values))
+              foreach($r in $disc){
                   $tk=([string]$r.Target).ToUpperInvariant()
                   if($typed.ContainsKey($tk)){ Write-Log "Recording server '$($r.Name)': the address you typed ($($typed[$tk])) is used instead of the discovered $($r.Fqdn)." 'Good'; & $add $r.Name $r.Target $typed[$tk] }
                   else { & $add $r.Name $r.Target $r.Fqdn } } }
         catch { $discErr=([string]$_.Exception.Message).Trim(); Write-Log "Recording server discovery failed: $(Format-Err $_)" 'Err' }
+        finally { Clear-DnsPrefetch }
     }
     foreach($h in @(([string]$ManualList) -split '[;,\r\n]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ -and -not $_.StartsWith('#') })){
         $parts=$h -split '=',2
