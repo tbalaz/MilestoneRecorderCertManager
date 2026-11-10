@@ -394,7 +394,7 @@ $script:MsBox = $null; $script:EsBox = $null; $script:RecBoxes = @()
 $script:SessOpt = New-PSSessionOption -OpenTimeout 20000 -OperationTimeout 180000
 function New-Box { param([string]$Role,[string]$Name,[string]$Target,[string]$Addr,[pscredential]$Cred)
     [pscustomobject]@{ Role=$Role; Name=$Name; Target=$Target; Addr=$Addr; Cred=$Cred; Reachable=$false; Encrypted=$null; Detail='not checked yet'; Excluded=$false
-                       IsNode=$false; ClusterKey=''; Active=$false; Half=$false } }
+                       IsNode=$false; ClusterKey=''; Active=$false; Half=$false; SrvHttps=$null } }
 # Cluster state (WSFC). $script:MsCluster / $script:EsCluster are $null for a single (standalone) server.
 $script:MsCluster = $null; $script:MsNodeBoxes = @(); $script:MsDetectError = ''
 $script:EsCluster = $null; $script:EsNodeBoxes = @(); $script:EsDetectError = ''

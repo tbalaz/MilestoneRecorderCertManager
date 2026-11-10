@@ -1622,8 +1622,10 @@ function Get-WaveLabel { param([string]$Wave)
 }
 # End-of-run wording: an ON run of a canary / group wave must not claim "ON on every computer".
 function Get-DoneText { param([bool]$Want,[string]$Wave)
-    if($Want -and ($Wave -eq 'canary' -or $Wave -eq 'group')){ return "ON for this wave ($(Get-WaveLabel $Wave)); the recording servers outside it are left as they are" }
-    "$(if($Want){'ON'}else{'OFF'}) on every computer"
+    $t = if($Want -and ($Wave -eq 'canary' -or $Wave -eq 'group')){ "ON for this wave ($(Get-WaveLabel $Wave)); the recording servers outside it are left as they are" } else { "$(if($Want){'ON'}else{'OFF'}) on every computer" }
+    # Owner 2026-11-10: an unticked "Event server and add-ons" section must not hide behind "on every computer".
+    if($script:EsBox -and -not $script:EsSectionOn){ $t += ", except the Event Server's 'Event server and add-ons' section (not ticked, left as it was)" }
+    $t
 }
 # Headless: match -CanaryRecorders / -CanaryGroupRecorders (comma lists of name, target or address, case-insensitive)
 # to the known recorders. Returns Problems (refusals) and the matched Targets of each list.
@@ -2170,7 +2172,7 @@ $script:SessOpt = New-PSSessionOption -OpenTimeout 20000 -OperationTimeout 18000
 
 function New-Box { param([string]$Role,[string]$Name,[string]$Target,[string]$Addr,[pscredential]$Cred)
     [pscustomobject]@{ Role=$Role; Name=$Name; Target=$Target; Addr=$Addr; Cred=$Cred; Reachable=$false; Encrypted=$null; Detail='not checked yet'; Excluded=$false
-                       IsNode=$false; ClusterKey=''; Active=$false; Half=$false } }
+                       IsNode=$false; ClusterKey=''; Active=$false; Half=$false; SrvHttps=$null } }
 # Cluster state (WSFC). $script:MsCluster / $script:EsCluster are $null for a single (standalone) server.
 $script:MsCluster = $null; $script:MsNodeBoxes = @(); $script:MsDetectError = ''
 $script:EsCluster = $null; $script:EsNodeBoxes = @(); $script:EsDetectError = ''
@@ -2212,7 +2214,11 @@ function Test-InScope { param($Box)
 function Get-FirstLine { param([string]$Text) if(-not $Text){ return '' }; ($Text -split "`r?`n")[0].Trim() }
 function Test-IpAddress { param([string]$Value) $ip=$null; [System.Net.IPAddress]::TryParse(([string]$Value).Trim(),[ref]$ip) }
 function Get-StateText { param($Box)
-    if(-not $Box.Reachable){ 'Unknown (cannot connect)' } elseif($null -eq $Box.Encrypted){ 'Unknown' } elseif($Box.Half){ 'Half-done (run again)' } elseif($Box.Encrypted){ 'Encrypted' } else { 'Not encrypted' } }
+    if(-not $Box.Reachable){ 'Unknown (cannot connect)' } elseif($null -eq $Box.Encrypted){ 'Unknown' } elseif($Box.Half){ 'Half-done (run again)' }
+    # Owner 2026-11-10: an Event Server whose two sections differ must not read as plainly (not) encrypted.
+    # Encrypted = "Event server and add-ons"; SrvHttps = "Server certificate" (display only, $null = not read).
+    elseif((Get-BoxKind $Box) -eq 'ES' -and $null -ne $Box.SrvHttps -and [bool]$Box.SrvHttps -ne [bool]$Box.Encrypted){ if($Box.SrvHttps){ 'Server certificate only' } else { 'Add-ons only' } }
+    elseif($Box.Encrypted){ 'Encrypted' } else { 'Not encrypted' } }
 
 # Ground truth readers. Management Server: netsh http sslcert bindings (443 = IIS and 5986 = WinRM
 # HTTPS are ignored); MS encrypted iff port 9000 or 9001 is bound. Recording server: RecorderConfig.xml
@@ -2624,7 +2630,13 @@ function Update-BoxStates { param([object[]]$Boxes)
                 if(-not $r){ throw 'no answer from the Event Server' }
                 $b.Reachable=$true
                 if(-not $r.Found){ $b.Encrypted=$null; $b.Detail="Event Server settings file not found ($($r.Path)) - is the Event Server installed on that computer?" }
-                else { $b.Encrypted=($r.Value -eq 'true'); $b.Detail="CertificateEnabled=$($r.Value)" }
+                else {
+                    $b.Encrypted=($r.Value -eq 'true')
+                    # Owner 2026-11-10: the row also shows the "Server certificate" section (display only).
+                    $b.SrvHttps=$null
+                    try { $s = Get-EsSrvState $b; if($s -and $s.Found -and $null -ne $s.Https){ $b.SrvHttps=[bool]$s.Https } } catch {}
+                    $b.Detail="Event server and add-ons: CertificateEnabled=$($r.Value); Server certificate: $(if($null -eq $b.SrvHttps){'unknown'}elseif($b.SrvHttps){'on (https)'}else{'off (http)'})"
+                }
             } catch { $b.Reachable=$false; $b.Encrypted=$null; $b.Detail="cannot connect: $(Get-FirstLine $_.Exception.Message)" }
         } else { $recs+=$b }
     }

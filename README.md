@@ -18,6 +18,8 @@ run as Administrator.
 | `Mrc-Ms-Gui.ps1` | Advanced / troubleshooting: the Management Server alone. | The Management Server |
 | `Mrc-Es-Gui.ps1` | Advanced / troubleshooting: a standalone Event Server alone. | The Event Server |
 | `Mrc-Rec-Gui.ps1` | Advanced / troubleshooting: Recording Servers alone (the guided script already includes them). | The Management Server or a workstation |
+| `Mrc-ClusterIisReset.js` | Cluster helper: restarts IIS on the Management Server node the role comes online on (see [Failover clusters](#failover-clusters-wsfc)). | A WSFC Generic Script resource in the Management Server role |
+| `Mrc-EsListenerUrl.ps1` | Cluster helper: keeps the Event Server's registered services on the Event Server cluster listener (see [Failover clusters](#failover-clusters-wsfc)). | A WSFC Generic Application resource in the Event Server role |
 
 The three role scripts change one role at a time and leave the order to you. Use them only when
 support asks for it or for a special case; for normal use, `Mrc-Guided.ps1` covers every role.
@@ -191,6 +193,25 @@ role (generic services). Run the wizard on any Management Server node.
 - Optional failover self-test (headless: `-TestFailover`): each role is moved to every other
   node and back, and must come up there. Management Server nodes that cannot take over
   (see above) are skipped and named.
+- **Optional: IIS restart on failover (`Mrc-ClusterIisReset.js`).** A workaround reported from
+  the field for the limitation above: an IIS restart on the node that took the role over. This
+  Generic Script resource (JScript) depends on the Management Server service resource and runs
+  `iisreset /restart` on that node every time the role comes online. It never fails the role;
+  an error goes to the cluster log and to the Application event log (source `MRC IIS restart`,
+  event 100). Install steps are in the file header. **Re-register this node** stays the
+  documented fix if it does not help in your system.
+- **Event Server cluster: registered URLs on the listener (`Mrc-EsListenerUrl.ps1`).**
+  ServerConfigurator registers a clustered Event Server's "Event Server service" and "Alarms
+  Service" under the node it ran on, and the Event Server re-registers "Alarms Service" with its
+  node name every time it starts. After a role move, clients and the API Gateway can then go to
+  the wrong node. This script sets both registered URLs to the Event Server cluster listener (the
+  same change as Management Client > Tools > Registered Services > Edit). As a Generic Application
+  resource in the Event Server role it runs `-Watch` as SYSTEM and re-checks every 60 seconds, so
+  a role move or a ServerConfigurator run is corrected within a minute. It needs MilestonePSTools
+  for all users on every Event Server node; the node computer accounts must be Milestone
+  administrators (they already are when the Milestone services run as NETWORK SERVICE). When
+  "Event server and add-ons" is encrypted, the Event Server certificate must contain the listener.
+  Setup steps are in the file header.
 
 ## Recording Servers in waves (canary first)
 
