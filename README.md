@@ -18,7 +18,7 @@ run as Administrator.
 | `Mrc-Ms-Gui.ps1` | Advanced / troubleshooting: the Management Server alone. | The Management Server |
 | `Mrc-Es-Gui.ps1` | Advanced / troubleshooting: a standalone Event Server alone. | The Event Server |
 | `Mrc-Rec-Gui.ps1` | Advanced / troubleshooting: Recording Servers alone (the guided script already includes them). | The Management Server or a workstation |
-| `Mrc-ClusterIisReset.js` | Cluster helper: restarts IIS on the Management Server node the role comes online on (see [Failover clusters](#failover-clusters-wsfc)). | A WSFC Generic Script resource in the Management Server role |
+| `Mrc-ClusterIisReset.ps1` | Cluster helper: restarts IIS on the Management Server node the role comes online on (see [Failover clusters](#failover-clusters-wsfc)). | A WSFC Generic Application resource in the Management Server role |
 | `Mrc-EsListenerUrl.ps1` | Cluster helper: keeps the Event Server's registered services on the Event Server cluster listener (see [Failover clusters](#failover-clusters-wsfc)). | A WSFC Generic Application resource in the Event Server role |
 
 The three role scripts change one role at a time and leave the order to you. Use them only when
@@ -193,13 +193,16 @@ role (generic services). Run the wizard on any Management Server node.
 - Optional failover self-test (headless: `-TestFailover`): each role is moved to every other
   node and back, and must come up there. Management Server nodes that cannot take over
   (see above) are skipped and named.
-- **Optional: IIS restart on failover (`Mrc-ClusterIisReset.js`).** A workaround reported from
-  the field for the limitation above: an IIS restart on the node that took the role over. This
-  Generic Script resource (JScript) depends on the Management Server service resource and runs
-  `iisreset /restart` on that node every time the role comes online. It never fails the role;
-  an error goes to the cluster log and to the Application event log (source `MRC IIS restart`,
-  event 100). Install steps are in the file header. **Re-register this node** stays the
-  documented fix if it does not help in your system.
+- **Optional: IIS restart on failover (`Mrc-ClusterIisReset.ps1`).** For this case, reported
+  from the field: after a failover the Management Server service is running, but logins fail,
+  and an IIS restart on the node that took the role over fixes it. This Generic Application
+  resource (PowerShell, runs as SYSTEM) depends on the Management Server service resource and
+  runs `iisreset /restart` on that node every time the role comes online, then stays running.
+  It never fails the role. The result goes to the Application event log (source
+  `MRC IIS restart`: event 101 on success, 100 on failure). Install and remove steps are in the
+  file header. It does **not** help when the Management Server service itself does not start
+  on that node (`invalid_client` in its log, the limitation above). Then use
+  **Re-register this node**.
 - **Event Server cluster: registered URLs on the listener (`Mrc-EsListenerUrl.ps1`).**
   ServerConfigurator registers a clustered Event Server's "Event Server service" and "Alarms
   Service" under the node it ran on, and the Event Server re-registers "Alarms Service" with its

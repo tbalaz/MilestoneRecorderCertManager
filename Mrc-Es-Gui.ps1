@@ -138,6 +138,7 @@ $workDir = '__WORKDIR__'
 $user    = '__USER__'
 $dom     = '__DOMAIN__'
 $pw = (Get-Content -LiteralPath $pwFile -Raw)
+try { [IO.File]::Delete($pwFile) } catch {}
 Add-Type -TypeDefinition @"
 using System;
 using System.ComponentModel;
@@ -585,7 +586,7 @@ function Invoke-RemoteRecorderInstall {
                 $elog.Add("[$env:COMPUTERNAME] SC stdout: $(if ($stdout -and $stdout.Trim()) { $stdout.Trim() } else { '(empty)' })")
                 $elog.Add("[$env:COMPUTERNAME] SC stderr: $(if ($stderr -and $stderr.Trim()) { $stderr.Trim() } else { '(empty)' })")
                 $elog.Add("[$env:COMPUTERNAME] SC exit code: $scExit")
-                $scLog = Get-ChildItem -Path (Join-Path $env:ProgramData 'Milestone') -Recurse -Filter '*.log' -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match 'erver.?onfigurator' } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+                $scKnown = Join-Path $env:ProgramData 'Milestone\Server Configurator\Logs\ServerConfiguratorApplication.log'; $scLog = if (Test-Path -LiteralPath $scKnown) { Get-Item -LiteralPath $scKnown } else { Get-ChildItem -Path (Join-Path $env:ProgramData 'Milestone') -Recurse -Filter '*.log' -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match 'erver.?onfigurator' } | Sort-Object LastWriteTime -Descending | Select-Object -First 1 }
                 $runLines = @()
                 if ($scLog) {
                     $allLog = @(Get-Content -LiteralPath $scLog.FullName -ErrorAction SilentlyContinue)
@@ -637,8 +638,10 @@ function Invoke-RemoteServerEncryption {
             $icm = @{ Session = $session }
         }
         $log.Add("Calling Set-XProtectCertificate  tp=$Thumbprint")
-        $encOut = Invoke-Command @icm -ScriptBlock {
-            param([string]$Tp, [string]$ConfPath, [pscredential]$RunCred, [string]$LauncherSource, [string]$CertGroup, [string]$EncAction)
+        $callTask = "MRC-SCSys-$([guid]::NewGuid().ToString('N').Substring(0,8))"
+        try {
+        $encOut = Invoke-Command @icm -ErrorAction Stop -ScriptBlock {
+            param([string]$Tp, [string]$ConfPath, [pscredential]$RunCred, [string]$LauncherSource, [string]$CertGroup, [string]$EncAction, [string]$TaskNameIn)
             $ErrorActionPreference = 'Stop'
             $elog = [System.Collections.Generic.List[string]]::new()
             $Tp = ($Tp -replace '[^A-Fa-f0-9]', '').ToUpperInvariant()
@@ -667,6 +670,32 @@ function Invoke-RemoteServerEncryption {
             if (-not $scExe) { $scExe = '(not found - looked in: ' + ((@($scLook) | Select-Object -Unique) -join '; ') + $(if (@($scDirs).Count) { '; and searched below: ' + ($scDirs -join '; ') } else { '' }) + ')' }
             if (-not (Test-Path -LiteralPath $scExe)) { throw "ServerConfigurator not found: $scExe | $($elog.ToArray() -join ' | ')" }
             $scDir   = [System.IO.Path]::GetDirectoryName($scExe)
+            # Leftovers of an earlier attempt (a dropped session, a closed window): MRC-SCSys-* / MRC-SCReg-* tasks and their
+            # work folders. A task that is not running is unregistered and its work folder (only %windir%\Temp\MRC-*) deleted.
+            # A task that is still running is waited for (up to 20 minutes) and never stopped; then it is cleaned the same way.
+            foreach ($ltTask in @(Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -like 'MRC-SCSys-*' -or $_.TaskName -like 'MRC-SCReg-*' })) {
+                $ltName = [string]$ltTask.TaskName
+                if ([string]$ltTask.State -eq 'Running') {
+                    $elog.Add("[$env:COMPUTERNAME] leftover task $ltName is still running - waiting up to 20 minutes for it to finish (it is not stopped)")
+                    $ltDeadline = (Get-Date).AddMinutes(20)
+                    while ((Get-Date) -lt $ltDeadline) {
+                        Start-Sleep -Seconds 2
+                        $ltNow = Get-ScheduledTask -TaskName $ltName -ErrorAction SilentlyContinue
+                        if (-not $ltNow -or [string]$ltNow.State -ne 'Running') { break }
+                    }
+                    $ltNow = Get-ScheduledTask -TaskName $ltName -ErrorAction SilentlyContinue
+                    if ($ltNow -and [string]$ltNow.State -eq 'Running') { throw "ServerConfigurator is still running after 20 minutes on $env:COMPUTERNAME - stopped here so nothing else changes while it works. Wait for it to finish, check the state, then run again." }
+                }
+                $ltDir = $null
+                try { $ltArg = [string]@($ltTask.Actions)[0].Arguments; if ($ltArg -match '-File\s+"([^"]+)"') { $ltDir = [IO.Path]::GetDirectoryName($Matches[1]) } } catch {}
+                Unregister-ScheduledTask -TaskName $ltName -Confirm:$false -ErrorAction SilentlyContinue
+                $ltDel = 'no work folder found'
+                if ($ltDir -and ([IO.Path]::GetFileName($ltDir) -like 'MRC-*') -and ([IO.Path]::GetDirectoryName($ltDir) -ieq (Join-Path $env:windir 'Temp'))) {
+                    Remove-Item -LiteralPath $ltDir -Recurse -Force -ErrorAction SilentlyContinue
+                    $ltDel = "work folder $ltDir deleted"
+                }
+                $elog.Add("[$env:COMPUTERNAME] removed leftover task $ltName ($ltDel)")
+            }
             # Kill any stale ServerConfigurator first: its singleton lock makes the next run exit -4/1 silently.
             Get-Process -Name ServerConfigurator -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
             Start-Sleep -Milliseconds 800
@@ -696,7 +725,7 @@ function Invoke-RemoteServerEncryption {
             $launchPw   = $nc.Password
             $cmdSpec    = '"{0}" /c "{1}"' -f "$env:windir\System32\cmd.exe", $cmdFile
             $pwFile     = Join-Path $work 'pw.txt'
-            $taskName   = "MRC-SCSys-$([guid]::NewGuid().ToString('N').Substring(0,8))"
+            $taskName   = $(if ($TaskNameIn) { $TaskNameIn } else { "MRC-SCSys-$([guid]::NewGuid().ToString('N').Substring(0,8))" })
             $taskRegistered = $false
             $launcherPs1 = $null
             $state = $null; $scExit = $null
@@ -763,7 +792,7 @@ function Invoke-RemoteServerEncryption {
             $elog.Add("[$env:COMPUTERNAME] SC stdout: $(if ($stdout -and $stdout.Trim()) { $stdout.Trim() } else { '(empty)' })")
             $elog.Add("[$env:COMPUTERNAME] SC stderr: $(if ($stderr -and $stderr.Trim()) { $stderr.Trim() } else { '(empty)' })")
             $elog.Add("[$env:COMPUTERNAME] SC exit code: $scExit")
-            $scLog = Get-ChildItem -Path (Join-Path $env:ProgramData 'Milestone') -Recurse -Filter '*.log' -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match 'erver.?onfigurator' } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            $scKnown = Join-Path $env:ProgramData 'Milestone\Server Configurator\Logs\ServerConfiguratorApplication.log'; $scLog = if (Test-Path -LiteralPath $scKnown) { Get-Item -LiteralPath $scKnown } else { Get-ChildItem -Path (Join-Path $env:ProgramData 'Milestone') -Recurse -Filter '*.log' -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match 'erver.?onfigurator' } | Sort-Object LastWriteTime -Descending | Select-Object -First 1 }
             $runLines = @()
             if ($scLog) {
                 $allLog = @(Get-Content -LiteralPath $scLog.FullName -ErrorAction SilentlyContinue)
@@ -790,7 +819,91 @@ function Invoke-RemoteServerEncryption {
             elseif ($scExit -eq 300000 -or $scExit -eq 100000) { $elog.Add("[$env:COMPUTERNAME] NOTE: SC exit $scExit - cert was BOUND but IDP/system registration FAILED (usually cert CN does not match the server's configured address, or IDP 403). This is a FAILURE: the server may not start. Re-run with a certificate whose CN matches the server's own DNS name.") }
             elseif ($scExit -ne 0 -and $certApplied) { $elog.Add("[$env:COMPUTERNAME] NOTE: SC exit $scExit - $EncAction APPLIED; post-apply step failed (likely mgmt server unreachable) - treating as success") }
             [pscustomobject]@{ Thumbprint = $certTp; ExitCode = [int64]$scExit; CertApplied = [bool]$certApplied; Logs = $elog.ToArray() }
-        } -ArgumentList $Thumbprint, $ServerConfiguratorPath, $connCred, $LocalLauncherSource, $CertificateGroup, $Action
+        } -ArgumentList $Thumbprint, $ServerConfiguratorPath, $connCred, $LocalLauncherSource, $CertificateGroup, $Action, $callTask
+        } catch {
+            $dropErr = $_
+            $dropTransport = ($null -ne $session) -and (($dropErr.Exception -is [System.Management.Automation.Remoting.PSRemotingTransportException]) -or ($dropErr.Exception.InnerException -is [System.Management.Automation.Remoting.PSRemotingTransportException]) -or (@('Broken','Closed') -contains [string]$session.State))
+            if (-not $dropTransport) { throw }
+            # The WinRM session dropped while ServerConfigurator ran (it restarts services and can sever the session):
+            # reconnect (up to 180 s) and collect the result of the task THIS call started, instead of failing the step.
+            $log.Add("WinRM session lost while ServerConfigurator ran ($(([string]$dropErr.Exception.Message).Split("`n")[0].Trim())) - reconnecting")
+            try { Remove-PSSession -Session $session -ErrorAction SilentlyContinue } catch {}
+            $session = $null
+            $reDeadline = (Get-Date).AddSeconds(180)
+            while ($null -eq $session -and (Get-Date) -lt $reDeadline) {
+                try { $session = New-PSSession @sp } catch { Start-Sleep -Seconds 5 }
+            }
+            if ($null -eq $session) { throw "The WinRM session to $ComputerName dropped while ServerConfigurator ran and could not be opened again within 180 s: $($dropErr.Exception.Message)" }
+            $encOut = Invoke-Command -Session $session -ErrorAction Stop -ScriptBlock {
+                param([string]$TaskName, [string]$EncAction, [string]$Tp)
+                $ErrorActionPreference = 'Stop'
+                $elog = [System.Collections.Generic.List[string]]::new()
+                $certTp = ($Tp -replace '[^A-Fa-f0-9]', '').ToUpperInvariant()
+                $elog.Add("[$env:COMPUTERNAME] WinRM session dropped while ServerConfigurator ran - result collected after reconnect")
+                # The original remote command can keep running on the server after the client dropped; its finally block then
+                # removes the task and the work folder when ServerConfigurator exits. So the task may be gone at the start or
+                # during the wait: then wait for the ServerConfigurator process and take the exit code from its log.
+                $colTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+                $work = $null
+                if ($colTask) { try { $colArg = [string]@($colTask.Actions)[0].Arguments; if ($colArg -match '-File\s+"([^"]+)"') { $work = [IO.Path]::GetDirectoryName($Matches[1]) } } catch {} }
+                $state = $null; $scExit = $null; $exitSource = ''
+                $deadline = (Get-Date).AddMinutes(20)
+                $taskGone = (-not $colTask)
+                while (-not $taskGone) {
+                    Start-Sleep -Seconds 2
+                    $tNow = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+                    if (-not $tNow) { $taskGone = $true; break }
+                    $state = [string]$tNow.State
+                    $tInfo = Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction SilentlyContinue
+                    if ($tInfo) { $scExit = $tInfo.LastTaskResult }
+                    if (-not ($state -eq 'Running' -or $scExit -eq 267009 -or $scExit -eq 267011)) { break }
+                    if ((Get-Date) -ge $deadline) { break }
+                }
+                if ($taskGone) {
+                    $scExit = $null
+                    while ((Get-Process -Name ServerConfigurator -ErrorAction SilentlyContinue) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 2 }
+                    if (Get-Process -Name ServerConfigurator -ErrorAction SilentlyContinue) { throw "ServerConfigurator is still running after 20 minutes on $env:COMPUTERNAME - stopped here so nothing else changes while it works. Wait for it to finish, check the state, then run again." }
+                } elseif ($state -eq 'Running' -or $scExit -eq 267009 -or $scExit -eq 267011) { throw "ServerConfigurator is still running after 20 minutes on $env:COMPUTERNAME - stopped here so nothing else changes while it works. Wait for it to finish, check the state, then run again." }
+                else { $exitSource = 'exit code from task' }
+                $stdout = $null; $stderr = $null
+                if ($work) {
+                    $stdout = (Get-Content -LiteralPath (Join-Path $work 'out.txt') -Raw -ErrorAction SilentlyContinue)
+                    $stderr = (Get-Content -LiteralPath (Join-Path $work 'err.txt') -Raw -ErrorAction SilentlyContinue)
+                }
+                Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+                if ($work -and ([IO.Path]::GetFileName($work) -like 'MRC-*') -and ([IO.Path]::GetDirectoryName($work) -ieq (Join-Path $env:windir 'Temp'))) { Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue }
+                $elog.Add("[$env:COMPUTERNAME] SC stdout: $(if ($stdout -and $stdout.Trim()) { $stdout.Trim() } else { '(empty)' })")
+                $elog.Add("[$env:COMPUTERNAME] SC stderr: $(if ($stderr -and $stderr.Trim()) { $stderr.Trim() } else { '(empty)' })")
+                $scKnown = Join-Path $env:ProgramData 'Milestone\Server Configurator\Logs\ServerConfiguratorApplication.log'; $scLog = if (Test-Path -LiteralPath $scKnown) { Get-Item -LiteralPath $scKnown } else { Get-ChildItem -Path (Join-Path $env:ProgramData 'Milestone') -Recurse -Filter '*.log' -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match 'erver.?onfigurator' } | Sort-Object LastWriteTime -Descending | Select-Object -First 1 }
+                $runLines = @()
+                if ($scLog) {
+                    $allLog = @(Get-Content -LiteralPath $scLog.FullName -ErrorAction SilentlyContinue)
+                    $argIdx = -1
+                    for ($i = $allLog.Count - 1; $i -ge 0; $i--) { if ($allLog[$i] -match 'Arguments:.*(enable|disable)encryption') { $argIdx = $i; break } }
+                    $runLines = if ($argIdx -ge 0) { @($allLog[$argIdx..($allLog.Count - 1)]) } else { @($allLog | Select-Object -Last 60) }
+                    $scTail = ($runLines | Select-Object -Last 80) -join ' || '
+                    $elog.Add("[$env:COMPUTERNAME] SC log [$($scLog.Name)] (this run): $scTail")
+                } else {
+                    $elog.Add("[$env:COMPUTERNAME] SC log: none found")
+                }
+                if ($null -eq $scExit) {
+                    $exLines = @($runLines | Where-Object { [string]$_ -match 'Exit code:\s*(-?\d+)' })
+                    if ($exLines.Count) { [void]([string]$exLines[$exLines.Count - 1] -match 'Exit code:\s*(-?\d+)'); $scExit = [int64]$Matches[1]; $exitSource = 'exit code from ServerConfigurator log' }
+                }
+                if ($null -eq $scExit) { throw "The WinRM session dropped while ServerConfigurator ran on $env:COMPUTERNAME and its task $TaskName is gone, so the result cannot be collected | $($elog.ToArray() -join ' | ')" }
+                $elog.Add("[$env:COMPUTERNAME] SC exit code: $scExit ($exitSource)")
+                if ($EncAction -eq 'disableencryption') {
+                    $certApplied = (($runLines -match 'Applying No Certificate = Unencrypted').Count -gt 0) -or (($runLines -match "\.ApplyCertificate'? Status = Success").Count -gt 0) -or (($runLines -match "\.RemoveCertificate'? Status = Success").Count -gt 0) -or (($runLines -match 'Registration done with result = Success').Count -gt 0)
+                } else {
+                    $certApplied = (($runLines -match "\.ApplyCertificate'? Status = Success").Count -gt 0) -or (($runLines -match 'Registration done with result = Success').Count -gt 0)
+                }
+                if ($scExit -ne 0 -and $scExit -ne 100 -and $scExit -ne 200000 -and -not $certApplied -and -not ($EncAction -eq 'disableencryption' -and $scExit -eq 1)) { throw "ServerConfigurator exited $scExit | $($elog.ToArray() -join ' | ')" }
+                if ($scExit -eq 100) { $elog.Add("[$env:COMPUTERNAME] NOTE: SC exit 100 - local cert applied but MS registration FAILED - encryption NOT fully enabled") }
+                elseif ($scExit -eq 300000 -or $scExit -eq 100000) { $elog.Add("[$env:COMPUTERNAME] NOTE: SC exit $scExit - cert was BOUND but IDP/system registration FAILED (usually cert CN does not match the server's configured address, or IDP 403). This is a FAILURE: the server may not start. Re-run with a certificate whose CN matches the server's own DNS name.") }
+                elseif ($scExit -ne 0 -and $certApplied) { $elog.Add("[$env:COMPUTERNAME] NOTE: SC exit $scExit - $EncAction APPLIED; post-apply step failed (likely mgmt server unreachable) - treating as success") }
+                [pscustomobject]@{ Thumbprint = $certTp; ExitCode = [int64]$scExit; CertApplied = [bool]$certApplied; Logs = $elog.ToArray() }
+            } -ArgumentList $callTask, $Action, $Thumbprint
+        }
         foreach ($l in $encOut.Logs) { $log.Add($l) }
         [pscustomobject]@{ Thumbprint = $encOut.Thumbprint; ExitCode = $encOut.ExitCode; CertApplied = $encOut.CertApplied; Logs = $log.ToArray() }
     } finally { if ($session) { Remove-PSSession -Session $session -ErrorAction SilentlyContinue } }

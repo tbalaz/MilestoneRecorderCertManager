@@ -1914,8 +1914,11 @@ function Get-BoxEncEnabled { param($Box)
     }
     if ($Box.Enc.PSObject.Properties['Enabled']) { return $Box.Enc.Enabled }
     if ($Box.Enc.PSObject.Properties['Ok'] -and $Box.Enc.PSObject.Properties['Count']) {
-        if ($Box.Enc.Ok) { return ($Box.Enc.Count -gt 0) }
-        return $null
+        if (-not $Box.Enc.Ok) { return $null }
+        # MS: encrypted iff port 9000 is bound. 9001 belongs to a Recording Server on the same computer and
+        # stays bound after the MS is switched off. (Recorder: any binding except 443/5986 - Count as before.)
+        if ($Box.Kind -eq 'MS' -and $Box.Enc.PSObject.Properties['Bindings']) { return (@(([string]$Box.Enc.Bindings) -split ',' | Where-Object { $_ -match ':9000$' }).Count -gt 0) }
+        return ($Box.Enc.Count -gt 0)
     }
     $null
 }
