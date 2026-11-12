@@ -1893,6 +1893,28 @@ $script:HostWorker = {
             $res.Status = if($res.Ok){ "Encrypted: $($okG -join '+') (svc up)" }
                           elseif($certOk){ "certificate applied but the Milestone services did not start again on $($P.Target)" }
                           else { "FAILED ok=[$($okG -join '+')] fail=[$($failG -join '+')] bound=$($conf.Bound)" }
+            # Owner 2026-11-12: a box whose services do not stay up after encryption ON does not record - turn
+            # encryption back OFF on it so it runs again, and keep the row FAILED with the reason. Only when the
+            # caller asks for it ($P.SwitchBack: the recorder jobs of Mrc-Guided).
+            if($P['SwitchBack'] -and -not $conf.AllServicesRunning){
+                $why=@($logs | Where-Object { $_ -match ' stopped - Application log: ' } | ForEach-Object { ($_ -split ' stopped - Application log: ',2)[1] }) | Select-Object -Last 1
+                $reason= if($unreach){ "ServerConfigurator could not reach the Management Server from $($P.Target)" } else { "the Milestone services did not stay running on $($P.Target)" }
+                if($why){ $reason+=" ($why)" }
+                $logs.Add("Encryption ON failed on $($P.Target): $reason - turning encryption back OFF so it runs again")
+                $offFail=@()
+                for($i=0;$i -lt $guids.Count;$i++){
+                    $g=$guids[$i]; $gn= if($i -lt $names.Count){ $names[$i] } else { $g }
+                    $r=Invoke-ScWithWedgeRetry -ComputerName $P.Fqdn -Credential $P.Cred `
+                         -Thumbprint '' -CertificateGroup $g -Action disableencryption -WorkLog $logs -GroupName $gn -ScPaths ([string]$P.ScPaths)
+                    foreach($l in $r.Logs){ $logs.Add("[$gn] $l") }
+                    if(-not ($r.CertApplied -or ($r.ExitCode -in 0,100,200000))){ $offFail+="$gn=exit $($r.ExitCode)" }
+                }
+                $back=Confirm-ServerEncryption -ComputerName $P.Fqdn -Credential $P.Cred -UseSsl:$false -Thumbprint '0' -SkipServiceNames @($P['SkipSvc'] | Where-Object { $_ })
+                foreach($l in $back.Logs){ $logs.Add($l) }
+                $res.Ok=$false; $res.Error=$reason
+                $res.Status= if($back.AllServicesRunning -and -not $offFail.Count){ "FAILED: $reason. Encryption was turned back OFF - $($P.Target) runs unencrypted (svc up)" }
+                             else { "FAILED: $reason. Turning encryption back OFF did not bring $($P.Target) up either$(if($offFail.Count){' (' + ($offFail -join '+') + ')'}) - check it" }
+            }
         } else {
             # Owner 2026-10-31: ServerConfigurator that could not reach the Management Server after applying (lab:
             # a short network drop) leaves the box half set and its services do not start - run it once more.
@@ -2135,7 +2157,7 @@ function Invoke-RecordersParallel { param([object[]]$Boxes,[string]$Action,[hash
         # the box off to the runspace - the engine calls inside HostWorker have no concept of Get-ConnAddr,
         # so a workgroup recorder addressed by name must already be resolved by the time it gets there.
         $conn = try { Get-ConnAddr $box.Addr $Common.Cred } catch { $box.Addr }
-        $P=@{Target=$box.Target;Fqdn=$conn;Cred=$Common.Cred;SignerTp=$Common.SignerTp;CaCer=$Common.CaCer;Domain=$Common.Domain;OutputDir=$Common.OutputDir;Guids=$Common.Guids;Names=$Common.Names;Action=$Action;BindExpected=$true;ExtraSans='';ScPaths=[string]$Common.ScPaths}
+        $P=@{Target=$box.Target;Fqdn=$conn;Cred=$Common.Cred;SignerTp=$Common.SignerTp;CaCer=$Common.CaCer;Domain=$Common.Domain;OutputDir=$Common.OutputDir;Guids=$Common.Guids;Names=$Common.Names;Action=$Action;BindExpected=$true;ExtraSans='';ScPaths=[string]$Common.ScPaths;SwitchBack=$true}
         # Prepared certificate file for this recorder (checked in the pre-flight check): HostWorker imports it
         # instead of signing a new one, and installs the operator's root CA (if given) instead of the signer.
         $cf=if($Common.ContainsKey('CertFiles') -and $Common.CertFiles){ $Common.CertFiles[([string]$box.Target).ToUpperInvariant()] }else{ $null }
