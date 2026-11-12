@@ -1443,6 +1443,24 @@ $script:ScLogSb = {
     $out
 }
 
+# The marker Mrc-Guided.ps1 writes on an MS cluster node after it copied the IDP secrets of the node
+# registered last to it (mrc-secret-copy.json: Source, CopiedUtc, Folders). Read-only: reads one json file.
+$script:SecCopySb = {
+    $out = [pscustomobject]@{ Found=$false; Source=''; CopiedUtc=$null; Folders=0 }
+    try {
+        $p = Join-Path $env:ProgramData 'Milestone\XProtect Management Server\mrc-secret-copy.json'
+        if (Test-Path -LiteralPath $p -PathType Leaf) {
+            $j = Get-Content -LiteralPath $p -Raw -ErrorAction Stop | ConvertFrom-Json
+            $out.Source = [string]$j.Source; $out.Folders = [int]$j.Folders
+            $cu = $j.CopiedUtc
+            if ($cu -is [DateTime]) { $out.CopiedUtc = $cu.ToUniversalTime().ToString('o') }
+            else { $out.CopiedUtc = ([DateTimeOffset]::Parse([string]$cu, [Globalization.CultureInfo]::InvariantCulture)).UtcDateTime.ToString('o') }
+            $out.Found = $true
+        }
+    } catch {}
+    $out
+}
+
 # One Facts object for a box, combining the scriptblocks above (several small round trips, same pattern
 # Mrc-Guided.ps1 itself uses for BindingsSb / ScFindSb / RegAddrSb - never merged into one giant call).
 # -- ONE remote/local round trip per box (lab fix round 1) ----------------------------------------
@@ -1504,6 +1522,7 @@ function Get-CollectJobs { param([string]$Kind)
             $jobs.Add([pscustomobject]@{ Name='Enc'; Text=$script:BindingsSb.ToString(); Args=@() })
             $jobs.Add([pscustomobject]@{ Name='Ms';  Text=$script:FactsMsSb.ToString();  Args=@() })
             $jobs.Add([pscustomobject]@{ Name='RegAddr'; Text=$script:RegAddrSb.ToString(); Args=@($false) })
+            $jobs.Add([pscustomobject]@{ Name='SecCopy'; Text=$script:SecCopySb.ToString(); Args=@() })
         }
         'ES' {
             $jobs.Add([pscustomobject]@{ Name='Enc'; Text=$script:EsStateSb.ToString(); Args=@() })
@@ -1566,6 +1585,7 @@ function Complete-BoxFacts { param($f,[bool]$IsLocal,$Bundle)
     $f.Common = $results['Common']
     if ($results.ContainsKey('ScFinder')) { $f.ScFinder = $results['ScFinder'] }
     if ($results.ContainsKey('ScLog')) { $f.ScLog = $results['ScLog'] }
+    if ($results.ContainsKey('SecCopy')) { $f.SecCopy = $results['SecCopy'] }
     if ($results.ContainsKey('Ssl')) { $f.Ssl = $results['Ssl'] }
     if ($results.ContainsKey('Enc')) { $f.Enc = $results['Enc'] }
     if ($results.ContainsKey('Ms')) { $f.Ms = $results['Ms'] }
@@ -1600,7 +1620,7 @@ function New-BoxFactsSkeleton { param($Box)
         Kind=$kind; Name=[string]$Box.Name; Target=[string]$Box.Target; Addr=[string]$Box.Addr
         IsNode=[bool]$Box.IsNode; ClusterKey=[string]$Box.ClusterKey; Active=[bool]$Box.Active
         Reachable=$false; ConnError=''; CollectErrors=@()
-        Common=$null; Enc=$null; ScFinder=$null; RegAddr=@(); Ssl=$null; KeyAccess=@(); ScLog=$null
+        Common=$null; Enc=$null; ScFinder=$null; RegAddr=@(); Ssl=$null; KeyAccess=@(); ScLog=$null; SecCopy=$null
         Ms=$null; Es=$null; Rec=$null; Dns=$null; PortProbe=@(); Certs=@()
         ClockOffsetSec=$null; ClockUncertaintySec=$null
     }
@@ -2403,6 +2423,16 @@ function Test-CLU4 { param($Result)
     $newest = $nw.Box
     foreach($d in $dated){
         if($d.Box.Target -ne $newest.Target){
+            # Mrc-Guided.ps1 copied the IDP secrets of the node registered last to this node after that registration: it can take over.
+            $sc = $null; if($d.Box.PSObject.Properties['SecCopy']){ $sc = $d.Box.SecCopy }
+            $copiedAt = $null
+            if($sc -and $sc.Found -and $sc.CopiedUtc -and (([string]$sc.Source -ieq [string]$newest.Target) -or ([string]$sc.Source -ieq [string]$newest.Name))){
+                try { $cu = ([DateTimeOffset]::Parse([string]$sc.CopiedUtc, [Globalization.CultureInfo]::InvariantCulture)).UtcDateTime; if($cu -ge $nw.When){ $copiedAt = $cu } } catch {}
+            }
+            if($copiedAt){
+                $rows += New-Row 'CLU-4' 'CLU' 'PASS' $d.Box.Name 'MS cluster node that can take over' "$($d.Box.Name) can take over - secrets copied from $($sc.Source) at $($copiedAt.ToString('yyyy-MM-dd HH:mm')) UTC (after $($newest.Name) registered at $($nw.When.ToString('yyyy-MM-dd HH:mm')) UTC)." ''
+                continue
+            }
             $rows += New-Row 'CLU-4' 'CLU' 'WARN' $d.Box.Name 'MS cluster node that can take over' "$($d.Box.Name) last registered $($d.When.ToString('yyyy-MM-dd HH:mm')) UTC - older than $($newest.Name) ($($nw.When.ToString('yyyy-MM-dd HH:mm')) UTC). It cannot take over the Management Server until it is re-registered (known Milestone limitation)." "After a failover, run Mrc-Guided.ps1 'Re-register this node' on $($d.Box.Name)."
         }
     }

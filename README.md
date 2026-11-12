@@ -181,15 +181,17 @@ role (generic services). Run the wizard on any Management Server node.
   installed on every such node.
 - ServerConfigurator runs node by node while the cluster nodes are paused. The node that
   owns the role runs last, so the role ends where it was. Every node has a short outage.
-- **Known Milestone limitation:** in a Management Server cluster only the node that ran
-  ServerConfigurator last can start the Management Server. The Result page names the nodes
-  that cannot take over. After a failover to such a node, open the wizard **on that node** and
-  click **Re-register this node** (headless: `-Action register`). This also works when the
-  other node is paused or down. This applies to automatic failovers too (a crash, a reboot for
-  Windows updates): until that node is registered again the Management Server stays down, and
-  registering it stops the other node from starting the Management Server. Plan patch reboots
-  with this in mind. Milestone's cluster guide runs the Management Server under a domain service
-  account; this limitation was seen with the services running as a system account.
+- **Management Server cluster: every node can take over.** Milestone itself lets only the node
+  that ran ServerConfigurator last start the Management Server: each node keeps its own copy of
+  the Management Server's identity secrets. After every ServerConfigurator run on a Management
+  Server node, the wizard copies that node's secrets to the other nodes (with Milestone's own
+  encryption library on each node; Milestone does not document this step), so any node can start
+  the Management Server after a failover, automatic ones included (a crash, a reboot for Windows
+  updates). This needs the Management Server services to run as NETWORK SERVICE (the default).
+  A node that did not get the copy (paused, down, or another service account) is named on the
+  Result page. After a failover to such a node, open the wizard **on that node** and click
+  **Re-register this node** (headless: `-Action register`); the wizard then copies that node's
+  secrets to the other nodes.
 - Optional failover self-test (headless: `-TestFailover`): each role is moved to every other
   node and back, and must come up there. Management Server nodes that cannot take over
   (see above) are skipped and named.

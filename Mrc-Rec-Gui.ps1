@@ -699,7 +699,7 @@ function Invoke-RemoteServerEncryption {
             # Leftovers of an earlier attempt (a dropped session, a closed window): MRC-SCSys-* / MRC-SCReg-* tasks and their
             # work folders. A task that is not running is unregistered and its work folder (only %windir%\Temp\MRC-*) deleted.
             # A task that is still running is waited for (up to 20 minutes) and never stopped; then it is cleaned the same way.
-            foreach ($ltTask in @(Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -like 'MRC-SCSys-*' -or $_.TaskName -like 'MRC-SCReg-*' })) {
+            foreach ($ltTask in @(Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { ($_.TaskName -like 'MRC-SCSys-*' -or $_.TaskName -like 'MRC-SCReg-*') -and (@('SYSTEM','NT AUTHORITY\SYSTEM','S-1-5-18') -contains [string]$_.Principal.UserId) })) {
                 $ltName = [string]$ltTask.TaskName
                 if ([string]$ltTask.State -eq 'Running') {
                     $elog.Add("[$env:COMPUTERNAME] leftover task $ltName is still running - waiting up to 20 minutes for it to finish (it is not stopped)")
@@ -717,8 +717,8 @@ function Invoke-RemoteServerEncryption {
                 Unregister-ScheduledTask -TaskName $ltName -Confirm:$false -ErrorAction SilentlyContinue
                 $ltDel = 'no work folder found'
                 if ($ltDir -and ([IO.Path]::GetFileName($ltDir) -like 'MRC-*') -and ([IO.Path]::GetDirectoryName($ltDir) -ieq (Join-Path $env:windir 'Temp'))) {
-                    Remove-Item -LiteralPath $ltDir -Recurse -Force -ErrorAction SilentlyContinue
-                    $ltDel = "work folder $ltDir deleted"
+                    # Only a plain work folder of this tool is deleted: no link (junction / symlink), no subfolder, only the files the engine writes.
+                    $ltDel = "work folder $ltDir left in place (not a plain MRC work folder: a link, a subfolder or an unknown file)"; try { $ltIt = Get-Item -LiteralPath $ltDir -Force -ErrorAction Stop; $ltKids = @(Get-ChildItem -LiteralPath $ltDir -Force -ErrorAction Stop); if (-not ($ltIt.Attributes -band [IO.FileAttributes]::ReparsePoint) -and -not @($ltKids | Where-Object { $_.PSIsContainer -or ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -or (@('out.txt','err.txt','run.cmd','launcher.ps1','pw.txt') -notcontains $_.Name) }).Count) { foreach ($ltK in $ltKids) { [IO.File]::Delete($ltK.FullName) }; [IO.Directory]::Delete($ltDir, $false); $ltDel = "work folder $ltDir deleted" } } catch {}
                 }
                 $elog.Add("[$env:COMPUTERNAME] removed leftover task $ltName ($ltDel)")
             }
@@ -897,7 +897,7 @@ function Invoke-RemoteServerEncryption {
                     $stderr = (Get-Content -LiteralPath (Join-Path $work 'err.txt') -Raw -ErrorAction SilentlyContinue)
                 }
                 Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
-                if ($work -and ([IO.Path]::GetFileName($work) -like 'MRC-*') -and ([IO.Path]::GetDirectoryName($work) -ieq (Join-Path $env:windir 'Temp'))) { Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue }
+                if ($work -and ([IO.Path]::GetFileName($work) -like 'MRC-*') -and ([IO.Path]::GetDirectoryName($work) -ieq (Join-Path $env:windir 'Temp'))) { try { $wIt = Get-Item -LiteralPath $work -Force -ErrorAction Stop; $wKids = @(Get-ChildItem -LiteralPath $work -Force -ErrorAction Stop); if (-not ($wIt.Attributes -band [IO.FileAttributes]::ReparsePoint) -and -not @($wKids | Where-Object { $_.PSIsContainer -or ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -or (@('out.txt','err.txt','run.cmd','launcher.ps1','pw.txt') -notcontains $_.Name) }).Count) { foreach ($wK in $wKids) { [IO.File]::Delete($wK.FullName) }; [IO.Directory]::Delete($work, $false) } } catch {} }
                 $elog.Add("[$env:COMPUTERNAME] SC stdout: $(if ($stdout -and $stdout.Trim()) { $stdout.Trim() } else { '(empty)' })")
                 $elog.Add("[$env:COMPUTERNAME] SC stderr: $(if ($stderr -and $stderr.Trim()) { $stderr.Trim() } else { '(empty)' })")
                 $scKnown = Join-Path $env:ProgramData 'Milestone\Server Configurator\Logs\ServerConfiguratorApplication.log'; $scLog = if (Test-Path -LiteralPath $scKnown) { Get-Item -LiteralPath $scKnown } else { Get-ChildItem -Path (Join-Path $env:ProgramData 'Milestone') -Recurse -Filter '*.log' -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match 'erver.?onfigurator' } | Sort-Object LastWriteTime -Descending | Select-Object -First 1 }
@@ -1073,6 +1073,7 @@ function Confirm-ServerEncryption {
         $res = Invoke-Command @icm -ScriptBlock {
             param([string]$Tp, [string[]]$SkipSvc)
             $rlog = [System.Collections.Generic.List[string]]::new()
+            $callStart = Get-Date
             # IIS (W3SVC/WAS) is stopped by the management-server encryption toggle and the IDP
             # web depends on it - start it first, before the Milestone services that talk to it.
             $iisSel = { $_.DisplayName -match 'Milestone XProtect|VideoOS' -or $_.Name -match 'MilestoneEventServer|^W3SVC$|^WAS$' }
@@ -1112,10 +1113,36 @@ function Confirm-ServerEncryption {
                     if (-not $waiting.Count) { break }
                     Start-Sleep -Seconds 2
                 }
+                # A service can reach Running and terminate seconds later (a Recording Server whose configuration
+                # ServerConfigurator left half-set stops 1-3 s after every start), so the started services must
+                # stay Running for 8 s before they count as up; stop watching as soon as one leaves Running.
+                $alive = @($started | Where-Object { $_.Refresh(); [string]$_.Status -eq 'Running' })
+                if ($alive.Count) {
+                    $stableUntil = (Get-Date).AddSeconds(8)
+                    while ((Get-Date) -lt $stableUntil) {
+                        Start-Sleep -Seconds 1
+                        if (@($alive | Where-Object { $_.Refresh(); [string]$_.Status -ne 'Running' }).Count) { break }
+                    }
+                }
                 $rlog.Add("[$env:COMPUTERNAME] services started together in $([int]$swStart.Elapsed.TotalSeconds) s")
             }
             $svc = @(Get-Service | Where-Object $iisSel | Where-Object { [string]$_.StartType -ne 'Disabled' -and $left -notcontains $_.Name })
             $stopped = @($svc | Where-Object { $_.Status -ne 'Running' } | Select-Object -ExpandProperty Name)
+            if ($stopped.Count) {
+                # Why it stopped: the newest Application log error since this call began whose source is the
+                # service's display name (Milestone services log their fatal start errors there). Log only -
+                # Stopped stays bare service names, callers filter on them; event text must never reach a verdict.
+                $evs = @(Get-WinEvent -FilterHashtable @{ LogName = 'Application'; Level = 1, 2; StartTime = $callStart } -MaxEvents 20 -ErrorAction SilentlyContinue)
+                foreach ($n in $stopped) {
+                    $dn = [string]($svc | Where-Object { $_.Name -eq $n } | Select-Object -First 1).DisplayName
+                    $own = @($evs | Where-Object { $dn -and [string]$_.ProviderName -eq $dn })
+                    $ev = @(@($own | Where-Object { [string]$_.Message -match 'terminat' }) + $own) | Select-Object -First 1
+                    if ($ev) {
+                        $m = ([string]$ev.Message -replace '\s+', ' ').Trim(); $m = $m.Substring(0, [Math]::Min(200, $m.Length))
+                        $rlog.Add("[$env:COMPUTERNAME] $n stopped - Application log: $m")
+                    }
+                }
+            }
             $binds = (netsh http show sslcert) -join "`n"
             $bound = $binds -match $Tp
             $rlog.Add("[$env:COMPUTERNAME] cert $Tp bound: $bound")

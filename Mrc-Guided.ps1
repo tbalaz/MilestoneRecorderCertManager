@@ -68,10 +68,19 @@
           Then wait for the service (MS :9000 or :80, ES :22331) and read that node's real state.
           The role ends on the node that had it.
         - Real state is read per node; the Check and Result tables show one row per node.
-        - Known Milestone limitation (reported, not fixed): each ServerConfigurator run on a
-          Management Server node leaves the OTHER MS nodes unable to start the Management Server
-          after a failover (IDP 'invalid_client') until they are registered again. The wizard's
-          'Re-register this node' action (headless -Action register) does that on the node it runs on.
+        - Known Milestone limitation: each ServerConfigurator run on a Management Server node
+          leaves the OTHER MS nodes unable to start the Management Server after a failover (IDP
+          'invalid_client') until they are registered again. After every ServerConfigurator run on
+          an MS node (on/off, rollback, re-register, registration fix) the wizard therefore copies
+          the node-registered-last's IDP secrets (idp.sec in four Milestone folders) to every other
+          MS node, so every node can take over. This only works while the Management Server
+          service runs as NETWORK SERVICE, uses Milestone's own crypto library
+          (VideoOS.Common.Crypto) in a way Milestone does not document, and keeps the old file as
+          idp.sec.bak-mrc. When the copy does not work (other service account, a node that is Down,
+          a Milestone update) the node stays on the 'cannot take over' list and the old rule holds:
+          make the role run on that node and click 'Re-register this node' (headless -Action
+          register) there. A ServerConfigurator run by hand makes the other nodes stale again until
+          the wizard runs (Re-register / a new run).
         - Optional failover self-test after a change (move each role to every other node and back).
     Before every on/off run a JSON snapshot of the real state is written next to the report; a failed
     run offers 'Undo this run (roll back)' (headless -Action rollback -Snapshot <file>).
@@ -779,7 +788,7 @@ function Invoke-RemoteServerEncryption {
             # Leftovers of an earlier attempt (a dropped session, a closed window): MRC-SCSys-* / MRC-SCReg-* tasks and their
             # work folders. A task that is not running is unregistered and its work folder (only %windir%\Temp\MRC-*) deleted.
             # A task that is still running is waited for (up to 20 minutes) and never stopped; then it is cleaned the same way.
-            foreach ($ltTask in @(Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -like 'MRC-SCSys-*' -or $_.TaskName -like 'MRC-SCReg-*' })) {
+            foreach ($ltTask in @(Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { ($_.TaskName -like 'MRC-SCSys-*' -or $_.TaskName -like 'MRC-SCReg-*') -and (@('SYSTEM','NT AUTHORITY\SYSTEM','S-1-5-18') -contains [string]$_.Principal.UserId) })) {
                 $ltName = [string]$ltTask.TaskName
                 if ([string]$ltTask.State -eq 'Running') {
                     $elog.Add("[$env:COMPUTERNAME] leftover task $ltName is still running - waiting up to 20 minutes for it to finish (it is not stopped)")
@@ -797,8 +806,8 @@ function Invoke-RemoteServerEncryption {
                 Unregister-ScheduledTask -TaskName $ltName -Confirm:$false -ErrorAction SilentlyContinue
                 $ltDel = 'no work folder found'
                 if ($ltDir -and ([IO.Path]::GetFileName($ltDir) -like 'MRC-*') -and ([IO.Path]::GetDirectoryName($ltDir) -ieq (Join-Path $env:windir 'Temp'))) {
-                    Remove-Item -LiteralPath $ltDir -Recurse -Force -ErrorAction SilentlyContinue
-                    $ltDel = "work folder $ltDir deleted"
+                    # Only a plain work folder of this tool is deleted: no link (junction / symlink), no subfolder, only the files the engine writes.
+                    $ltDel = "work folder $ltDir left in place (not a plain MRC work folder: a link, a subfolder or an unknown file)"; try { $ltIt = Get-Item -LiteralPath $ltDir -Force -ErrorAction Stop; $ltKids = @(Get-ChildItem -LiteralPath $ltDir -Force -ErrorAction Stop); if (-not ($ltIt.Attributes -band [IO.FileAttributes]::ReparsePoint) -and -not @($ltKids | Where-Object { $_.PSIsContainer -or ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -or (@('out.txt','err.txt','run.cmd','launcher.ps1','pw.txt') -notcontains $_.Name) }).Count) { foreach ($ltK in $ltKids) { [IO.File]::Delete($ltK.FullName) }; [IO.Directory]::Delete($ltDir, $false); $ltDel = "work folder $ltDir deleted" } } catch {}
                 }
                 $elog.Add("[$env:COMPUTERNAME] removed leftover task $ltName ($ltDel)")
             }
@@ -977,7 +986,7 @@ function Invoke-RemoteServerEncryption {
                     $stderr = (Get-Content -LiteralPath (Join-Path $work 'err.txt') -Raw -ErrorAction SilentlyContinue)
                 }
                 Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
-                if ($work -and ([IO.Path]::GetFileName($work) -like 'MRC-*') -and ([IO.Path]::GetDirectoryName($work) -ieq (Join-Path $env:windir 'Temp'))) { Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue }
+                if ($work -and ([IO.Path]::GetFileName($work) -like 'MRC-*') -and ([IO.Path]::GetDirectoryName($work) -ieq (Join-Path $env:windir 'Temp'))) { try { $wIt = Get-Item -LiteralPath $work -Force -ErrorAction Stop; $wKids = @(Get-ChildItem -LiteralPath $work -Force -ErrorAction Stop); if (-not ($wIt.Attributes -band [IO.FileAttributes]::ReparsePoint) -and -not @($wKids | Where-Object { $_.PSIsContainer -or ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -or (@('out.txt','err.txt','run.cmd','launcher.ps1','pw.txt') -notcontains $_.Name) }).Count) { foreach ($wK in $wKids) { [IO.File]::Delete($wK.FullName) }; [IO.Directory]::Delete($work, $false) } } catch {} }
                 $elog.Add("[$env:COMPUTERNAME] SC stdout: $(if ($stdout -and $stdout.Trim()) { $stdout.Trim() } else { '(empty)' })")
                 $elog.Add("[$env:COMPUTERNAME] SC stderr: $(if ($stderr -and $stderr.Trim()) { $stderr.Trim() } else { '(empty)' })")
                 $scKnown = Join-Path $env:ProgramData 'Milestone\Server Configurator\Logs\ServerConfiguratorApplication.log'; $scLog = if (Test-Path -LiteralPath $scKnown) { Get-Item -LiteralPath $scKnown } else { Get-ChildItem -Path (Join-Path $env:ProgramData 'Milestone') -Recurse -Filter '*.log' -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match 'erver.?onfigurator' } | Sort-Object LastWriteTime -Descending | Select-Object -First 1 }
@@ -1160,6 +1169,7 @@ function Confirm-ServerEncryption {
         $res = Invoke-Command @icm -ScriptBlock {
             param([string]$Tp, [string[]]$SkipSvc)
             $rlog = [System.Collections.Generic.List[string]]::new()
+            $callStart = Get-Date
             # IIS (W3SVC/WAS) is stopped by the management-server encryption toggle and the IDP
             # web depends on it - start it first, before the Milestone services that talk to it.
             $iisSel = { $_.DisplayName -match 'Milestone XProtect|VideoOS' -or $_.Name -match 'MilestoneEventServer|^W3SVC$|^WAS$' }
@@ -1199,10 +1209,36 @@ function Confirm-ServerEncryption {
                     if (-not $waiting.Count) { break }
                     Start-Sleep -Seconds 2
                 }
+                # A service can reach Running and terminate seconds later (a Recording Server whose configuration
+                # ServerConfigurator left half-set stops 1-3 s after every start), so the started services must
+                # stay Running for 8 s before they count as up; stop watching as soon as one leaves Running.
+                $alive = @($started | Where-Object { $_.Refresh(); [string]$_.Status -eq 'Running' })
+                if ($alive.Count) {
+                    $stableUntil = (Get-Date).AddSeconds(8)
+                    while ((Get-Date) -lt $stableUntil) {
+                        Start-Sleep -Seconds 1
+                        if (@($alive | Where-Object { $_.Refresh(); [string]$_.Status -ne 'Running' }).Count) { break }
+                    }
+                }
                 $rlog.Add("[$env:COMPUTERNAME] services started together in $([int]$swStart.Elapsed.TotalSeconds) s")
             }
             $svc = @(Get-Service | Where-Object $iisSel | Where-Object { [string]$_.StartType -ne 'Disabled' -and $left -notcontains $_.Name })
             $stopped = @($svc | Where-Object { $_.Status -ne 'Running' } | Select-Object -ExpandProperty Name)
+            if ($stopped.Count) {
+                # Why it stopped: the newest Application log error since this call began whose source is the
+                # service's display name (Milestone services log their fatal start errors there). Log only -
+                # Stopped stays bare service names, callers filter on them; event text must never reach a verdict.
+                $evs = @(Get-WinEvent -FilterHashtable @{ LogName = 'Application'; Level = 1, 2; StartTime = $callStart } -MaxEvents 20 -ErrorAction SilentlyContinue)
+                foreach ($n in $stopped) {
+                    $dn = [string]($svc | Where-Object { $_.Name -eq $n } | Select-Object -First 1).DisplayName
+                    $own = @($evs | Where-Object { $dn -and [string]$_.ProviderName -eq $dn })
+                    $ev = @(@($own | Where-Object { [string]$_.Message -match 'terminat' }) + $own) | Select-Object -First 1
+                    if ($ev) {
+                        $m = ([string]$ev.Message -replace '\s+', ' ').Trim(); $m = $m.Substring(0, [Math]::Min(200, $m.Length))
+                        $rlog.Add("[$env:COMPUTERNAME] $n stopped - Application log: $m")
+                    }
+                }
+            }
             $binds = (netsh http show sslcert) -join "`n"
             $bound = $binds -match $Tp
             $rlog.Add("[$env:COMPUTERNAME] cert $Tp bound: $bound")
@@ -3116,7 +3152,7 @@ $script:ScRegisterSb = {
     # Leftovers of an earlier attempt (a dropped session, a closed window): MRC-SCSys-* / MRC-SCReg-* tasks and their
     # work folders. A task that is not running is unregistered and its work folder (only %windir%\Temp\MRC-*) deleted.
     # A task that is still running is waited for (up to 20 minutes) and never stopped; then it is cleaned the same way.
-    foreach ($ltTask in @(Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -like 'MRC-SCSys-*' -or $_.TaskName -like 'MRC-SCReg-*' })) {
+    foreach ($ltTask in @(Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { ($_.TaskName -like 'MRC-SCSys-*' -or $_.TaskName -like 'MRC-SCReg-*') -and (@('SYSTEM','NT AUTHORITY\SYSTEM','S-1-5-18') -contains [string]$_.Principal.UserId) })) {
         $ltName = [string]$ltTask.TaskName
         if ([string]$ltTask.State -eq 'Running') {
             $elog.Add("[$env:COMPUTERNAME] leftover task $ltName is still running - waiting up to 20 minutes for it to finish (it is not stopped)")
@@ -3134,8 +3170,8 @@ $script:ScRegisterSb = {
         Unregister-ScheduledTask -TaskName $ltName -Confirm:$false -ErrorAction SilentlyContinue
         $ltDel = 'no work folder found'
         if ($ltDir -and ([IO.Path]::GetFileName($ltDir) -like 'MRC-*') -and ([IO.Path]::GetDirectoryName($ltDir) -ieq (Join-Path $env:windir 'Temp'))) {
-            Remove-Item -LiteralPath $ltDir -Recurse -Force -ErrorAction SilentlyContinue
-            $ltDel = "work folder $ltDir deleted"
+            # Only a plain work folder of this tool is deleted: no link (junction / symlink), no subfolder, only the files the engine writes.
+            $ltDel = "work folder $ltDir left in place (not a plain MRC work folder: a link, a subfolder or an unknown file)"; try { $ltIt = Get-Item -LiteralPath $ltDir -Force -ErrorAction Stop; $ltKids = @(Get-ChildItem -LiteralPath $ltDir -Force -ErrorAction Stop); if (-not ($ltIt.Attributes -band [IO.FileAttributes]::ReparsePoint) -and -not @($ltKids | Where-Object { $_.PSIsContainer -or ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -or (@('out.txt','err.txt','run.cmd','launcher.ps1','pw.txt') -notcontains $_.Name) }).Count) { foreach ($ltK in $ltKids) { [IO.File]::Delete($ltK.FullName) }; [IO.Directory]::Delete($ltDir, $false); $ltDel = "work folder $ltDir deleted" } } catch {}
         }
         $elog.Add("[$env:COMPUTERNAME] removed leftover task $ltName ($ltDel)")
     }
@@ -3407,7 +3443,7 @@ function Wait-ClusterGroupSettled { param([string]$Key,[int]$TimeoutSec=300,[int
 # the role's Milestone services offline (IP + name stay online), then moves only the address there.
 $script:MsTouched = $false; $script:MsLive = $null
 function Initialize-MsTracking {
-    $script:MsTouched = $false; $script:MsLive = $null
+    $script:MsTouched = $false; $script:MsLive = $null; $script:MsSecretSyncNote = ''
     if(-not $script:MsCluster){ return }
     [void](Update-ClusterInfo 'MS')
     $script:MsLastRegistered = [string]$script:MsCluster.Owner
@@ -3415,6 +3451,310 @@ function Initialize-MsTracking {
 function Set-MsRegistered { param([string]$Node)
     $script:MsLastRegistered = $Node
     $script:MsStaleNodes = @(@($script:MsNodeBoxes) | Where-Object { [string]$_.Target -ne $Node } | ForEach-Object { [string]$_.Name })
+}
+# -- Management Server cluster: copy of the IDP secrets to every node (lab-proven 2026-09-24) ------
+# Every ServerConfigurator run on one MS node replaces the single IDP client secret per component in the
+# Surveillance_IDP database and stores a copy ONLY on that node (idp.sec, protected for NETWORK SERVICE).
+# The other node then fails with 'Idp returned 400 invalid_client' until it is registered itself. This copy
+# reads the secrets on the node registered last and writes them on every other MS node, with Milestone's own
+# crypto library (VideoOS.Common.Crypto.FileSecretProvider) as NETWORK SERVICE - an undocumented use of
+# Milestone internals (tools/Sync-MsClusterSecret.ps1 is the lab tool this is ported from). Nothing here is
+# fatal: every failure is logged and leaves the old behavior (the node stays on the stale list). The values
+# exist for seconds as base64 files in a work folder only Administrators, SYSTEM and NETWORK SERVICE can open,
+# deleted in a finally; they are never logged. Each scriptblock carries only its own text (no outside functions).
+$script:MsSecretReadSb = {
+    $ErrorActionPreference = 'Stop'
+    $out = [pscustomobject]@{ Ok = $false; Skipped = $false; Computer = $env:COMPUTERNAME; Account = ''; Reason = ''; Folders = @(); Blobs = @(); Log = @() }
+    $lg = [System.Collections.Generic.List[string]]::new()
+    $work = $null; $tn = $null
+    try {
+        $pd = [string]$env:ProgramData
+        $svcs = @(Get-CimInstance Win32_Service -ErrorAction Stop | Where-Object { [string]$_.DisplayName -eq 'Milestone XProtect Management Server' })
+        if (-not $svcs.Count) { $out.Reason = "the service 'Milestone XProtect Management Server' was not found on $env:COMPUTERNAME" }
+        else {
+            $svc = $svcs[0]
+            $out.Account = [string]$svc.StartName
+            if ($out.Account -inotmatch '^(NT AUTHORITY\\)?(NetworkService|Network Service)$') { $out.Skipped = $true; $out.Reason = "the Management Server service runs as '$($out.Account)', not as NETWORK SERVICE" }
+            else {
+                $dll = ''; $cands = @()
+                if ([string]$svc.PathName -match '^\s*"?([^"]+?\.exe)') { $cands += (Join-Path ([IO.Path]::GetDirectoryName($Matches[1])) 'VideoOS.Common.Crypto.dll') }
+                $cands += (Join-Path $env:ProgramFiles 'Milestone\XProtect Management Server\VideoOS.Common.Crypto.dll')
+                foreach ($c in $cands) { if (Test-Path -LiteralPath $c -PathType Leaf) { $dll = $c; break } }
+                if (-not $dll) { $out.Reason = "VideoOS.Common.Crypto.dll was not found (looked in: $($cands -join '; '))" }
+                else {
+                    $fs = @()
+                    foreach ($f in @((Join-Path $pd 'Milestone\XProtect Management Server'), (Join-Path $pd 'Milestone\XProtect Management Server\IIS\ManagementServer'), (Join-Path $pd 'Milestone\XProtect API Gateway'), (Join-Path $pd 'Milestone\XProtect Data Collector Server'))) {
+                        if (Test-Path -LiteralPath (Join-Path $f 'idp.sec') -PathType Leaf) { $fs += $f }
+                    }
+                    if (-not $fs.Count) { $out.Reason = 'no idp.sec file was found in any of the four Milestone folders' }
+                    else {
+                        $tmpRoot = Join-Path $env:windir 'Temp'
+                        # Leftovers of an earlier copy: not-running MRC-SecRead-* / MRC-SecWrite-* tasks of NETWORK SERVICE, and plain MRC-sec-* work folders.
+                        $nsIds = @('NT AUTHORITY\NETWORK SERVICE', 'NETWORK SERVICE', 'NT AUTHORITY\NetworkService', 'S-1-5-20')
+                        $busy = $false
+                        foreach ($lt in @(Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { ($_.TaskName -like 'MRC-SecRead-*' -or $_.TaskName -like 'MRC-SecWrite-*') -and ($nsIds -icontains ([string]$_.Principal.UserId)) })) {
+                            if ([string]$lt.State -eq 'Running') { $busy = $true; continue }
+                            Unregister-ScheduledTask -TaskName ([string]$lt.TaskName) -Confirm:$false -ErrorAction SilentlyContinue
+                            $lg.Add("removed leftover task $($lt.TaskName)")
+                        }
+                        if (-not $busy) {
+                            foreach ($ld in @(Get-ChildItem -LiteralPath $tmpRoot -Directory -Filter 'MRC-sec-*' -Force -ErrorAction SilentlyContinue)) {
+                                $ldMsg = "leftover work folder $($ld.FullName) left in place (not a plain MRC work folder: a link, a subfolder or an unknown file)"
+                                try {
+                                    $ldKids = @(Get-ChildItem -LiteralPath $ld.FullName -Force -ErrorAction Stop) ; $ldOwn = [string](Get-Acl -LiteralPath $ld.FullName -ErrorAction Stop).GetOwner([System.Security.Principal.SecurityIdentifier]).Value; $ldOwnOk = (@('S-1-5-32-544', 'S-1-5-18', [Security.Principal.WindowsIdentity]::GetCurrent().User.Value) -icontains $ldOwn)
+                                    if ($ldOwnOk -and -not ($ld.Attributes -band [IO.FileAttributes]::ReparsePoint) -and -not @($ldKids | Where-Object { $_.PSIsContainer -or ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -or ($_.Name -inotmatch '^(folders\.txt|r\.ps1|w\.ps1|log\.txt|s\d+\.b64)$') }).Count) {
+                                        foreach ($ldK in $ldKids) { [IO.File]::Delete($ldK.FullName) }
+                                        [IO.Directory]::Delete($ld.FullName, $false)
+                                        $ldMsg = "removed leftover work folder $($ld.FullName)"
+                                    }
+                                } catch {}
+                                $lg.Add($ldMsg)
+                            }
+                        }
+                        # Work folder: created with its protected ACL (Administrators, SYSTEM, NETWORK SERVICE) BEFORE any file is written.
+                        $work = Join-Path $tmpRoot ('MRC-sec-' + [guid]::NewGuid().ToString('N'))
+                        $acl = New-Object System.Security.AccessControl.DirectorySecurity
+                        $acl.SetAccessRuleProtection($true, $false)
+                        foreach ($sid in @('S-1-5-32-544', 'S-1-5-18', 'S-1-5-20')) {
+                            $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule((New-Object System.Security.Principal.SecurityIdentifier($sid)), 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+                        }
+                        [void][IO.Directory]::CreateDirectory($work, $acl)
+                        [IO.File]::WriteAllLines((Join-Path $work 'folders.txt'), [string[]]$fs)
+                        $rs = @'
+$ErrorActionPreference = 'Continue'
+$w = '@@WORK@@'
+$lg = Join-Path $w 'log.txt'
+try { $a = [Reflection.Assembly]::LoadFrom('@@DLL@@') } catch { ('assembly load failed: ' + $_.Exception.Message) | Add-Content -LiteralPath $lg; exit 1 }
+('running as ' + [Security.Principal.WindowsIdentity]::GetCurrent().Name) | Add-Content -LiteralPath $lg
+$t = $a.GetType('VideoOS.Common.Crypto.FileSecretProvider')
+if (-not $t) { 'FileSecretProvider type not found' | Add-Content -LiteralPath $lg; exit 1 }
+$i = 0
+foreach ($f in @(Get-Content -LiteralPath (Join-Path $w 'folders.txt'))) {
+  $i++; $p = $null; $plain = $null; $how = ''
+  try { $p = [Activator]::CreateInstance($t, [object[]]@([string]$f, 'idp.tmp', 'idp.sec')) } catch { $m = $_.Exception.Message; if ($_.Exception.InnerException) { $m += ' / ' + $_.Exception.InnerException.Message }; ('s' + $i + ' ctor failed: ' + $m) | Add-Content -LiteralPath $lg; continue }
+  try { $enc = $p.ReadSecret() } catch { $m = $_.Exception.Message; if ($_.Exception.InnerException) { $m += ' / ' + $_.Exception.InnerException.Message }; ('s' + $i + ' read failed: ' + $m) | Add-Content -LiteralPath $lg; continue }
+  foreach ($scope in 'CurrentUser', 'LocalMachine') { try { $plain = $p.DecryptSecret($enc, [Security.Cryptography.DataProtectionScope]::$scope); $how = $scope; break } catch {} }
+  if ($plain) { [IO.File]::WriteAllText((Join-Path $w ('s' + $i + '.b64')), [Convert]::ToBase64String($plain)); ('s' + $i + ' ok scope=' + $how) | Add-Content -LiteralPath $lg }
+  else { ('s' + $i + ' FAILED to decrypt') | Add-Content -LiteralPath $lg }
+}
+'@
+                        $rs = $rs.Replace('@@WORK@@', $work.Replace("'", "''")).Replace('@@DLL@@', $dll.Replace("'", "''"))
+                        [IO.File]::WriteAllText((Join-Path $work 'r.ps1'), $rs)
+                        $tn = 'MRC-SecRead-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
+                        [void](Register-ScheduledTask -TaskName $tn -Principal (New-ScheduledTaskPrincipal -UserId 'NT AUTHORITY\NETWORK SERVICE' -LogonType ServiceAccount) -Action (New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -ExecutionPolicy Bypass -File "' + (Join-Path $work 'r.ps1') + '"')))
+                        Start-ScheduledTask -TaskName $tn
+                        $t0 = Get-Date
+                        do {
+                            Start-Sleep -Seconds 2
+                            $st = Get-ScheduledTask -TaskName $tn -ErrorAction SilentlyContinue
+                            $notYet = $false
+                            if ($st -and [string]$st.State -ne 'Running') { $notYet = ([int](Get-ScheduledTaskInfo -TaskName $tn -ErrorAction SilentlyContinue).LastTaskResult -eq 267011) }
+                        } while ($st -and ([string]$st.State -eq 'Running' -or $notYet) -and ((Get-Date) - $t0).TotalSeconds -lt 90)
+                        $lgFile = Join-Path $work 'log.txt'
+                        if (Test-Path -LiteralPath $lgFile) { foreach ($l in @(Get-Content -LiteralPath $lgFile)) { $lg.Add([string]$l) } }
+                        $blobs = @()
+                        for ($i = 1; $i -le $fs.Count; $i++) {
+                            $bf = Join-Path $work ('s' + $i + '.b64')
+                            if (Test-Path -LiteralPath $bf -PathType Leaf) { $blobs += ([IO.File]::ReadAllText($bf)).Trim() } else { $blobs += '' }
+                        }
+                        $have = @($blobs | Where-Object { $_ }).Count
+                        if ($have -eq $fs.Count) { $out.Folders = @($fs); $out.Blobs = @($blobs); $out.Ok = $true } else { $out.Reason = "$have of $($fs.Count) secret(s) could be read" }
+                    }
+                }
+            }
+        }
+    } catch { $out.Ok = $false; $out.Blobs = @(); $out.Reason = "$($_.Exception.Message)" }
+    finally {
+        if ($tn) {
+            try { $tk = Get-ScheduledTask -TaskName $tn -ErrorAction SilentlyContinue; if ($tk -and [string]$tk.State -eq 'Running') { Stop-ScheduledTask -TaskName $tn -ErrorAction SilentlyContinue } } catch {}
+            Unregister-ScheduledTask -TaskName $tn -Confirm:$false -ErrorAction SilentlyContinue
+        }
+        if ($work -and (Test-Path -LiteralPath $work)) {
+            try {
+                $wIt = Get-Item -LiteralPath $work -Force -ErrorAction Stop
+                if (-not ($wIt.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                    foreach ($wk in @(Get-ChildItem -LiteralPath $work -Force -ErrorAction Stop)) { if (-not $wk.PSIsContainer -and -not ($wk.Attributes -band [IO.FileAttributes]::ReparsePoint)) { [IO.File]::Delete($wk.FullName) } }
+                    [IO.Directory]::Delete($work, $false)
+                }
+            } catch { $lg.Add("work folder $work could not be deleted: $($_.Exception.Message)") }
+        }
+    }
+    $out.Log = @($lg.ToArray())
+    $out
+}
+$script:MsSecretWriteSb = {
+    param([string]$FoldersJoined, [string]$BlobsJoined, [string]$Source)
+    $ErrorActionPreference = 'Stop'
+    $out = [pscustomobject]@{ Ok = $false; Skipped = $false; Computer = $env:COMPUTERNAME; Account = ''; Reason = ''; Written = 0; Failed = 0; Log = @() }
+    $lg = [System.Collections.Generic.List[string]]::new()
+    $work = $null; $tn = $null
+    try {
+        $pd = [string]$env:ProgramData
+        $known = @((Join-Path $pd 'Milestone\XProtect Management Server'), (Join-Path $pd 'Milestone\XProtect Management Server\IIS\ManagementServer'), (Join-Path $pd 'Milestone\XProtect API Gateway'), (Join-Path $pd 'Milestone\XProtect Data Collector Server'))
+        $fs = @($FoldersJoined -split '\|' | Where-Object { $_ }); $bs = @($BlobsJoined -split '\|' | Where-Object { $_ })
+        $svcs = @(Get-CimInstance Win32_Service -ErrorAction Stop | Where-Object { [string]$_.DisplayName -eq 'Milestone XProtect Management Server' })
+        if (-not $svcs.Count) { $out.Reason = "the service 'Milestone XProtect Management Server' was not found on $env:COMPUTERNAME" }
+        else {
+            $svc = $svcs[0]
+            $out.Account = [string]$svc.StartName
+            if ($out.Account -inotmatch '^(NT AUTHORITY\\)?(NetworkService|Network Service)$') { $out.Skipped = $true; $out.Reason = "the Management Server service runs as '$($out.Account)', not as NETWORK SERVICE" }
+            elseif (-not $fs.Count -or $fs.Count -ne $bs.Count) { $out.Reason = 'the folder list and the secret list do not match' }
+            elseif (@($fs | Where-Object { $f1 = $_; -not @($known | Where-Object { $_ -ieq $f1 }).Count }).Count) { $out.Reason = 'the folder list holds a folder that is not one of the four Milestone folders' }
+            elseif (@($bs | Where-Object { $_ -notmatch '^[A-Za-z0-9+/=]+$' }).Count) { $out.Reason = 'a secret has an unexpected format' }
+            else {
+                $dll = ''; $cands = @()
+                if ([string]$svc.PathName -match '^\s*"?([^"]+?\.exe)') { $cands += (Join-Path ([IO.Path]::GetDirectoryName($Matches[1])) 'VideoOS.Common.Crypto.dll') }
+                $cands += (Join-Path $env:ProgramFiles 'Milestone\XProtect Management Server\VideoOS.Common.Crypto.dll')
+                foreach ($c in $cands) { if (Test-Path -LiteralPath $c -PathType Leaf) { $dll = $c; break } }
+                if (-not $dll) { $out.Reason = "VideoOS.Common.Crypto.dll was not found (looked in: $($cands -join '; '))" }
+                else {
+                    $tmpRoot = Join-Path $env:windir 'Temp'
+                    # Leftovers of an earlier copy: not-running MRC-SecRead-* / MRC-SecWrite-* tasks of NETWORK SERVICE, and plain MRC-sec-* work folders.
+                    $nsIds = @('NT AUTHORITY\NETWORK SERVICE', 'NETWORK SERVICE', 'NT AUTHORITY\NetworkService', 'S-1-5-20')
+                    $busy = $false
+                    foreach ($lt in @(Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { ($_.TaskName -like 'MRC-SecRead-*' -or $_.TaskName -like 'MRC-SecWrite-*') -and ($nsIds -icontains ([string]$_.Principal.UserId)) })) {
+                        if ([string]$lt.State -eq 'Running') { $busy = $true; continue }
+                        Unregister-ScheduledTask -TaskName ([string]$lt.TaskName) -Confirm:$false -ErrorAction SilentlyContinue
+                        $lg.Add("removed leftover task $($lt.TaskName)")
+                    }
+                    if (-not $busy) {
+                        foreach ($ld in @(Get-ChildItem -LiteralPath $tmpRoot -Directory -Filter 'MRC-sec-*' -Force -ErrorAction SilentlyContinue)) {
+                            $ldMsg = "leftover work folder $($ld.FullName) left in place (not a plain MRC work folder: a link, a subfolder or an unknown file)"
+                            try {
+                                $ldKids = @(Get-ChildItem -LiteralPath $ld.FullName -Force -ErrorAction Stop) ; $ldOwn = [string](Get-Acl -LiteralPath $ld.FullName -ErrorAction Stop).GetOwner([System.Security.Principal.SecurityIdentifier]).Value; $ldOwnOk = (@('S-1-5-32-544', 'S-1-5-18', [Security.Principal.WindowsIdentity]::GetCurrent().User.Value) -icontains $ldOwn)
+                                if ($ldOwnOk -and -not ($ld.Attributes -band [IO.FileAttributes]::ReparsePoint) -and -not @($ldKids | Where-Object { $_.PSIsContainer -or ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -or ($_.Name -inotmatch '^(folders\.txt|r\.ps1|w\.ps1|log\.txt|s\d+\.b64)$') }).Count) {
+                                    foreach ($ldK in $ldKids) { [IO.File]::Delete($ldK.FullName) }
+                                    [IO.Directory]::Delete($ld.FullName, $false)
+                                    $ldMsg = "removed leftover work folder $($ld.FullName)"
+                                }
+                            } catch {}
+                            $lg.Add($ldMsg)
+                        }
+                    }
+                    # Work folder: created with its protected ACL (Administrators, SYSTEM, NETWORK SERVICE) BEFORE any file is written.
+                    $work = Join-Path $tmpRoot ('MRC-sec-' + [guid]::NewGuid().ToString('N'))
+                    $acl = New-Object System.Security.AccessControl.DirectorySecurity
+                    $acl.SetAccessRuleProtection($true, $false)
+                    foreach ($sid in @('S-1-5-32-544', 'S-1-5-18', 'S-1-5-20')) {
+                        $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule((New-Object System.Security.Principal.SecurityIdentifier($sid)), 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+                    }
+                    [void][IO.Directory]::CreateDirectory($work, $acl)
+                    [IO.File]::WriteAllLines((Join-Path $work 'folders.txt'), [string[]]$fs)
+                    for ($i = 0; $i -lt $fs.Count; $i++) { if (Test-Path -LiteralPath $fs[$i] -PathType Container) { [IO.File]::WriteAllText((Join-Path $work ('s' + ($i + 1) + '.b64')), [string]$bs[$i]) } }
+                    $ws = @'
+$ErrorActionPreference = 'Continue'
+$w = '@@WORK@@'
+$lg = Join-Path $w 'log.txt'
+try { $a = [Reflection.Assembly]::LoadFrom('@@DLL@@') } catch { ('assembly load failed: ' + $_.Exception.Message) | Add-Content -LiteralPath $lg; exit 1 }
+('running as ' + [Security.Principal.WindowsIdentity]::GetCurrent().Name) | Add-Content -LiteralPath $lg
+$t = $a.GetType('VideoOS.Common.Crypto.FileSecretProvider')
+if (-not $t) { 'FileSecretProvider type not found' | Add-Content -LiteralPath $lg; exit 1 }
+$i = 0
+foreach ($f in @(Get-Content -LiteralPath (Join-Path $w 'folders.txt'))) {
+  $i++; $src = Join-Path $w ('s' + $i + '.b64')
+  if (-not (Test-Path -LiteralPath $src)) { ('w' + $i + ' skipped (folder not present on this node)') | Add-Content -LiteralPath $lg; continue }
+  try {
+    $p = [Activator]::CreateInstance($t, [object[]]@([string]$f, 'idp.tmp', 'idp.sec'))
+    $plain = [Convert]::FromBase64String(([IO.File]::ReadAllText($src)).Trim())
+    $enc = $p.EncryptSecret($plain, [Security.Cryptography.DataProtectionScope]::CurrentUser)
+    $perm = Join-Path ([string]$f) 'idp.sec'
+    if (Test-Path -LiteralPath $perm) { Copy-Item -LiteralPath $perm -Destination ($perm + '.bak-mrc') -Force }
+    $p.WriteSecret($enc)
+    $chk = $p.DecryptSecret($p.ReadSecret(), [Security.Cryptography.DataProtectionScope]::CurrentUser)
+    $same = ($chk.Length -eq $plain.Length)
+    if ($same) { for ($k = 0; $k -lt $plain.Length; $k++) { if ($chk[$k] -ne $plain[$k]) { $same = $false; break } } }
+    if ($same) { ('w' + $i + ' OK written and read back') | Add-Content -LiteralPath $lg } else { ('w' + $i + ' FAILED read-back differs') | Add-Content -LiteralPath $lg }
+  } catch { $m = $_.Exception.Message; if ($_.Exception.InnerException) { $m += ' / ' + $_.Exception.InnerException.Message }; ('w' + $i + ' FAILED: ' + $m) | Add-Content -LiteralPath $lg }
+  try { [IO.File]::Delete($src) } catch {}
+}
+'@
+                    $ws = $ws.Replace('@@WORK@@', $work.Replace("'", "''")).Replace('@@DLL@@', $dll.Replace("'", "''"))
+                    [IO.File]::WriteAllText((Join-Path $work 'w.ps1'), $ws)
+                    $tn = 'MRC-SecWrite-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
+                    [void](Register-ScheduledTask -TaskName $tn -Principal (New-ScheduledTaskPrincipal -UserId 'NT AUTHORITY\NETWORK SERVICE' -LogonType ServiceAccount) -Action (New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -ExecutionPolicy Bypass -File "' + (Join-Path $work 'w.ps1') + '"')))
+                    Start-ScheduledTask -TaskName $tn
+                    $t0 = Get-Date
+                    do {
+                        Start-Sleep -Seconds 2
+                        $st = Get-ScheduledTask -TaskName $tn -ErrorAction SilentlyContinue
+                        $notYet = $false
+                        if ($st -and [string]$st.State -ne 'Running') { $notYet = ([int](Get-ScheduledTaskInfo -TaskName $tn -ErrorAction SilentlyContinue).LastTaskResult -eq 267011) }
+                    } while ($st -and ([string]$st.State -eq 'Running' -or $notYet) -and ((Get-Date) - $t0).TotalSeconds -lt 90)
+                    $lgFile = Join-Path $work 'log.txt'
+                    if (Test-Path -LiteralPath $lgFile) { foreach ($l in @(Get-Content -LiteralPath $lgFile)) { $lg.Add([string]$l) } }
+                    $out.Written = @($lg | Where-Object { $_ -match '^w\d+ OK ' }).Count
+                    $out.Failed = @($lg | Where-Object { $_ -match '^w\d+ FAILED' }).Count
+                    if ($out.Written -gt 0 -and $out.Failed -eq 0) {
+                        $out.Ok = $true
+                        # Marker (admin session): Mrc-Doctor reads it to see that this node got the secrets of the node registered last.
+                        $mk = Join-Path $pd 'Milestone\XProtect Management Server\mrc-secret-copy.json'
+                        $mj = (New-Object PSObject -Property ([ordered]@{ Source = [string]$Source; CopiedUtc = [DateTime]::UtcNow.ToString('o'); Folders = [int]$out.Written })) | ConvertTo-Json
+                        [IO.File]::WriteAllText($mk, $mj, (New-Object System.Text.UTF8Encoding($false)))
+                    } else { $out.Reason = "$($out.Written) written, $($out.Failed) failed" }
+                }
+            }
+        }
+    } catch { $out.Ok = $false; $out.Reason = "$($_.Exception.Message)" }
+    finally {
+        if ($tn) {
+            try { $tk = Get-ScheduledTask -TaskName $tn -ErrorAction SilentlyContinue; if ($tk -and [string]$tk.State -eq 'Running') { Stop-ScheduledTask -TaskName $tn -ErrorAction SilentlyContinue } } catch {}
+            Unregister-ScheduledTask -TaskName $tn -Confirm:$false -ErrorAction SilentlyContinue
+        }
+        if ($work -and (Test-Path -LiteralPath $work)) {
+            try {
+                $wIt = Get-Item -LiteralPath $work -Force -ErrorAction Stop
+                if (-not ($wIt.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                    foreach ($wk in @(Get-ChildItem -LiteralPath $work -Force -ErrorAction Stop)) { if (-not $wk.PSIsContainer -and -not ($wk.Attributes -band [IO.FileAttributes]::ReparsePoint)) { [IO.File]::Delete($wk.FullName) } }
+                    [IO.Directory]::Delete($work, $false)
+                }
+            } catch { $lg.Add("work folder $work could not be deleted: $($_.Exception.Message)") }
+        }
+    }
+    $out.Log = @($lg.ToArray())
+    $out
+}
+# Copy the MS IDP secrets from $Source (the node registered last) to every other MS node. Never throws, never
+# fails the run: success clears the nodes from the stale list; a failed, skipped or unreachable node stays on it.
+$script:MsSecretSyncNote = ''
+function Sync-MsClusterSecrets { param([string]$Source)
+    $res = [pscustomobject]@{ Ran = $false; Copied = @(); Failed = @(); Skipped = @() }
+    $script:MsSecretSyncNote = ''
+    if(-not $script:MsCluster -or -not $Source){ return $res }
+    $sb = Get-NodeBox 'MS' $Source
+    $targets = @(Get-NodeBoxes 'MS' | Where-Object { [string]$_.Target -ne $Source })
+    if(-not $sb -or -not $targets.Count){ return $res }
+    $res.Ran = $true
+    $names = ((@($targets | ForEach-Object { [string]$_.Name })) -join ', ')
+    Write-Log "Management Server secrets: copying them from $($sb.Name) (registered last) to $names, so every node can start the Management Server. This uses Milestone's own crypto library in a way Milestone does not document." 'Info'
+    $rd = $null
+    try { $rd = Get-First -Items @(Invoke-OnNode -Node $sb.Target -Cred $sb.Cred -Sb $script:MsSecretReadSb) }
+    catch { $rd = [pscustomobject]@{ Ok = $false; Skipped = $false; Account = ''; Reason = (Get-FirstLine $_.Exception.Message); Folders = @(); Blobs = @(); Log = @() } }
+    if($rd){ foreach($l in @($rd.Log)){ Write-Log "[$($sb.Name)] $l" 'Info' } }
+    if(-not $rd -or -not $rd.Ok){
+        $why = if($rd){ [string]$rd.Reason } else { 'no answer' }
+        if($rd -and $rd.Skipped){ $res.Skipped = @($targets | ForEach-Object { [string]$_.Name }); Write-Log "Management Server secrets NOT copied: $why. $names stay on the list of nodes that cannot take over." 'Err' }
+        else { $res.Failed = @($targets | ForEach-Object { [string]$_.Name }); Write-Log "Management Server secrets NOT copied: the secrets could not be read on $($sb.Name) ($why). $names stay on the list of nodes that cannot take over." 'Err' }
+        $script:MsSecretSyncNote = "The automatic copy of the Management Server secrets did not work ($why)."
+        return $res
+    }
+    $fj = (@($rd.Folders) -join '|'); $bj = (@($rd.Blobs) -join '|')
+    foreach($t in $targets){
+        $nm = [string]$t.Name
+        $down = @(@($script:MsCluster.Nodes) | Where-Object { [string]$_.Name -eq [string]$t.Target -and [string]$_.State -eq 'Down' }).Count
+        if($down){ $res.Failed += $nm; Write-Log "[$nm] is Down - the secrets were not copied to it. It stays on the list of nodes that cannot take over." 'Err'; continue }
+        $wr = $null
+        try { $wr = Get-First -Items @(Invoke-OnNode -Node $t.Target -Cred $t.Cred -Sb $script:MsSecretWriteSb -ArgumentList @($fj,$bj,[string]$sb.Target)) }
+        catch { $wr = [pscustomobject]@{ Ok = $false; Skipped = $false; Account = ''; Reason = (Get-FirstLine $_.Exception.Message); Written = 0; Failed = 0; Log = @() } }
+        if($wr){ foreach($l in @($wr.Log)){ Write-Log "[$nm] $l" 'Info' } }
+        if($wr -and $wr.Ok){ $res.Copied += $nm }
+        elseif($wr -and $wr.Skipped){ $res.Skipped += $nm; Write-Log "[$nm] secrets NOT copied: $($wr.Reason). It stays on the list of nodes that cannot take over." 'Err' }
+        else { $res.Failed += $nm; Write-Log "[$nm] secrets NOT copied: $(if($wr){ $wr.Reason } else { 'no answer' }). It stays on the list of nodes that cannot take over." 'Err' }
+    }
+    $fj = $null; $bj = $null; $rd = $null
+    if(@($res.Copied).Count){ $script:MsStaleNodes = @(@($script:MsStaleNodes) | Where-Object { @($res.Copied) -notcontains [string]$_ }) }
+    if(@($res.Copied).Count -eq $targets.Count){ Write-Log "Management Server secrets copied from $($sb.Name) to $((@($res.Copied)) -join ', ') - every node can now start the Management Server." 'Good' }
+    else { $script:MsSecretSyncNote = "The automatic copy of the Management Server secrets worked on $(if(@($res.Copied).Count){ (@($res.Copied)) -join ', ' } else { 'no node' }) only - see the log." }
+    $res
 }
 # Fix-1 takeover: stop the MS role's Generic Service resources, then move the role (only IP and name
 # move, so this no longer depends on the Management Server starting on a node that is not registered).
@@ -4116,6 +4456,7 @@ function Repair-ClusterRegistrations { param([string]$Key,[object[]]$Findings)
         if(-not $mv.Ok -or -not $ob){ $ok = $false; Write-Log "The cluster role '$($cl.Group)' could not be moved back to $orig. Move it in Failover Cluster Manager (Roles > right-click '$($cl.Group)' > Move > Select Node)." 'Err' }
         else { $up = Wait-NodeService $Key $ob; if(-not $up.Up){ $ok = $false } }
     }
+    if($isMs -and $ok){ [void](Sync-MsClusterSecrets -Source ([string]$script:MsLastRegistered)) }
     $ok }
 function Repair-Registrations { param([object[]]$Findings)
     $f = @($Findings); $ok = $true
@@ -4337,6 +4678,8 @@ function Invoke-ClusterStage { param([string]$Key,[bool]$Want,[object[]]$Todo)
         return $false
     }
     [void](Update-ClusterInfo $Key)
+    # MS: every node that ran ServerConfigurator made the other nodes stale - copy the IDP secrets of the node registered last to them.
+    if($isMs){ [void](Sync-MsClusterSecrets -Source ([string]$script:MsLastRegistered)) }
     Set-StageStatus $Key "Done - encryption $wt on $(@($Todo).Count) cluster node(s); the role is on $($cl.Owner)" 'Good'
     $true
 }
@@ -4657,7 +5000,7 @@ function Restore-RoleOwners { param($Snap)
             Update-BoxStates @($box)
             try { $rg = Invoke-NodeRegister $box (Get-MsRegisterAddress ($box.Encrypted -eq $true)); $up = [pscustomobject]@{ Up=[bool]$rg.Ok; Detail=$rg.Detail } }
             catch { $up = [pscustomobject]@{ Up=$false; Detail=(Format-Err $_) } }
-            if(-not $up.Up){ Move-MsToWorkingNode }
+            if(-not $up.Up){ Move-MsToWorkingNode } else { [void](Sync-MsClusterSecrets -Source ([string]$script:MsLastRegistered)) }
         } else {
             $mv = Move-ClusterRole $k ([string]$r.Owner)
             if(-not $mv.Ok){ $ok = $false; Set-RunFailure 'Move cluster roles back' ([string]$r.Owner) "The cluster role '$($cl.Group)' could not be moved back to $($r.Owner)." $mv.Detail "Move it in Failover Cluster Manager (Roles > right-click '$($cl.Group)' > Move > Select Node)."; if($k -eq 'MS'){ Move-MsToWorkingNode }; continue }
@@ -4681,7 +5024,7 @@ function Invoke-FailoverTest {
         # Management Server: the node registered last must end up owning the role.
         if($k -eq 'MS' -and $script:MsLastRegistered){ $orig = [string]$script:MsLastRegistered }
         foreach($n in @(Get-NodeBoxes $k | Where-Object { [string]$_.Target -ne $orig })){
-            if($k -eq 'MS' -and [string]$n.Target -ne [string]$script:MsLastRegistered){
+            if($k -eq 'MS' -and @($script:MsStaleNodes) -contains [string]$n.Name){
                 # Known to fail AND it takes the Management Server down: not tested.
                 $det = "skipped - $($n.Name) cannot take over until it is re-registered (known Milestone limitation, see IMPORTANT)"
                 [void]$res.Add([pscustomobject]@{ Key=$k; Role=$role; Node=[string]$n.Name; Ok=$true; Skipped=$true; Detail=$det; Back=$false })
@@ -4733,6 +5076,7 @@ function Get-ClusterNotes {
         $g = $script:MsCluster.Group
         $n.Add('')
         $n.Add("IMPORTANT - known Milestone limitation (not an error of this run): the Management Server node registered last is $($script:MsLastRegistered). Only that node can start the Management Server now. These node(s) CANNOT take over until they are registered again: $($script:MsStaleNodes -join ', ').")
+        if($script:MsSecretSyncNote){ $n.Add([string]$script:MsSecretSyncNote) }
         if($script:MsLive){
             $lv = $script:MsLive
             if($lv.Up){ $n.Add("The Management Server works now, on $($lv.Owner) (checked live at $($lv.At.ToString('HH:mm:ss')): $($lv.Detail)).") }
@@ -5810,7 +6154,7 @@ function Invoke-RegisterActionCore {
                     Set-StageStatus 'REG' 'Working - ServerConfigurator is registering this node...' 'Work'
                     $addr = Get-MsRegisterAddress ($me.Encrypted -eq $true)
                     $rg = Invoke-NodeRegister $me $addr
-                    if($rg.Ok){ $ok=$true; Set-StageStatus 'REG' 'Done - registered, the Management Server is running' 'Good' }
+                    if($rg.Ok){ $ok=$true; [void](Sync-MsClusterSecrets -Source ([string]$script:MsLastRegistered)); Set-StageStatus 'REG' 'Done - registered, the Management Server is running' 'Good' }
                     else {
                         Set-StageStatus 'REG' 'FAILED' 'Bad'
                         Set-RunFailure 'Re-register' $me.Name 'ServerConfigurator could not register this node, or the Management Server did not start within 5 minutes afterwards.' $rg.Detail "Check that the admin account is a Milestone administrator and that the cluster address $($cl.Address) points to this node. Then click 'Re-register this node' again, or send the report to support."
