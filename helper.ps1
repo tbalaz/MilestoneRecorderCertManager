@@ -1,11 +1,9 @@
 # helper.ps1 - commands for 'token validation failed' in the Event Server log.
 #
 # Copy-paste only the block for the computer you are on, in Windows PowerShell started
-# "as Administrator". Fill in the values below first. Blocks 1-4 only read; the fix in
-# block 5 is commented out and changes one Event Server node's registration.
+# "as Administrator". Fill in the value below first. Every block only reads; nothing changes.
 
 $MsName = '<ms-dnsname>'                  # the management server address every server must use
-$EsRole = '<event-server-cluster-role>'   # the Event Server cluster role (block 5 only)
 
 
 # --- 1. On a Management Server node: which node runs the role, and the IDP address per node -
@@ -36,14 +34,3 @@ Get-Date
 $log = Get-ChildItem 'C:\ProgramData\Milestone\XProtect Event Server\logs' -Recurse -Filter *.log -ErrorAction SilentlyContinue | Sort-Object LastWriteTime | Select-Object -Last 1
 "$env:COMPUTERNAME $($log.FullName)"
 Select-String -LiteralPath $log.FullName -Pattern 'validation failed' -Context 1,8 | Select-Object -First 2 | Out-String -Width 300
-
-
-# --- 5. FIX, on the Event Server node that block 3 shows with a different MS address ---------
-# Moves the ES role to this node, stops the role's services, registers this node with $MsName,
-# starts the role again. The Event Server is down for about 1-2 minutes.
-# Move-ClusterGroup -Name $EsRole -Node $env:COMPUTERNAME
-# Get-ClusterGroup $EsRole | Get-ClusterResource | Where-Object ResourceType -eq 'Generic Service' | Stop-ClusterResource
-# & "$env:ProgramFiles\Milestone\Server Configurator\ServerConfigurator.exe" /register /managementserveraddress=http://$MsName/ /quiet | Out-Null
-# (Get-ItemProperty 'HKLM:\SOFTWARE\WOW6432Node\Milestone\XProtect Event Server').ManagementServerAddress
-# Start-ClusterGroup -Name $EsRole
-# Get-ClusterGroup $EsRole | Get-ClusterResource | Select-Object Name,State,OwnerNode | Out-String
