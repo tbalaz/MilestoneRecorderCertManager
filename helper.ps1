@@ -24,6 +24,7 @@ Select-String -LiteralPath $sc -Pattern 'Registration done with result|managemen
 try { $null = Invoke-WebRequest 'http://localhost/ManagementServer/ServerService.svc' -UseBasicParsing; 'ServerService.svc: OK' } catch { 'ServerService.svc: ' + $_.Exception.Message; $r = $_.Exception.Response; if($r){ $s = (New-Object IO.StreamReader($r.GetResponseStream())).ReadToEnd(); $s.Substring(0,[Math]::Min(1500,$s.Length)) } }
 Get-WinEvent -FilterHashtable @{LogName='Application'; Level=2; StartTime=(Get-Date).AddMinutes(-30)} -MaxEvents 5 -ErrorAction SilentlyContinue | Format-List TimeCreated,ProviderName,Message | Out-String -Width 250
 try { 'IDP issuer: ' + (Invoke-RestMethod "http://$MsName/IDP/.well-known/openid-configuration").issuer } catch { 'IDP issuer: ' + $_.Exception.Message }
+Import-Module WebAdministration -ErrorAction SilentlyContinue; Get-ChildItem IIS:\AppPools -ErrorAction SilentlyContinue | Select-Object Name,State | Out-String
 
 
 # --- 2. On an Event Server node -----------------------------------------------------------------
@@ -52,3 +53,47 @@ $recLogs | Select-String -Pattern 'token|unauthori|401' | Select-Object -Last 8 
 # Invoke-Command -ComputerName $Recorders { Restart-Service -DisplayName 'Milestone XProtect Recording Server' }
 # ...and the Event Server role (on an ES node):
 # Stop-ClusterGroup -Name $EsRole; Start-ClusterGroup -Name $EsRole
+
+
+# --- 5. RECOVERY: the MS cannot start because the recorders flood it with requests -------------
+# A temporary firewall rule on every MS node blocks the recorders' addresses while the MS starts.
+# Recorders keep recording while the MS is unreachable (stopping their service would stop recording).
+# On the MS node that ran ServerConfigurator LAST. $Recorders (top) must list EVERY recording server.
+# Pasting this file only DEFINES the functions below; nothing runs until you type a command:
+#   Block-MrcRecorders                   block all recorder addresses on every MS node
+#   iisreset                             restart IIS on this node (the crashed ManagementServer app,
+#                                        and app pools IIS may have stopped after repeated crashes)
+#   Start-ClusterGroup -Name $MsRole     start the MS; wait until the Management Client connects
+#   Release-MrcRecorders 10              unblock 10 recorders + restart their Recording Server service;
+#                                        repeat while the MS stays healthy
+#   Remove-MrcRecorderBlock              at the end, or to undo: delete the rule on every MS node
+$RuleName = 'MRC TEMP block recorders'
+function Get-MrcRecorderIps { param([string[]]$Names)
+    foreach($n in $Names){ foreach($ip in @((Resolve-DnsName $n -Type A -ErrorAction Stop).IPAddress)){ [pscustomobject]@{ Name=$n; Ip=[string]$ip } } } }
+function Block-MrcRecorders {
+    $map = @(Get-MrcRecorderIps $Recorders)
+    $protect = @(Get-ClusterNode | ForEach-Object { @((Resolve-DnsName $_.Name -Type A).IPAddress) })
+    $protect += @(Get-ClusterResource | Where-Object ResourceType -eq 'IP Address' | Get-ClusterParameter -Name Address | ForEach-Object { [string]$_.Value })
+    $bad = @($map | Where-Object { $protect -contains $_.Ip })
+    if($bad.Count){ "STOP - these are MS cluster addresses, not recorders: " + (($bad | ForEach-Object { "$($_.Name)=$($_.Ip)" }) -join ', '); return }
+    $ips = @($map | ForEach-Object Ip | Sort-Object -Unique)
+    "Blocking $($ips.Count) addresses of $(@($Recorders).Count) recorders"
+    Get-ClusterNode | ForEach-Object { Invoke-Command -ComputerName $_.Name -ArgumentList $RuleName,$ips { param($rn,$ips)
+        Remove-NetFirewallRule -DisplayName $rn -ErrorAction SilentlyContinue
+        New-NetFirewallRule -DisplayName $rn -Direction Inbound -Action Block -RemoteAddress $ips | Out-Null
+        "$env:COMPUTERNAME : rule '$rn' blocks $(@($ips).Count) addresses" } } }
+function Release-MrcRecorders { param([int]$Count = 10)
+    $blocked = @((Get-NetFirewallRule -DisplayName $RuleName -ErrorAction SilentlyContinue | Get-NetFirewallAddressFilter).RemoteAddress)
+    if(-not $blocked.Count){ 'No recorder address is blocked any more.'; return }
+    $map = @(Get-MrcRecorderIps $Recorders | Where-Object { $blocked -contains $_.Ip })
+    $names = @($map | ForEach-Object Name | Select-Object -Unique | Select-Object -First $Count)
+    $free = @($map | Where-Object { $names -contains $_.Name } | ForEach-Object Ip)
+    $left = @($blocked | Where-Object { $free -notcontains $_ })
+    Get-ClusterNode | ForEach-Object { Invoke-Command -ComputerName $_.Name -ArgumentList $RuleName,$left { param($rn,$left)
+        if(@($left).Count){ Set-NetFirewallRule -DisplayName $rn -RemoteAddress $left } else { Remove-NetFirewallRule -DisplayName $rn -ErrorAction SilentlyContinue }
+        "$env:COMPUTERNAME : $(@($left).Count) addresses still blocked" } }
+    "Restarting the Recording Server service on: $($names -join ', ')"
+    Invoke-Command -ComputerName $names { Restart-Service -DisplayName 'Milestone XProtect Recording Server'; "$env:COMPUTERNAME : Recording Server restarted" } }
+function Remove-MrcRecorderBlock {
+    Get-ClusterNode | ForEach-Object { Invoke-Command -ComputerName $_.Name -ArgumentList $RuleName { param($rn)
+        Remove-NetFirewallRule -DisplayName $rn -ErrorAction SilentlyContinue; "$env:COMPUTERNAME : rule '$rn' removed" } } }
