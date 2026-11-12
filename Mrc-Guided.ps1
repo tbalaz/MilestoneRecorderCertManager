@@ -1912,8 +1912,8 @@ $script:HostWorker = {
                 $back=Confirm-ServerEncryption -ComputerName $P.Fqdn -Credential $P.Cred -UseSsl:$false -Thumbprint '0' -SkipServiceNames @($P['SkipSvc'] | Where-Object { $_ })
                 foreach($l in $back.Logs){ $logs.Add($l) }
                 $res.Ok=$false; $res.Error=$reason
-                $res.Status= if($back.AllServicesRunning -and -not $offFail.Count){ "FAILED: $reason. Encryption was turned back OFF - $($P.Target) runs unencrypted (svc up)" }
-                             else { "FAILED: $reason. Turning encryption back OFF did not bring $($P.Target) up either$(if($offFail.Count){' (' + ($offFail -join '+') + ')'}) - check it" }
+                $res.Status= if($back.AllServicesRunning -and -not $offFail.Count){ "$reason. Encryption was turned back OFF - $($P.Target) runs unencrypted (svc up)" }
+                             else { "$reason. Turning encryption back OFF did not bring $($P.Target) up either$(if($offFail.Count){' (' + ($offFail -join '+') + ')'}) - check it" }
             }
         } else {
             # Owner 2026-10-31: ServerConfigurator that could not reach the Management Server after applying (lab:
@@ -5502,6 +5502,11 @@ function Set-RunFailure { param([string]$Step,[string]$Who,[string]$Reason,[stri
 # Map an engine status/error text to a sentence an operator can act on.
 function Get-PlainReason { param([string]$Text)
     $t=[string]$Text
+    # Owner 2026-11-12: a recorder that stopped after encryption ON was turned back OFF by the wizard (HostWorker).
+    if($t -match 'Turning encryption back OFF did not bring'){ return 'Encryption could not be turned on, and turning it back OFF did not start the Recording Server again either. This computer does not record now - check it at once.' }
+    if($t -match 'Encryption was turned back OFF'){
+        if($t -match 'could not reach the Management Server'){ return 'This recording server could not reach the Management Server, so encryption could not be turned on there. The wizard turned encryption back OFF on it, so it keeps recording without encryption. Make the Management Server reachable from this computer (name resolution, ports 80 and 443), then run again.' }
+        return 'The Recording Server on this computer stopped right after encryption was turned on. The wizard turned encryption back OFF on it, so it keeps recording without encryption. The reason is in the technical detail; fix it, then run again.' }
     if(Test-IdentityError $t){ return (Get-IdentityMessage $t) }
     if($t -match '(Cannot reach cluster node .+? Nothing was changed on [^.\s]+\.)'){ return $Matches[1] }
     if($t -match 'NOT REGISTERED'){ return 'The Event Server changed its own setting but could not register the change with the Management Server, so the two now disagree.' }
@@ -5873,7 +5878,12 @@ function Invoke-RecStage { param([bool]$Want)
     if(Test-RecRegAsAdminOn){ Write-Log "Recording servers: connection as $($script:RecCred.UserName); registration with the Management Server as $($script:AdminCred.UserName) (network-only logon)." }
     $t0 = Get-Date
     $results=@(Invoke-RecordersParallel -Boxes $todo -Action $(if($Want){'enable'}else{'disable'}) -Common $common -Throttle 32)
-    [void](Confirm-BoxStates $todo $Want -TotalSec 300)
+    # Wait for the real state only where the job succeeded; a failed job (for example a recorder the wizard turned
+    # back OFF) is read once - waiting 5 min for a state it cannot reach only delays the result.
+    $okBoxes=@($todo | Where-Object { $bx=$_; @($results | Where-Object { [string]$_.Box.Addr -eq [string]$bx.Addr -and [bool]$_.Result.Ok }).Count })
+    $badBoxes=@($todo | Where-Object { $okBoxes -notcontains $_ })
+    if($okBoxes.Count){ [void](Confirm-BoxStates $okBoxes $Want -TotalSec 300) }
+    if($badBoxes.Count){ [void](Confirm-BoxStates $badBoxes $Want -TotalSec 0) }
     $failed=@()
     foreach($b in $todo){
         $rr=@($results | Where-Object { [string]$_.Box.Addr -eq [string]$b.Addr } | Select-Object -First 1)

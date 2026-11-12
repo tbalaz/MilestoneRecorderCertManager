@@ -1483,8 +1483,8 @@ $script:HostWorker = {
                 $back=Confirm-ServerEncryption -ComputerName $P.Fqdn -Credential $P.Cred -UseSsl:$false -Thumbprint '0' -SkipServiceNames @($P['SkipSvc'] | Where-Object { $_ })
                 foreach($l in $back.Logs){ $logs.Add($l) }
                 $res.Ok=$false; $res.Error=$reason
-                $res.Status= if($back.AllServicesRunning -and -not $offFail.Count){ "FAILED: $reason. Encryption was turned back OFF - $($P.Target) runs unencrypted (svc up)" }
-                             else { "FAILED: $reason. Turning encryption back OFF did not bring $($P.Target) up either$(if($offFail.Count){' (' + ($offFail -join '+') + ')'}) - check it" }
+                $res.Status= if($back.AllServicesRunning -and -not $offFail.Count){ "$reason. Encryption was turned back OFF - $($P.Target) runs unencrypted (svc up)" }
+                             else { "$reason. Turning encryption back OFF did not bring $($P.Target) up either$(if($offFail.Count){' (' + ($offFail -join '+') + ')'}) - check it" }
             }
         } else {
             # Owner 2026-10-31: ServerConfigurator that could not reach the Management Server after applying (lab:
