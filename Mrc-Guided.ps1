@@ -121,7 +121,9 @@
     -Action on|off|status|register|rollback. -NoEventServer instead of -EsHost when there is no
     standalone Event Server. Without -RecTargets the recording servers are discovered from the VMS
     (-MsAddr, default this machine; needs MilestonePSTools). -TestFailover runs the failover
-    self-test after an on/off run on clustered roles. -FixRegistration lets the pre-flight check
+    self-test after an on/off run on clustered roles. Recording servers get both Server Configurator
+    sections, 'Server certificate' and 'Streaming media' (the video to Smart Client, port 7563);
+    -NoStreamingMedia leaves 'Streaming media' as it is. -FixRegistration lets the pre-flight check
     register computers that point to a different management-server address (Server Configurator
     /register); without it such a computer fails the pre-flight check (status only reports it).
     -CertFolder <dir> -CertPwFile <file> [-RootCaFile <cer>] gives every server a prepared certificate
@@ -150,6 +152,7 @@ param(
     [string]$EsHost = '',                               # standalone Event Server host (FQDN, short name or IP)
     [switch]$NoEventServer,                             # there is no standalone Event Server
     [switch]$NoEventServerSection,                      # headless on/off: leave Server Configurator's "Event server and add-ons" section as it is
+    [switch]$NoStreamingMedia,                          # headless on/off: leave the recorders' "Streaming media" section (video to Smart Client) as it is
     [string]$RecTargets = '',                           # comma list of recorders ('host' or 'name=ip'); empty = discover from the VMS
     [ValidateSet('all','canary','group')][string]$Wave = 'all',   # headless ON: which recording servers (all / canary only / canary + canary group)
     [string]$CanaryRecorders = '',                      # comma list of recorder names / targets / addresses for the canary wave (replaces the saved ticks)
@@ -242,6 +245,7 @@ if (-not $NoEventServer) { $EsHost = Resolve-Default $EsHost 'EsHost' }
 # Milestone certificate-group GUIDs (constant across XProtect installs).
 $script:CertGroupServer = '84430eb7-847c-422d-aa00-7915cd0d7a65'   # Management server / co-located recorder / recording servers
 $script:CertGroupEvent  = '7e02e0f5-549d-4113-b8de-bda2c1f38dbf'   # Event Server
+$script:CertGroupStream = '549df21d-047c-456b-958e-99e65dd8b3ec'   # Streaming media: recorder image server (port 7563) to Smart Client and other video clients
 $script:SignerImportedForRun = $false
 
 # -- SYSTEM-jump launcher: PS1 template with inline C# (VERBATIM) -----------
@@ -1796,6 +1800,7 @@ function Get-DoneText { param([bool]$Want,[string]$Wave)
     $t = if($Want -and ($Wave -eq 'canary' -or $Wave -eq 'group')){ "ON for this wave ($(Get-WaveLabel $Wave)); the recording servers outside it are left as they are" } else { "$(if($Want){'ON'}else{'OFF'}) on every computer" }
     # Owner 2026-11-10: an unticked "Event server and add-ons" section must not hide behind "on every computer".
     if($script:EsBox -and -not $script:EsSectionOn){ $t += ", except the Event Server's 'Event server and add-ons' section (not ticked, left as it was)" }
+    if(@($script:RecBoxes).Count -and -not $script:StreamOn){ $t += "$(if($script:EsBox -and -not $script:EsSectionOn){' and'}else{', except'}) the recording servers' 'Streaming media' section (not ticked, left as it was)" }
     $t
 }
 # Headless: match -CanaryRecorders / -CanaryGroupRecorders (comma lists of name, target or address, case-insensitive)
@@ -2158,6 +2163,8 @@ function Invoke-RecordersParallel { param([object[]]$Boxes,[string]$Action,[hash
         # so a workgroup recorder addressed by name must already be resolved by the time it gets there.
         $conn = try { Get-ConnAddr $box.Addr $Common.Cred } catch { $box.Addr }
         $P=@{Target=$box.Target;Fqdn=$conn;Cred=$Common.Cred;SignerTp=$Common.SignerTp;CaCer=$Common.CaCer;Domain=$Common.Domain;OutputDir=$Common.OutputDir;Guids=$Common.Guids;Names=$Common.Names;Action=$Action;BindExpected=$true;ExtraSans='';ScPaths=[string]$Common.ScPaths;SwitchBack=$true}
+        # Owner 2026-11-25: the certificate groups of THIS recorder (Server certificate, Streaming media).
+        if($box.PSObject.Properties['ScGroups'] -and $box.ScGroups -and $box.ScGroups.Guids){ $P.Guids=$box.ScGroups.Guids; $P.Names=$box.ScGroups.Names }
         # Prepared certificate file for this recorder (checked in the pre-flight check): HostWorker imports it
         # instead of signing a new one, and installs the operator's root CA (if given) instead of the signer.
         $cf=if($Common.ContainsKey('CertFiles') -and $Common.CertFiles){ $Common.CertFiles[([string]$box.Target).ToUpperInvariant()] }else{ $null }
@@ -2365,7 +2372,7 @@ $script:SessOpt = New-PSSessionOption -OpenTimeout 20000 -OperationTimeout 18000
 
 function New-Box { param([string]$Role,[string]$Name,[string]$Target,[string]$Addr,[pscredential]$Cred)
     [pscustomobject]@{ Role=$Role; Name=$Name; Target=$Target; Addr=$Addr; Cred=$Cred; Reachable=$false; Encrypted=$null; Detail='not checked yet'; Excluded=$false
-                       IsNode=$false; ClusterKey=''; Active=$false; Half=$false; SrvHttps=$null } }
+                       IsNode=$false; ClusterKey=''; Active=$false; Half=$false; SrvHttps=$null; StreamEnc=$null } }
 # Cluster state (WSFC). $script:MsCluster / $script:EsCluster are $null for a single (standalone) server.
 $script:MsCluster = $null; $script:MsNodeBoxes = @(); $script:MsDetectError = ''
 $script:EsCluster = $null; $script:EsNodeBoxes = @(); $script:EsDetectError = ''
@@ -2375,6 +2382,9 @@ $script:EsWaitSec = 180; $script:EsHoldPolls = 12
 $script:Scope = $null; $script:FinalOwners = @{}; $script:LastSnapshotPath = ''; $script:TestFailoverOn = $false
 # Owner 2026-11-09: the "Event server and add-ons" section is optional (step 3 check box / -NoEventServerSection).
 $script:EsSectionOn = $true
+# Owner 2026-11-25: the recorders' "Streaming media" section (video to Smart Client), step 3 check box ticked by
+# default / -NoStreamingMedia. Ticked: ON turns it on, OFF turns it off. Unticked: left as it is.
+$script:StreamOn = $true
 # Owner 2026-11-06: which recording servers an ON run configures: 'all' (default, as before), 'canary', 'group' (canary + group).
 $script:RunWave = 'all'; $script:RunWaveLine = ''; $script:WaveGridLoading = $false
 function Get-First { param($Items) $a=@($Items); if($a.Count){ $a[0] } else { $null } }
@@ -2411,7 +2421,33 @@ function Get-StateText { param($Box)
     # Owner 2026-11-10: an Event Server whose two sections differ must not read as plainly (not) encrypted.
     # Encrypted = "Event server and add-ons"; SrvHttps = "Server certificate" (display only, $null = not read).
     elseif((Get-BoxKind $Box) -eq 'ES' -and $null -ne $Box.SrvHttps -and [bool]$Box.SrvHttps -ne [bool]$Box.Encrypted){ if($Box.SrvHttps){ 'Server certificate only' } else { 'Add-ons only' } }
+    # Owner 2026-11-25: a recorder whose "Streaming media" section differs from its "Server certificate" section.
+    elseif((Get-BoxKind $Box) -eq 'REC' -and $null -ne (Get-BoxStream $Box) -and [bool](Get-BoxStream $Box) -ne [bool]$Box.Encrypted){ if($Box.Encrypted){ 'Server certificate only' } else { 'Streaming media only' } }
     elseif($Box.Encrypted){ 'Encrypted' } else { 'Not encrypted' } }
+# Recorder "Streaming media" state ($true / $false / $null = not read); boxes made elsewhere may lack the property.
+function Get-BoxStream { param($Box) if($Box -and $Box.PSObject.Properties['StreamEnc']){ $Box.StreamEnc } else { $null } }
+# Owner 2026-11-25: with the Streaming media box ticked a recorder is only done when that section is in the wanted
+# state too. Not ticked, not a recorder, or the section could not be read: only the Server certificate counts.
+function Test-RecStreamDone { param($Box,[bool]$Want)
+    if(-not $script:StreamOn -or (Get-BoxKind $Box) -ne 'REC'){ return $true }
+    $s = Get-BoxStream $Box
+    ($null -eq $s) -or ([bool]$s -eq $Want) }
+function Test-RecDone { param($Box,[bool]$Want) ($Box.Encrypted -eq $Want) -and (Test-RecStreamDone $Box $Want) }
+# Certificate groups ServerConfigurator runs on one recorder (HostWorker runs them one by one, in this order).
+# ON: a recorder missing either section gets BOTH with the new certificate, so the Server certificate binding
+# check still matches the new thumbprint. OFF: each section that is on.
+function Get-RecScGroups { param($Box,[bool]$Want)
+    $s = Get-BoxStream $Box
+    $stream = $script:StreamOn -and $null -ne $s
+    $g = @()
+    if($Want){
+        $g += [pscustomobject]@{ Guid=$script:CertGroupServer; Name='Server (recorder)' }
+        if($stream){ $g += [pscustomobject]@{ Guid=$script:CertGroupStream; Name='Streaming media' } }
+    } else {
+        if($Box.Encrypted -ne $false -or -not $stream){ $g += [pscustomobject]@{ Guid=$script:CertGroupServer; Name='Server (recorder)' } }
+        if($stream -and $s){ $g += [pscustomobject]@{ Guid=$script:CertGroupStream; Name='Streaming media' } }
+    }
+    [pscustomobject]@{ Guids=((@($g | ForEach-Object { $_.Guid })) -join ' '); Names=((@($g | ForEach-Object { $_.Name })) -join ', ') } }
 
 # Ground truth readers. Management Server: netsh http sslcert bindings (443 = IIS and 5986 = WinRM
 # HTTPS are ignored); MS encrypted iff port 9000 is bound (9001 belongs to a Recording Server on the same
@@ -2454,6 +2490,8 @@ $script:BindingsSb = {
 # W4: recorder ground truth is RecorderConfig.xml's <serverEncryption enabled="true|false"> element
 # (present on a 2025 R3 recorder at this path); the bindings are used ONLY when that element is missing
 # or unreadable. Source=xml/bindings tells the caller which one produced the answer.
+# Stream = Server Configurator's "Streaming media" section (/recorderconfig/webserver/encryption, the image
+# server on port 7563 that Smart Client takes its video from): $true / $false, $null when not readable.
 $script:RecorderStateSb = {
     # The recorder's own DNS names (host name + primary DNS suffix; host name + AD domain when domain-joined): a
     # prepared certificate file may carry one of them instead of the name the wizard reaches the recorder by.
@@ -2469,22 +2507,24 @@ $script:RecorderStateSb = {
             if ($n) {
                 $en = [string]$n.GetAttribute('enabled')
                 if ($en -eq 'true' -or $en -eq 'false') {
-                    return [pscustomobject]@{ Source='xml'; Ok=$true; Bindings=''; Count=0; Enabled=($en -eq 'true'); Hash=[string]$n.GetAttribute('certificateHash'); Names=$ownNames }
+                    $st = $null; $sn = $x.SelectSingleNode('/recorderconfig/webserver/encryption')
+                    if ($sn) { $sv = ([string]$sn.GetAttribute('enabled')).Trim().ToLowerInvariant(); if ($sv -eq 'true' -or $sv -eq 'false') { $st = ($sv -eq 'true') } }
+                    return [pscustomobject]@{ Source='xml'; Ok=$true; Bindings=''; Count=0; Enabled=($en -eq 'true'); Hash=[string]$n.GetAttribute('certificateHash'); Stream=$st; Names=$ownNames }
                 }
             }
         } catch {}
     }
     $addrRe = '(\d{1,3}(?:\.\d{1,3}){3}:\d+|\[[0-9A-Fa-f:]+\]:\d+)'
     $raw = $null
-    try { $raw = @(netsh http show sslcert 2>&1) } catch { return [pscustomobject]@{ Source='bindings'; Ok=$false; Bindings=''; Count=0; Enabled=$null; Hash=''; Error=$_.Exception.Message; Names=$ownNames } }
-    if ($LASTEXITCODE) { return [pscustomobject]@{ Source='bindings'; Ok=$false; Bindings=''; Count=0; Enabled=$null; Hash=''; Error="netsh exited $LASTEXITCODE"; Names=$ownNames } }
+    try { $raw = @(netsh http show sslcert 2>&1) } catch { return [pscustomobject]@{ Source='bindings'; Ok=$false; Bindings=''; Count=0; Enabled=$null; Hash=''; Stream=$null; Error=$_.Exception.Message; Names=$ownNames } }
+    if ($LASTEXITCODE) { return [pscustomobject]@{ Source='bindings'; Ok=$false; Bindings=''; Count=0; Enabled=$null; Hash=''; Stream=$null; Error="netsh exited $LASTEXITCODE"; Names=$ownNames } }
     $b = @()
     foreach ($ln in $raw) {
         $m = [regex]::Match([string]$ln, $addrRe)
         if ($m.Success) { $b += $m.Groups[1].Value }
     }
     $b = @($b | Where-Object { $_ -notmatch ':(443|5986)$' })
-    [pscustomobject]@{ Source='bindings'; Ok=$true; Bindings=($b -join ','); Count=$b.Count; Enabled=($b.Count -gt 0); Hash=''; Names=$ownNames }
+    [pscustomobject]@{ Source='bindings'; Ok=$true; Bindings=($b -join ','); Count=$b.Count; Enabled=($b.Count -gt 0); Hash=''; Stream=$null; Names=$ownNames }
 }
 $script:EsStateSb = {
     $p = Join-Path $env:ProgramData 'Milestone\XProtect Event Server\config\ServiceEndpoints.xml'
@@ -2744,8 +2784,10 @@ function Invoke-OnNode { param([string]$Node,[pscredential]$Cred,[scriptblock]$S
 function Set-RecBoxState { param($Box,$R)
     $Box.Reachable=$true
     $Box | Add-Member -NotePropertyName OwnNames -NotePropertyValue @(if($R -and $R.PSObject.Properties['Names']){ @($R.Names) | Where-Object { $_ } | ForEach-Object { ([string]$_).ToLowerInvariant() } }) -Force
+    $st = if($R -and $R.PSObject.Properties['Stream']){ $R.Stream } else { $null }
+    $Box | Add-Member -NotePropertyName StreamEnc -NotePropertyValue $st -Force
     if($R.Source -eq 'xml'){
-        $Box.Encrypted=$R.Enabled; $Box.Detail="RecorderConfig.xml: serverEncryption enabled=$($R.Enabled)$(if($R.Hash){' hash=' + $R.Hash}else{''})"
+        $Box.Encrypted=$R.Enabled; $Box.Detail="RecorderConfig.xml: serverEncryption enabled=$($R.Enabled)$(if($R.Hash){' hash=' + $R.Hash}else{''}); Streaming media (webserver) enabled=$(if($null -eq $st){'unknown'}else{$st})"
     } elseif($R.Ok){
         $Box.Encrypted=$R.Enabled; $Box.Detail="bindings: $(if($R.Bindings){$R.Bindings}else{'none'}) (RecorderConfig.xml not usable - fallback)"
     } else {
@@ -2849,7 +2891,7 @@ function Confirm-BoxStates { param([object[]]$Boxes,[bool]$Want,[int]$TotalSec=3
         $i++
         Update-BoxStates $Boxes
         foreach($b in @($Boxes)){ Write-Log "  real state [$(Get-RoleText $b)] $($b.Name): $(Get-StateText $b) ($($b.Detail))" }
-        $bad=@($Boxes | Where-Object { $_.Encrypted -ne $Want -or $_.Half })
+        $bad=@($Boxes | Where-Object { $_.Encrypted -ne $Want -or $_.Half -or -not (Test-RecStreamDone $_ $Want) })
         if(-not $bad.Count){ return $true }
         if((Get-Date).AddSeconds($DelaySec) -gt $deadline){ break }
         Write-Log "  $($bad.Count) computer(s) not yet in the wanted state - checking again in ${DelaySec}s (check $i, up to $([int]($TotalSec/60)) min in total)"; Wait-Ui $DelaySec
@@ -4868,7 +4910,7 @@ function Get-PreFlightProblems { param([ValidateSet('on','off','register','rollb
     # actually run it in this action (register always runs it on the local node; on/off/rollback run it on
     # every reachable box that still needs to change). Otherwise refuse and change nothing.
     $scTargets = if($Mode -eq 'register'){ @($boxes | Where-Object { $_.Reachable }) }
-                 else { @($boxes | Where-Object { $_.Reachable -and (Test-InScope $_) -and -not (Test-OutOfWave $_ $Want) -and ($_.Encrypted -ne $Want -or $_.Half) }) }
+                 else { @($boxes | Where-Object { $_.Reachable -and (Test-InScope $_) -and -not (Test-OutOfWave $_ $Want) -and ($_.Encrypted -ne $Want -or $_.Half -or -not (Test-RecStreamDone $_ $Want)) }) }
     foreach($m in @(Get-ScMissingProblem $scTargets)){ $p.Add($m) }
     # Registered to a different management server? Read-only here; Invoke-PreFlight offers the fix.
     $script:RegFindings = @(Get-RegistrationMismatches @($boxes | Where-Object { $_.Reachable }))
@@ -4954,7 +4996,7 @@ function Save-Snapshot { param([string]$Act)
         $roles = @(foreach($k in @('MS','ES')){ $cl = Get-ClusterObj $k; if($cl){ [ordered]@{ Key=$k; Group=$cl.Group; Owner=$cl.Owner; Address=$cl.Address } } })
         $boxes = @(foreach($b in @(Get-AllBoxes)){
             [ordered]@{ Kind=(Get-BoxKind $b); Role=$b.Role; Name=$b.Name; Target=$b.Target; Addr=$b.Addr; IsNode=[bool]$b.IsNode; ClusterKey=$b.ClusterKey
-                        Active=[bool]$b.Active; Encrypted=$b.Encrypted; State=(Get-StateText $b); Excluded=[bool]$b.Excluded } })
+                        Active=[bool]$b.Active; Encrypted=$b.Encrypted; Stream=(Get-BoxStream $b); State=(Get-StateText $b); Excluded=[bool]$b.Excluded } })
         $o = [ordered]@{ Tool='Mrc-Guided'; Version=1; Created=(Get-Date).ToString('s'); Action=$Act; Computer=$env:COMPUTERNAME; Domain=$script:DomainName
                          EsHost=$(if($script:EsBox){ $script:EsAddr } else { '' }); NoEventServer=[bool](-not $script:EsBox); Roles=$roles; Boxes=$boxes }
         ($o | ConvertTo-Json -Depth 6) | Set-Content -LiteralPath $path -Encoding UTF8
@@ -5825,9 +5867,16 @@ function Invoke-RecStage { param([bool]$Want)
     foreach($b in $recs){
         # Owner 2026-11-06: a recording server outside the chosen wave is left exactly as it is.
         if(Test-OutOfWave $b $Want){ Write-Log "[$($b.Name)] not in this wave ($($script:RunWave)) - left as it is" 'Good'; Add-GuidedRow $b $act $true 'not in this wave - left as it is'; continue }
-        if($b.Reachable -and $b.Encrypted -eq $Want){ Write-Log "[$($b.Name)] recording server already $wt - skipped" 'Good'; Add-GuidedRow $b $act $true "already $wt - skipped" }
+        if($b.Reachable -and (Test-RecDone $b $Want)){ Write-Log "[$($b.Name)] recording server already $wt - skipped" 'Good'; Add-GuidedRow $b $act $true "already $wt - skipped" }
         else { $todo+=$b }
     }
+    foreach($b in $todo){
+        # Owner 2026-11-25: per recorder, the sections ServerConfigurator runs (Server certificate, Streaming media).
+        $b | Add-Member -NotePropertyName ScGroups -NotePropertyValue (Get-RecScGroups $b $Want) -Force
+        if($script:StreamOn -and $b.Reachable -and $null -eq (Get-BoxStream $b)){ Write-Log "[$($b.Name)] the 'Streaming media' state could not be read (RecorderConfig.xml) - only the 'Server certificate' section is changed" 'Err' }
+        Write-Log "[$($b.Name)] sections to turn ${wt}: $($b.ScGroups.Names)"
+    }
+    if(-not $script:StreamOn){ Write-Log "The recording servers' 'Streaming media' section (video to Smart Client) is not ticked - left as it is" }
     if(-not $todo.Count){ Set-StageStatus 'REC' "All already $wt - skipped" 'Skip'; return $true }
     # Prerequisite: recorders only move to the state the Management Server is already in (on a
     # cluster: the node that runs the Management Server role now).
@@ -5888,7 +5937,7 @@ function Invoke-RecStage { param([bool]$Want)
     foreach($b in $todo){
         $rr=@($results | Where-Object { [string]$_.Box.Addr -eq [string]$b.Addr } | Select-Object -First 1)
         $wok=($rr.Count -gt 0) -and [bool]$rr[0].Result.Ok
-        if(-not ($wok -and $b.Encrypted -eq $Want)){
+        if(-not ($wok -and (Test-RecDone $b $Want))){
             $txt = if($rr.Count){ "$($rr[0].Result.Status) $($rr[0].Result.Error)" } else { 'no result' }
             $why = if($wok){ "ServerConfigurator reported success, but it still reports: $(Get-StateText $b)." } else { Get-PlainReason "$txt $($b.Detail)" }
             $failed += [pscustomobject]@{ Name=$b.Name; Why=$why; Tech=$txt }
@@ -6034,11 +6083,11 @@ function Invoke-GuidedRunCore { param([ValidateSet('on','off')][string]$Act)
     foreach($b in $all){
         # Owner 2026-11-06: a recording server outside the wave is not part of the final check.
         if(Test-LeftAsIs $b $want){ Add-GuidedRow $b 'final-state' $true "final state $(Get-StateText $b) - $(if(Test-OutOfWave $b $want){'not in this wave'}else{"'Event server and add-ons' not ticked"}), left as it is"; continue }
-        $fine = ($b.Encrypted -eq $want) -and -not $b.Half
+        $fine = ($b.Encrypted -eq $want) -and -not $b.Half -and (Test-RecStreamDone $b $want)
         Add-GuidedRow $b 'final-state' $fine "final state $(Get-StateText $b) (target $wt)" $(if(-not $fine){$b.Detail}else{''}) }
-    $allMatch = (@($all | Where-Object { -not (Test-LeftAsIs $_ $want) -and ($_.Encrypted -ne $want -or $_.Half) }).Count -eq 0)
+    $allMatch = (@($all | Where-Object { -not (Test-LeftAsIs $_ $want) -and ($_.Encrypted -ne $want -or $_.Half -or -not (Test-RecStreamDone $_ $want)) }).Count -eq 0)
     if($ok -and -not $allMatch){
-        $bad=@($all | Where-Object { -not (Test-LeftAsIs $_ $want) -and ($_.Encrypted -ne $want -or $_.Half) } | ForEach-Object { $_.Name })
+        $bad=@($all | Where-Object { -not (Test-LeftAsIs $_ $want) -and ($_.Encrypted -ne $want -or $_.Half -or -not (Test-RecStreamDone $_ $want)) } | ForEach-Object { $_.Name })
         Set-RunFailure 'Final check' ($bad -join ', ') 'These computers are not in the wanted state (for example they could not be reached).' '' 'Make sure every computer is switched on and reachable, then run the same action again.'
     }
     $success = $ok -and $allMatch
@@ -6075,6 +6124,9 @@ function Invoke-GuidedRollbackCore { param([string]$Path)
         return [pscustomobject]@{ Kind='rollback'; Success=$false; Want=$false; Failure=$script:RunFailure; Report=$script:LastReportPath } }
     $want=([string]$snap.Action -ne 'on'); $wt=$(if($want){'ON'}else{'OFF'}); $act="rollback-$($wt.ToLower())"
     $script:EsSectionOn = $true   # rollback: the Event Server section goes back too where that run changed it (scope)
+    # Owner 2026-11-25: the recorders' Streaming media section goes back only when the snapshot shows a recorder that
+    # had it in the rollback's target state (the run moved it away). A snapshot without Stream: Server certificate only.
+    $script:StreamOn = [bool]@(@($snap.Boxes) | Where-Object { [string]$_.Kind -eq 'REC' -and $_.PSObject.Properties['Stream'] -and $null -ne $_.Stream -and [bool]$_.Stream -eq $want }).Count
     $keys = @(Get-RunKeys $want)
     Reset-Stages ($keys + @('ROLE'))
     Write-Log "========== ROLLBACK: turn encryption $wt again where the run of $($snap.Created) changed it ==========" 'Good'
@@ -6487,6 +6539,11 @@ function Get-ConfirmText { param([string]$Act)
          ' - Every computer is checked first. If something is wrong, nothing is changed and you get a list of what to fix.',
          " - The steps run in this order: $order. Computers that are already $wt are skipped.")
     $l += @(Get-ClusterConfirmLines)
+    # Owner 2026-11-25: the recorders' "Streaming media" section (video to Smart Client).
+    if(-not @($script:RecBoxes).Count){ }
+    elseif($script:StreamOn -and $want){ $l += " - Recording servers: both sections, 'Server certificate' and 'Streaming media' (the video to Smart Client and other clients). Every computer that runs Smart Client must trust the certificate's CA, or it shows no video." }
+    elseif($script:StreamOn){ $l += " - Recording servers: both sections, 'Server certificate' and 'Streaming media'." }
+    else { $l += " - Recording servers: only the 'Server certificate' section. 'Streaming media' (video to Smart Client) is not ticked and stays as it is." }
     if($want -and $script:CertFilesOn){ $l += " - Every server gets its certificate file from $($script:CertFilesDir) (no signing CA, no new certificates)$(if($script:CertRootCa){', and the root CA ' + [IO.Path]::GetFileName($script:CertRootCa) + ' is added to their trusted roots'})." }
     if(-not (Test-HasPsTools)){ $l += $script:PsToolsConfirmLine }
     if($script:MsCluster){ $l += " - Known Milestone limitation: after the Management Server is changed, only the node that was configured last ($($script:MsCluster.Owner)) can run it. The other Management Server node(s) need 'Re-register this node' after a failover. The result page explains it." }
@@ -6517,6 +6574,7 @@ function Start-GuidedAction { param([ValidateSet('on','off')][string]$Act)
     $script:RunWave = if($Act -eq 'on'){ switch($script:WaveBox.SelectedIndex){ 1 { 'canary' } 2 { 'group' } default { 'all' } } } else { 'all' }
     $script:TestFailoverOn = [bool]($script:FailoverChk.Visible -and $script:FailoverChk.Checked)
     $script:EsSectionOn = [bool]$script:EsSectionChk.Checked
+    $script:StreamOn = [bool]$script:StreamChk.Checked
     $q=Get-ConfirmText $Act
     if([Windows.Forms.MessageBox]::Show($q,'Please confirm',4,'Question') -ne 'Yes'){ return }
     $offer=$false
@@ -6777,21 +6835,23 @@ $script:WaveBox=[Windows.Forms.ComboBox]::new(); $script:WaveBox.Name='WaveBox';
 $script:FailoverChk=New-UiCheck 'Test failover after the change (move each cluster role to every other node and back)' 24 178 584; $script:FailoverChk.Checked=$true; $script:FailoverChk.Visible=$false; $p3.Controls.Add($script:FailoverChk)
 # Owner 2026-11-09: like Server Configurator - "Event server and add-ons" is optional; "Server certificate" always follows the MS.
 $script:EsSectionChk=New-UiCheck "Change the 'Event server and add-ons' section" 610 178 364; $script:EsSectionChk.Name='EsSectionChk'; $script:EsSectionChk.Checked=$true; $p3.Controls.Add($script:EsSectionChk)
-$script:StageGrid=[Windows.Forms.DataGridView]::new(); $script:StageGrid.Location=[Drawing.Point]::new(24,212); $script:StageGrid.Size=[Drawing.Size]::new(950,160); $script:StageGrid.Anchor='Top,Left,Right'
+# Owner 2026-11-25: the recorders' "Streaming media" section (Smart Client video), ticked by default.
+$script:StreamChk=New-UiCheck "Change the recording servers' 'Streaming media' section (video to Smart Client)" 24 208 950; $script:StreamChk.Name='StreamChk'; $script:StreamChk.Checked=$true; $p3.Controls.Add($script:StreamChk)
+$script:StageGrid=[Windows.Forms.DataGridView]::new(); $script:StageGrid.Location=[Drawing.Point]::new(24,242); $script:StageGrid.Size=[Drawing.Size]::new(950,160); $script:StageGrid.Anchor='Top,Left,Right'
 $script:StageGrid.AllowUserToAddRows=$false; $script:StageGrid.AllowUserToDeleteRows=$false; $script:StageGrid.RowHeadersVisible=$false; $script:StageGrid.ReadOnly=$true
 $script:StageGrid.BackgroundColor=[Drawing.Color]::White; $script:StageGrid.RowTemplate.Height=24; $script:StageGrid.ColumnHeadersHeight=34
 foreach($c in @(@('Step','Step',260),@('Who','Computers',280),@('Status','Status',400))){
     $col=[Windows.Forms.DataGridViewTextBoxColumn]::new(); $col.Name=$c[0]; $col.HeaderText=$c[1]; $col.Width=$c[2]; $col.SortMode='NotSortable'; [void]$script:StageGrid.Columns.Add($col) }
 $script:StageGrid.Columns['Status'].AutoSizeMode='Fill'
 $p3.Controls.Add($script:StageGrid)
-$script:BusyLabel=New-UiLabel 'Working - this can take several minutes (on a cluster: longer). The window may stop responding while a server restarts. Please wait and do not close it.' 24 376 950 50
+$script:BusyLabel=New-UiLabel 'Working - this can take several minutes (on a cluster: longer). The window may stop responding while a server restarts. Please wait and do not close it.' 24 406 950 50
 $script:BusyLabel.TextAlign='TopLeft'; $script:BusyLabel.Font=$script:UiBold; $script:BusyLabel.ForeColor=[Drawing.Color]::DarkOrange; $script:BusyLabel.Visible=$false; $p3.Controls.Add($script:BusyLabel)
-$detailsBtn=New-UiButton 'Show details' 24 430 180 34; $p3.Controls.Add($detailsBtn)
-$undoOldBtn=New-UiButton 'Undo an earlier run...' 214 430 260 34; $p3.Controls.Add($undoOldBtn)
+$detailsBtn=New-UiButton 'Show details' 24 460 180 34; $p3.Controls.Add($detailsBtn)
+$undoOldBtn=New-UiButton 'Undo an earlier run...' 214 460 260 34; $p3.Controls.Add($undoOldBtn)
 $undoOldBtn.Add_Click({ Start-RollbackAction '' })   # asks for the run-...-snapshot.json of that run
-$script:RegBtn=New-UiButton 'Re-register this node' 594 430 380 34; $script:RegBtn.Anchor='Top,Right'; $script:RegBtn.Visible=$false; $p3.Controls.Add($script:RegBtn)
+$script:RegBtn=New-UiButton 'Re-register this node' 594 460 380 34; $script:RegBtn.Anchor='Top,Right'; $script:RegBtn.Visible=$false; $p3.Controls.Add($script:RegBtn)
 $script:RegBtn.Add_Click({ Start-RegisterAction })
-$script:Log=[Windows.Forms.RichTextBox]::new(); $script:Log.Location=[Drawing.Point]::new(24,470); $script:Log.Size=[Drawing.Size]::new(950,142); $script:Log.ReadOnly=$true
+$script:Log=[Windows.Forms.RichTextBox]::new(); $script:Log.Location=[Drawing.Point]::new(24,500); $script:Log.Size=[Drawing.Size]::new(950,112); $script:Log.ReadOnly=$true
 $script:Log.Anchor='Top,Bottom,Left,Right'; $script:Log.Font=[Drawing.Font]::new('Consolas',9); $script:Log.Visible=$false; $p3.Controls.Add($script:Log)
 $detailsBtn.Add_Click({ $script:Log.Visible = -not $script:Log.Visible; $this.Text = if($script:Log.Visible){'Hide details'}else{'Show details'} })
 
@@ -6814,11 +6874,11 @@ $rbHint=New-UiLabel 'Changes back only what the last run changed. Available only
 
 # Short screens (1366 x 768, or 1920 x 1080 at 150 %): a step is never squeezed below this height - it scrolls
 # instead, so bottom-anchored controls cannot slide over the grid and no box collapses (tools\Test-GuidedLayout.ps1).
-$script:Pages[1].AutoScrollMinSize=[Drawing.Size]::new(0,420); $script:Pages[2].AutoScrollMinSize=[Drawing.Size]::new(0,520); $script:Pages[3].AutoScrollMinSize=[Drawing.Size]::new(0,510)
+$script:Pages[1].AutoScrollMinSize=[Drawing.Size]::new(0,420); $script:Pages[2].AutoScrollMinSize=[Drawing.Size]::new(0,550); $script:Pages[3].AutoScrollMinSize=[Drawing.Size]::new(0,510)
 $script:BackBtn.Add_Click({ if($script:Page -gt 1){ Show-Page ($script:Page - 1) } })
 $script:NextBtn.Add_Click({ switch($script:Page){ 1 { Do-Connect } 2 { Show-Page 3 } 3 { Show-Page 4 } default { $script:Form.Close() } } })
 
-$script:BusyCtrls=@($script:BackBtn,$script:NextBtn,$onBtn,$offBtn,$script:WaveBox,$recheckBtn,$findCaBtn,$createCaBtn,$script:CertFilesBtn,$script:RegBtn,$undoOldBtn,$script:FailoverChk,$script:EsSectionChk)   # RollbackBtn: Update-RollbackButton decides
+$script:BusyCtrls=@($script:BackBtn,$script:NextBtn,$onBtn,$offBtn,$script:WaveBox,$recheckBtn,$findCaBtn,$createCaBtn,$script:CertFilesBtn,$script:RegBtn,$undoOldBtn,$script:FailoverChk,$script:EsSectionChk,$script:StreamChk)   # RollbackBtn: Update-RollbackButton decides
 
 # Closing the window in the middle of a change can leave cluster nodes paused or a role elsewhere.
 $script:Form.Add_FormClosing({
@@ -6917,6 +6977,7 @@ if($script:Headless){
         }
         $script:TestFailoverOn = [bool]$TestFailover
         $script:EsSectionOn = -not [bool]$NoEventServerSection
+        $script:StreamOn = -not [bool]$NoStreamingMedia
         # Owner 2026-11-06: waves. Given lists replace (and save) the ticks; not given = the saved ticks.
         $script:RunWave = $(if($Action -eq 'on'){ $Wave } else { 'all' })
         if($CanaryRecorders -or $CanaryGroupRecorders){

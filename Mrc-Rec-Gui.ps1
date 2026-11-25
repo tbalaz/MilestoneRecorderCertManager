@@ -19,8 +19,8 @@
     imports it (+ trusts the signer CA, grants NETWORK SERVICE on the key) and runs
     ServerConfigurator /enableencryption for the Server certificate group (84430eb7) - the same
     group a recorder co-located on the management server already gets from that box's own GUI -
-    plus, optionally, the Streaming media group (549df21d) for recorders running an image server
-    component. Disable runs ServerConfigurator /disableencryption for the same group(s).
+    plus, optionally, the Streaming media group (549df21d): the image server on port 7563 that Smart
+    Client and the other video clients take video from (every recorder runs it). Disable runs ServerConfigurator /disableencryption for the same group(s).
     Minted certificates carry CN = the resolved recorder FQDN, with SANs = FQDN + short name +
     any Extra SANs (per-row 'Sans' grid cell or -ExtraSans), for recorders reachable/registered
     under alias addresses.
@@ -151,8 +151,8 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 # Milestone certificate-group GUIDs (constant across XProtect installs).
-$script:CertGroupServer    = '84430eb7-847c-422d-aa00-7915cd0d7a65'   # server / recording-server comms (port 7563)
-$script:CertGroupStreaming = '549df21d-047c-456b-958e-99e65dd8b3ec'   # streaming media (mobile/web)
+$script:CertGroupServer    = '84430eb7-847c-422d-aa00-7915cd0d7a65'   # Server certificate: management server <-> recorder (port 9001)
+$script:CertGroupStreaming = '549df21d-047c-456b-958e-99e65dd8b3ec'   # Streaming media: recorder video to Smart Client and other clients (port 7563)
 $script:SignerImportedForRun = $false
 
 # -- SYSTEM-jump launcher: PS1 template with inline C# (VERBATIM) -----------
@@ -1186,8 +1186,8 @@ $script:OutputDir = Join-Path ([IO.Path]::GetTempPath()) ("MrcRecGui-{0:yyyyMMdd
 [void](New-Item -ItemType Directory -Path $script:OutputDir -Force)
 $script:RunResults = [System.Collections.Generic.List[object]]::new()
 $script:RunsDir    = Join-Path ([IO.Path]::GetTempPath()) 'MilestoneRecorderCertManager-runs'
-$script:CertGroupServer = '84430eb7-847c-422d-aa00-7915cd0d7a65'   # Server / recording-server comms (port 7563/9001)
-$script:CertGroupStream = '549df21d-047c-456b-958e-99e65dd8b3ec'   # Streaming media (image server)
+$script:CertGroupServer = '84430eb7-847c-422d-aa00-7915cd0d7a65'   # Server certificate: management server <-> recorder (port 9001)
+$script:CertGroupStream = '549df21d-047c-456b-958e-99e65dd8b3ec'   # Streaming media: recorder video to Smart Client and other clients (port 7563)
 $script:RootSubjectForRun = $null                                   # set by -RootSubject in headless; else GUI subject box drives store-mode signer lookup
 
 # -- WinForms helpers ------------------------------------------------------
@@ -1723,14 +1723,14 @@ $storeHint=New-Label '(store-mode signs with the CA matching this CN)' 500 $y 43
 $script:Tip.SetToolTip($storeHint,'Store-mode signs with the CA in the cert store whose CN matches this box. Create root CA makes a fresh self-signed root with this subject. Must be the SAME CA that signed the management server certificate.')
 
 # Per-recorder certificate group selector: the Server group (84430eb7) is mandatory (it IS the
-# recorder cert group); Streaming media (549df21d) is optional, for recorders with an image
-# server component.
+# recorder cert group); Streaming media (549df21d) is optional: it encrypts the video every recorder
+# serves to Smart Client and the other clients (image server, port 7563).
 function New-Chk { param([string]$Text,[int]$X,[int]$Y,[int]$W,[bool]$On)
     $c=[Windows.Forms.CheckBox]::new(); $c.Text=$Text; $c.Location=[Drawing.Point]::new($X,$Y); $c.Size=[Drawing.Size]::new($W,22); $c.Checked=$On; $c }
 $y+=30
 $script:Form.Controls.Add((New-Label 'Certificate group:' 12 $y 120))
 $script:AlsoStreamChk=New-Chk 'Also Streaming media group' 138 $y 220 $false; $script:Form.Controls.Add($script:AlsoStreamChk)
-$script:Tip.SetToolTip($script:AlsoStreamChk,"Certificate group 549df21d - Streaming media / image server.`r`nEvery recorder always gets the Server group (84430eb7). Tick this ONLY if the recorder also runs a Streaming media (image server) component.")
+$script:Tip.SetToolTip($script:AlsoStreamChk,"Certificate group 549df21d - Streaming media: the video from the recorder to Smart Client, Management Client,`r`nMobile Server and other clients (port 7563). Every recorder always gets the Server group (84430eb7).`r`nEvery computer that shows the video must trust the certificate's CA.")
 $script:Form.Controls.Add((New-Label 'Max ||' 770 $y 48))
 $script:MaxParBox   =New-Tb 818 $y 60 '32'; $script:Form.Controls.Add($script:MaxParBox)
 

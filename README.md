@@ -66,6 +66,15 @@ encrypted and "Server certificate" is off. Recording Servers and "Server certifi
 only move to the state the Management Server is already in. In the wrong order,
 ServerConfigurator quits without changing anything and logs no reason.
 
+On a Recording Server, Server Configurator also has two sections. **Server certificate** is the
+link between the Management Server and the recorder. **Streaming media** is the video the
+recorder sends to Smart Client, Management Client, Mobile Server and other clients (port 7563).
+The wizard turns both on and off; a recorder with only "Server certificate" on is not skipped,
+it gets "Streaming media" too. Each recorder restarts once per section, so its video is gone for
+a few minutes. Every computer that runs Smart Client must trust the certificate's CA, or it
+shows no video. Untick "Change the recording servers' 'Streaming media' section" on the Action
+page (headless: `-NoStreamingMedia`) to leave that section as it is.
+
 ## What the guided script does for you
 
 - It checks the **real** state after every step: certificate bindings on the Management
@@ -313,6 +322,7 @@ share: it is listed in `.gitignore`.
     [-CertFolder <folder> -CertPwFile <path> -RootCaFile <root-ca.cer>]   # own CA: -RootSubject not needed
     [-Wave canary|group|all -CanaryRecorders '<rec1>' -CanaryGroupRecorders '<rec2>,<rec3>']   # ON in waves
     [-NoEventServerSection]   # leave the Event Server's "Event server and add-ons" section as it is
+    [-NoStreamingMedia]       # leave the recorders' "Streaming media" section (video to Smart Client) as it is
 .\Mrc-Guided.ps1 -Action register -AdminUser <DOMAIN\user> -AdminPwFile <path>   # this cluster node
 .\Mrc-Guided.ps1 -Action rollback -Snapshot <run-...-snapshot.json> -AdminUser ... -AdminPwFile ...
 ```

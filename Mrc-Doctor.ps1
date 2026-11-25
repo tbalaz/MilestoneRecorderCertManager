@@ -394,7 +394,7 @@ $script:MsBox = $null; $script:EsBox = $null; $script:RecBoxes = @()
 $script:SessOpt = New-PSSessionOption -OpenTimeout 20000 -OperationTimeout 180000
 function New-Box { param([string]$Role,[string]$Name,[string]$Target,[string]$Addr,[pscredential]$Cred)
     [pscustomobject]@{ Role=$Role; Name=$Name; Target=$Target; Addr=$Addr; Cred=$Cred; Reachable=$false; Encrypted=$null; Detail='not checked yet'; Excluded=$false
-                       IsNode=$false; ClusterKey=''; Active=$false; Half=$false; SrvHttps=$null } }
+                       IsNode=$false; ClusterKey=''; Active=$false; Half=$false; SrvHttps=$null; StreamEnc=$null } }
 # Cluster state (WSFC). $script:MsCluster / $script:EsCluster are $null for a single (standalone) server.
 $script:MsCluster = $null; $script:MsNodeBoxes = @(); $script:MsDetectError = ''
 $script:EsCluster = $null; $script:EsNodeBoxes = @(); $script:EsDetectError = ''
@@ -438,6 +438,12 @@ $script:BindingsSb = {
     [pscustomobject]@{ Ok=$true; Bindings=($b -join ','); Count=$b.Count; IdpScheme=$idp }
 }
 $script:RecorderStateSb = {
+    # The recorder's own DNS names (host name + primary DNS suffix; host name + AD domain when domain-joined): a
+    # prepared certificate file may carry one of them instead of the name the wizard reaches the recorder by.
+    $ownNames = @()
+    try { $gp = [System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties(); if ($gp.HostName -and $gp.DomainName) { $ownNames += ('{0}.{1}' -f $gp.HostName, $gp.DomainName) } } catch {}
+    try { $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop; if ($cs.PartOfDomain -and $cs.Domain) { $ownNames += ('{0}.{1}' -f $(if ($cs.DNSHostName) { $cs.DNSHostName } else { $env:COMPUTERNAME }), $cs.Domain) } } catch {}
+    $ownNames = @($ownNames | ForEach-Object { ([string]$_).Trim().TrimEnd('.').ToLowerInvariant() } | Where-Object { $_ -match '\.' } | Select-Object -Unique)
     $cfgPath = Join-Path $env:ProgramData 'Milestone\XProtect Recording Server\RecorderConfig.xml'
     if (Test-Path -LiteralPath $cfgPath) {
         try {
@@ -446,22 +452,24 @@ $script:RecorderStateSb = {
             if ($n) {
                 $en = [string]$n.GetAttribute('enabled')
                 if ($en -eq 'true' -or $en -eq 'false') {
-                    return [pscustomobject]@{ Source='xml'; Ok=$true; Bindings=''; Count=0; Enabled=($en -eq 'true'); Hash=[string]$n.GetAttribute('certificateHash') }
+                    $st = $null; $sn = $x.SelectSingleNode('/recorderconfig/webserver/encryption')
+                    if ($sn) { $sv = ([string]$sn.GetAttribute('enabled')).Trim().ToLowerInvariant(); if ($sv -eq 'true' -or $sv -eq 'false') { $st = ($sv -eq 'true') } }
+                    return [pscustomobject]@{ Source='xml'; Ok=$true; Bindings=''; Count=0; Enabled=($en -eq 'true'); Hash=[string]$n.GetAttribute('certificateHash'); Stream=$st; Names=$ownNames }
                 }
             }
         } catch {}
     }
     $addrRe = '(\d{1,3}(?:\.\d{1,3}){3}:\d+|\[[0-9A-Fa-f:]+\]:\d+)'
     $raw = $null
-    try { $raw = @(netsh http show sslcert 2>&1) } catch { return [pscustomobject]@{ Source='bindings'; Ok=$false; Bindings=''; Count=0; Enabled=$null; Hash=''; Error=$_.Exception.Message } }
-    if ($LASTEXITCODE) { return [pscustomobject]@{ Source='bindings'; Ok=$false; Bindings=''; Count=0; Enabled=$null; Hash=''; Error="netsh exited $LASTEXITCODE" } }
+    try { $raw = @(netsh http show sslcert 2>&1) } catch { return [pscustomobject]@{ Source='bindings'; Ok=$false; Bindings=''; Count=0; Enabled=$null; Hash=''; Stream=$null; Error=$_.Exception.Message; Names=$ownNames } }
+    if ($LASTEXITCODE) { return [pscustomobject]@{ Source='bindings'; Ok=$false; Bindings=''; Count=0; Enabled=$null; Hash=''; Stream=$null; Error="netsh exited $LASTEXITCODE"; Names=$ownNames } }
     $b = @()
     foreach ($ln in $raw) {
         $m = [regex]::Match([string]$ln, $addrRe)
         if ($m.Success) { $b += $m.Groups[1].Value }
     }
     $b = @($b | Where-Object { $_ -notmatch ':(443|5986)$' })
-    [pscustomobject]@{ Source='bindings'; Ok=$true; Bindings=($b -join ','); Count=$b.Count; Enabled=($b.Count -gt 0); Hash='' }
+    [pscustomobject]@{ Source='bindings'; Ok=$true; Bindings=($b -join ','); Count=$b.Count; Enabled=($b.Count -gt 0); Hash=''; Stream=$null; Names=$ownNames }
 }
 $script:EsStateSb = {
     $p = Join-Path $env:ProgramData 'Milestone\XProtect Event Server\config\ServiceEndpoints.xml'
@@ -845,6 +853,10 @@ function Initialize-EsCluster {
 $script:ScSearchPaths = ''
 $script:ScFindSb = {
     param([string]$ConfPath)
+    # ServerConfigurator.exe location on THIS computer (install folders differ per server): the search
+    # list in $ConfPath first (exe paths, or folders: <f>, <f>\Server Configurator, <f>\Milestone\Server
+    # Configurator), then <Milestone root>\Server Configurator derived from the Milestone service image
+    # paths, then %ProgramFiles%\Milestone; last, a bounded recursive search of the given folders.
     $scExe = $null; $scLook = [System.Collections.Generic.List[string]]::new()
     $scDirs = @(([string]$ConfPath) -split ';' | ForEach-Object { $_.Trim().Trim('"') } | Where-Object { $_ })
     foreach ($scP in $scDirs) { if ($scP -match '\.exe$') { $scLook.Add($scP) } else { foreach ($scSub in @('', 'Server Configurator', 'Milestone\Server Configurator')) { $scLook.Add((Join-Path (Join-Path $scP $scSub) 'ServerConfigurator.exe')) } } }
