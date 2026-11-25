@@ -255,6 +255,55 @@ the original certificates. A Recording Server cannot be put back into a state th
 Management Server does not allow (Recording Servers follow the Management Server); it is
 skipped with a message.
 
+## Smart Client: Windows login fails on the cluster name or an alias (HTTP 400)
+
+Seen in the field on a Management Server cluster: Smart Client with **Windows authentication
+(current user)** shows "An error occurred while connecting to the server" when the address is
+the cluster name or a DNS alias (CNAME) that points to it, while another DNS name for the same IP
+address logs in fine. Basic users are not affected (they do not use Kerberos).
+
+Why: on the failing name Windows logs in with Kerberos. Smart Client asks for a ticket for the
+name the alias points to (`HTTP/<cluster name>`), which has an SPN on the cluster's computer
+object. The working name has no SPN, so Windows falls back to NTLM. A user who is a member of
+many AD groups gets a large Kerberos ticket, and HTTP.sys on the Management Server node rejects
+the request with "HTTP Error 400. The size of the request headers is too long" before IIS or
+Milestone see it. The NTLM header is small, so the other name works. Registering an SPN for the
+alias does not help: Smart Client never asks for one.
+
+Check on the client PC, as the affected user, in Windows PowerShell (`https://` instead of
+`http://` when the Management Server is encrypted):
+
+```powershell
+klist purge
+# Now try the Smart Client login on the failing name, then:
+klist | findstr /i "HTTP/"
+$b = 'grant_type=windows_credentials&client_id=GrantValidatorClient'
+try { (Invoke-WebRequest "http://<failing name>/IDP/connect/token" -Method Post -UseDefaultCredentials -UseBasicParsing -Body $b).StatusCode } catch { $_.ErrorDetails.Message }
+```
+
+It is this issue when the ticket list shows `HTTP/<cluster name>` and the last command prints
+"The size of the request headers is too long". On the node that owns the Management Server role,
+`C:\Windows\System32\LogFiles\HTTPERR\` then has `FieldLength` or `RequestLength` lines for the
+client's address.
+
+Fix, on every Management Server node, in a command prompt started "as Administrator":
+
+```
+reg add HKLM\SYSTEM\CurrentControlSet\Services\HTTP\Parameters /v MaxFieldLength /t REG_DWORD /d 65534 /f
+reg add HKLM\SYSTEM\CurrentControlSet\Services\HTTP\Parameters /v MaxRequestBytes /t REG_DWORD /d 16777216 /f
+```
+
+HTTP.sys reads these values when it starts, so reboot the node. In a cluster, one node at a time:
+set and reboot a node that does not own the Management Server role, move the role to it (a short
+outage), then do the other node(s). Afterwards the check above no longer prints the header
+message, and the Windows login works on the cluster name and on the alias.
+
+These are the maximum values. Larger limits let HTTP.sys use more memory per request; Microsoft's
+article gives a formula to size them to your largest ticket instead:
+[HTTP 400 Bad Request (Request Header too long) responses to HTTP requests](https://learn.microsoft.com/en-us/troubleshoot/developer/webapps/iis/www-authentication-authorization/http-bad-request-response-kerberos).
+Undo: `reg delete HKLM\SYSTEM\CurrentControlSet\Services\HTTP\Parameters /v MaxFieldLength /f`,
+the same for `MaxRequestBytes`, then reboot the node.
+
 ## Requirements
 
 - Windows PowerShell 5.1 (not PowerShell 7). WinForms needs the Windows PowerShell host.
