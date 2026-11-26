@@ -282,7 +282,8 @@ try { (Invoke-WebRequest "http://<failing name>/IDP/connect/token" -Method Post 
 ```
 
 It is this issue when the ticket list shows `HTTP/<cluster name>` and the last command prints
-"The size of the request headers is too long". On the node that owns the Management Server role,
+"Bad Request - Request Too Long" or "The size of the request headers is too long" (HTTP.sys
+page, not a JSON answer from the IDP). On the node that owns the Management Server role,
 `C:\Windows\System32\LogFiles\HTTPERR\` then has `FieldLength` or `RequestLength` lines for the
 client's address.
 
