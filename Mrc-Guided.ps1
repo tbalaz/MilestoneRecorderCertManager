@@ -6350,6 +6350,17 @@ function Update-WaveFromCell { param($Grid,[int]$RowIndex,[int]$ColIndex)
     } finally { $script:WaveGridLoading=$false }
     Set-RecWave ([string]$b.Target) $(if($c){'canary'}elseif($g){'group'}else{''})
 }
+# Owner 2026-11-26 ("I cannot select any checkboxes"): a DataGridView check box cell only toggles on its small square;
+# a click anywhere else in a 'Canary' / 'Canary group' cell now toggles it too (CellValueChanged then saves it).
+function Switch-WaveCellOnClick { param($Grid,$E)
+    if([string]$E.Button -ne 'Left' -or $E.RowIndex -lt 0 -or $E.ColumnIndex -lt 0){ return }
+    $name=[string]$Grid.Columns[$E.ColumnIndex].Name
+    if($name -ne 'Canary' -and $name -ne 'CanaryGroup'){ return }
+    $cell=$Grid.Rows[$E.RowIndex].Cells[$E.ColumnIndex]
+    if($cell.ReadOnly -or $cell.ContentBounds.Contains($E.X,$E.Y)){ return }   # locked, or on the square (the grid toggles that itself)
+    [void]$Grid.EndEdit()
+    $cell.Value = -not [bool]$cell.Value
+}
 function Show-StateGrid { param($Grid,[object[]]$Boxes)
     $script:WaveGridLoading=$true
     try {
@@ -6815,6 +6826,7 @@ $p2.Controls.Add((New-UiLabel 'This is the current state of every computer. Noth
 $script:CheckGrid=New-StateGrid 24 50 950 320; Add-WaveColumns $script:CheckGrid; $p2.Controls.Add($script:CheckGrid)
 $script:CheckGrid.Add_CurrentCellDirtyStateChanged({ if($script:CheckGrid.IsCurrentCellDirty){ [void]$script:CheckGrid.CommitEdit([Windows.Forms.DataGridViewDataErrorContexts]::Commit) } })
 $script:CheckGrid.Add_CellValueChanged({ param($s,$e) Update-WaveFromCell $script:CheckGrid $e.RowIndex $e.ColumnIndex })
+$script:CheckGrid.Add_CellMouseUp({ param($s,$e) Switch-WaveCellOnClick $script:CheckGrid $e })
 $script:ClusterLabel=New-UiLabel '' 24 376 950 120; $script:ClusterLabel.TextAlign='TopLeft'; $script:ClusterLabel.Anchor='Bottom,Left,Right'; $p2.Controls.Add($script:ClusterLabel)
 $script:CheckSummary=New-UiLabel '' 24 500 720 30; $script:CheckSummary.Anchor='Bottom,Left'; $script:CheckSummary.Font=$script:UiBold; $p2.Controls.Add($script:CheckSummary)
 $recheckBtn=New-UiButton 'Check again' 794 498 180; $recheckBtn.Anchor='Bottom,Right'; $p2.Controls.Add($recheckBtn); $recheckBtn.Add_Click({ Do-Recheck })
