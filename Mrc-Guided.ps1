@@ -6327,9 +6327,10 @@ function New-StateGrid { param([int]$X,[int]$Y,[int]$W,[int]$H)
     $g }
 # Owner 2026-11-06: the check grid (step 2) gets two tick columns, 'Canary' and 'Canary group', editable on recording-server rows.
 function Add-WaveColumns { param($Grid)
-    $Grid.Columns['Role'].Width=200; $Grid.Columns['Detail'].MinimumWidth=120
-    foreach($c in @(@('Canary','Canary',70),@('CanaryGroup','Canary group',100))){
+    $Grid.Columns['Role'].Width=185; $Grid.Columns['Detail'].MinimumWidth=120
+    foreach($c in @(@('Canary','Canary',70),@('CanaryGroup','Canary group',115))){
         $col=[Windows.Forms.DataGridViewCheckBoxColumn]::new(); $col.Name=$c[0]; $col.HeaderText=$c[1]; $col.Width=$c[2]; $col.SortMode='NotSortable'
+        $col.HeaderCell.Style.WrapMode='False'   # 'Canary group' wrapped to 2 lines and the 34 px header cut off 'group'
         [void]$Grid.Columns.Add($col) }
     $Grid.Columns['Canary'].DisplayIndex=4; $Grid.Columns['CanaryGroup'].DisplayIndex=5
     $Grid.ReadOnly=$false
