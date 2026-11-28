@@ -190,6 +190,16 @@ role (generic services). Run the wizard on any Management Server node.
   installed on every such node.
 - ServerConfigurator runs node by node while the cluster nodes are paused. The node that
   owns the role runs last, so the role ends where it was. Every node has a short outage.
+- **Management Server cluster of two nodes, Turn encryption ON: the Management Server keeps
+  running.** When both nodes are not encrypted and both are Up, the wizard pauses the standby
+  node and runs ServerConfigurator there while the other node keeps serving. ServerConfigurator
+  also starts a second Management Server on that standby node, which Milestone does not support
+  on one database; the wizard stops it at once (it runs for about a minute). The role then moves
+  to that node, the other node is configured the same way, and the role moves back. The
+  Management Server is unavailable only during the two role moves (in our lab about 40 seconds
+  each, against about 11 minutes before). Turn encryption OFF, Undo, Re-register, a cluster of
+  three or more nodes and a node left half-done by an earlier run keep the node-by-node way:
+  Milestone refuses OFF from the standby node.
 - **Management Server cluster: every node can take over.** Milestone itself lets only the node
   that ran ServerConfigurator last start the Management Server: each node keeps its own copy of
   the Management Server's identity secrets. After every ServerConfigurator run on a Management

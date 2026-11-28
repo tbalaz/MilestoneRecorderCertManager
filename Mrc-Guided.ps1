@@ -3050,11 +3050,11 @@ $script:ClusterOpSb = {
             catch { $log.Add("moving role '$Group' to $Node reported: $(& $first $_.Exception.Message)") }
         }
     } elseif($Op -eq 'suspend'){
-        # W3: $Node carries the caller's possible-owner list (comma-separated); a node of this cluster
-        # that is NOT a possible owner of role $Group is left exactly as it is (another role may need it).
+        # W3: $Node carries the caller's list of nodes to pause (comma-separated: the role's possible owners, or one
+        # standby node); a node of this cluster that is NOT in it is left exactly as it is (another role may need it).
         $only = @(([string]$Node) -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
         foreach($n in @(Get-ClusterNode)){
-            if($only.Count -and $only -notcontains [string]$n.Name){ $log.Add("node $($n.Name) left as it is (not a possible owner of role '$Group')"); continue }
+            if($only.Count -and $only -notcontains [string]$n.Name){ $log.Add("node $($n.Name) left as it is (not one of the nodes to pause now)"); continue }
             $st = [string]$n.State
             if($st -eq 'Up'){
                 try { Suspend-ClusterNode -Name $n.Name -ErrorAction Stop | Out-Null; $log.Add("paused node $($n.Name)"); $paused += [string]$n.Name }
@@ -4791,6 +4791,187 @@ function Invoke-ClusterStage { param([string]$Key,[bool]$Want,[object[]]$Todo)
     $true
 }
 
+# -- Management Server cluster ON through the standby node (owner 2026-11-28, lab-proven) -----------
+# On a 2-node cluster ServerConfigurator runs on the node that does NOT own the role while the other node keeps
+# serving; the role moves twice (to the configured node, then back). Everything else (OFF, rollback, 3+ nodes,
+# half-done nodes) keeps the one-node-at-a-time flow of Invoke-ClusterStage. docs/plans/2026-11-28-standby-node-on.md
+# $false = the path is off (the offline flow tests turn it off to keep testing the usual flow).
+$script:MsStandbyOn = $true
+# Stops every Windows service of the MS cluster role on a node that does NOT own the role (ServerConfigurator starts a
+# second Management Server there for about a minute): Stop() and wait 60 s, else kill the process and wait 30 s.
+# Runs on the node; nothing here throws. Returns Ok (every one Stopped) and one line per service.
+$script:MsStandbyStopSb = {
+    param([string[]]$Names,[string]$MsDisplay)
+    $ErrorActionPreference = 'Continue'
+    $lines = [System.Collections.Generic.List[string]]::new(); $allOk = $true
+    try {
+        $svcs = @(Get-Service -ErrorAction SilentlyContinue | Where-Object { @($Names) -contains $_.Name -or [string]$_.DisplayName -eq $MsDisplay })
+        foreach($s in $svcs){
+            $was = [string]$s.Status; $mode = ''; $note = ''
+            try { $mode = [string]$s.StartType } catch {}
+            if($was -ne 'Stopped'){
+                try { $s.Stop(); $s.WaitForStatus('Stopped',[TimeSpan]::FromSeconds(60)) } catch { $note = $_.Exception.Message }
+                $s.Refresh()
+                if([string]$s.Status -ne 'Stopped'){
+                    $svcPid = 0
+                    try { $svcPid = [int](Get-CimInstance Win32_Service -Filter "Name='$($s.Name)'").ProcessId } catch {}
+                    if($svcPid){ Stop-Process -Id $svcPid -Force -ErrorAction SilentlyContinue; $note = "the stop hung or was refused - killed (pid $svcPid)" }
+                    $sw = [Diagnostics.Stopwatch]::StartNew()
+                    while($sw.Elapsed.TotalSeconds -lt 30){ $s.Refresh(); if([string]$s.Status -eq 'Stopped'){ break }; Start-Sleep -Seconds 2 }
+                    $s.Refresh()
+                }
+            }
+            $now = [string]$s.Status
+            if($now -ne 'Stopped'){ $allOk = $false }
+            $lines.Add("$($s.DisplayName): $was -> $now (start mode $mode)$(if($note){" - $note"})")
+        }
+        if(-not $svcs.Count){ $lines.Add('no Milestone service of the role found on this computer') }
+    } catch { $allOk = $false; $lines.Add("could not stop the services: $($_.Exception.Message)") }
+    [pscustomobject]@{ Ok=$allOk; Lines=$lines.ToArray() }
+}
+# '' = the standby path applies; else ONE short reason why the usual flow is used.
+function Get-MsStandbyOnBlocker { param([bool]$Want,[object[]]$Todo)
+    if(-not $script:MsStandbyOn){ return 'the faster switch-on is turned off' }
+    if(-not $Want){ return 'only turning encryption ON uses the faster way' }
+    if($null -ne $script:Scope){ return 'a rollback always goes one node at a time' }
+    if(-not $script:MsCluster){ return 'this Management Server is not clustered' }
+    $boxes = @($script:MsNodeBoxes)
+    if($boxes.Count -ne 2){ return "the faster way is built for 2 cluster nodes (this role has $($boxes.Count))" }
+    $todoT = @(@($Todo) | ForEach-Object { [string]$_.Target })
+    foreach($b in $boxes){ if($todoT -notcontains [string]$b.Target){ return "$($b.Name) is not one of the nodes to change" } }
+    foreach($n in @($script:MsCluster.Nodes)){ if([string]$n.State -ne 'Up'){ return "cluster node $($n.Name) is $($n.State), not Up" } }
+    foreach($b in $boxes){ if($b.Encrypted -ne $false -or $b.Half){ return "$($b.Name) is not plain and complete ($(Get-StateText $b))" } }
+    $owner = [string]$script:MsCluster.Owner
+    if(@($boxes | Where-Object { [string]$_.Target -eq $owner }).Count -ne 1){ return "the role owner $owner is not one of the 2 nodes" }
+    if([string]$script:MsLastRegistered -ne $owner){ return "the role owner $owner is not the node registered last ($($script:MsLastRegistered))" }
+    ''
+}
+# Stop the second Management Server (and the role's other services) on the standby node. Never throws.
+function Stop-MsStandbyServices { param($Box)
+    $names = @(); try { $names = @(@((Invoke-ClusterOp 'MS' 'svcnames').Services) | Where-Object { $_ }) } catch {}
+    $r = $null; $detail = ''
+    try {
+        $al = @($names, $script:MsSvcDisplay)
+        $r = if(Test-NodeIsLocal $Box.Target){ & $script:MsStandbyStopSb @al }
+             else { Invoke-OnNode -Node $Box.Target -Cred $Box.Cred -Sb $script:MsStandbyStopSb -ArgumentList $al }
+        $r = @($r) | Select-Object -Last 1
+    } catch { $detail = Get-FirstLine $_.Exception.Message }
+    if(-not $r){ Write-Log "[$($Box.Name)] the services of the role could not be stopped: $detail" 'Err'; return [pscustomobject]@{ Ok=$false; Detail=$detail } }
+    foreach($l in @($r.Lines)){ Write-Log "[$($Box.Name)] $l" $(if([bool]$r.Ok){'Info'}else{'Err'}) }
+    [pscustomobject]@{ Ok=[bool]$r.Ok; Detail=(@($r.Lines) -join '; ') }
+}
+# ServerConfigurator (ON) on the node that does NOT own the role: only this node is paused (the role cannot move to it
+# half-configured), the owner keeps serving. Returns Ok / Why / Tech. The second Management Server SC starts here is stopped
+# in the finally, before the node is resumed.
+function Invoke-MsStandbyNodeSc { param($Box,[string]$Thumbprint)
+    $out = [pscustomobject]@{ Ok=$false; Why=''; Tech='' }
+    $t0 = Get-Date; $owner = [string]$script:MsCluster.Owner
+    $sus = Invoke-ClusterOp 'MS' 'suspend' ([string]$Box.Target)
+    if(-not $sus.Ok){
+        $out.Why = "$($Box.Name) could not be paused, so ServerConfigurator was NOT run on $($Box.Name). $($sus.Detail)"; $out.Tech = $sus.Detail
+        Add-GuidedRow $Box 'on' $false 'node could not be paused - ServerConfigurator not run' $sus.Detail; return $out }
+    $r = $null; $gwOld = ''; $mobStopped = $false; $resumeFail = ''
+    $sp = [pscustomobject]@{ Ok=$false; Detail='the stop was not run' }; $rs = [pscustomobject]@{ Ok=$true; Detail='' }
+    try {
+        Set-StageStatus 'MS' "$($Box.Name): making sure the Management Server service is stopped..." 'Work'
+        if(Test-NodeIsLocal $Box.Target){ [void](Wait-MsIdpReady -MsFqdn $Box.Addr) }
+        else { [void](Wait-NodeMsSettled -Box $Box -WantRunning $false) }
+        $gwOld = Set-GatewayStopLimit $Box $script:GatewayStopLimit
+        $mobStopped = Set-MobileServerStop $Box
+        Set-StageStatus 'MS' "$($Box.Name): ServerConfigurator is running (turn encryption ON) while $owner keeps serving..." 'Work'
+        $r = Invoke-NodeSc -Key 'MS' -Box $Box -Want $true -Thumbprint $Thumbprint
+        if($r.Ok -or @(@($r.Logs) | Where-Object { [string]$_ -match 'Registration done with result = Success' }).Count){ Set-MsRegistered ([string]$Box.Target) }
+    } catch { $out.Why = Get-PlainReason (Format-Err $_); $out.Tech = Format-Err $_ }
+    finally {
+        if($gwOld){ [void](Set-GatewayStopLimit $Box $gwOld -Restore) }
+        if($mobStopped){ [void](Set-MobileServerStop $Box -Restore) }
+        $sp = Stop-MsStandbyServices $Box
+        $rs = Invoke-ClusterOp 'MS' 'resume'
+        if(-not $rs.Ok){
+            $resumeFail = Get-PausedNodeText @('MS')
+            if(-not $resumeFail){ $resumeFail = "Not every cluster node could be resumed ($($rs.Detail)). Open Failover Cluster Manager, right-click each paused node, Resume > Do not fail roles back." }
+            Write-Log $resumeFail 'Err'
+        }
+    }
+    if($r){
+        Add-RunResult $r
+        foreach($l in $r.Logs){ Write-LogLines "[$($r.Target)] " ([string]$l) }
+        Write-LogLines "[$($r.Target)] $(if($r.Ok){'OK'}else{'FAILED'}): " ([string]$r.Status) $(if($r.Ok){'Good'}else{'Err'})
+    }
+    if($resumeFail){
+        Add-GuidedRow $Box 'on' $false 'cluster node(s) still paused - stopped' $resumeFail
+        $out.Why = $resumeFail; $out.Tech = $rs.Detail; return $out }
+    if(-not $sp.Ok){
+        $out.Why = "A second Management Server still runs on $($Box.Name) next to the one on ${owner}: it could not be stopped ($($sp.Detail)). Stop 'Milestone XProtect Management Server' on $($Box.Name) in services.msc."
+        $out.Tech = $sp.Detail
+        Add-GuidedRow $Box 'on' $false 'second Management Server could not be stopped' $sp.Detail; return $out }
+    if(-not $r){
+        if(-not $out.Why){ $out.Why = "ServerConfigurator could not be run on $($Box.Name)." }
+        Add-GuidedRow $Box 'on' $false 'ServerConfigurator not run' $out.Tech; return $out }
+    # No Wait-NodeService here: the Management Server must NOT run on a node that does not own the role.
+    $gt = Confirm-BoxStates @($Box) $true -TotalSec $(if($r.Ok){ 300 } else { 0 })
+    if($r.Ok -and $gt){ $out.Ok = $true; return $out }
+    Save-NodeDiagnostics $Box $t0 $(if(-not $r.Ok){ "ServerConfigurator failed on $($Box.Name)" } else { "$($Box.Name) still reports the old state" })
+    $out.Why = if(-not $r.Ok){ Get-PlainReason "$($r.Status) $($r.Error)" }
+               else { "ServerConfigurator reported success, but $($Box.Name) still reports: $(Get-StateText $Box)." }
+    $out.Tech = "$($r.Status) $($r.Error)"
+    $out
+}
+# The 2-node Management Server ON flow: B (standby) first while A (the role owner) serves, role to B, A while B serves,
+# role back to A. $Todo = the two node boxes.
+function Invoke-MsStandbyOnStage { param([object[]]$Todo)
+    $cl = $script:MsCluster; $role = Get-StageName 'MS'; $t0 = Get-Date
+    $script:MsTouched = $true
+    $A = Get-NodeBox 'MS' ([string]$cl.Owner)
+    $B = Get-First -Items @(@($script:MsNodeBoxes) | Where-Object { [string]$_.Target -ne [string]$cl.Owner })
+    Write-Log "Management Server cluster '$($cl.Group)': $($B.Name) is configured first while $($A.Name) keeps serving, then the role moves to $($B.Name), then $($A.Name) is configured while $($B.Name) serves, then the role moves back to $($A.Name). For about a minute after ServerConfigurator a second Management Server starts on the standby node; the wizard stops it at once." 'Good'
+    Set-StageStatus 'MS' 'Creating and installing the cluster certificate...' 'Work'
+    try { $tp = New-ClusterCertificate 'MS' $Todo }
+    catch {
+        foreach($b in $Todo){ Add-GuidedRow $b 'on' $false 'cluster certificate could not be installed - nothing changed' (Format-Err $_) }
+        Set-StageStatus 'MS' 'FAILED - certificate' 'Bad'
+        $certWhy = if(Test-IdentityError $_.Exception.Message){ "$(Get-IdentityMessage $_.Exception.Message) The certificate was not installed there and ServerConfigurator was not run, so encryption was not changed." }
+                   else { 'The certificate for the cluster could not be created or installed on every node. ServerConfigurator was not run, so encryption was not changed.' }
+        Set-RunFailure $role $cl.Group $certWhy (Format-Err $_) 'Check that every cluster node is reachable by its own name or its own IP address and that the signing CA is on this computer, then try again.'
+        return $false
+    }
+    $failed = $null
+    do {
+        Set-StageStatus 'MS' "$($B.Name): ServerConfigurator while $($A.Name) keeps serving..." 'Work'
+        $s1 = Invoke-MsStandbyNodeSc $B $tp
+        if(-not $s1.Ok){ $failed = [pscustomobject]@{ Box=$B; Why=$s1.Why; Tech=$s1.Tech }; break }
+        Set-StageStatus 'MS' "Moving the role to $($B.Name)..." 'Work'
+        $mv = Move-ClusterRole 'MS' ([string]$B.Target)
+        if(-not $mv.Ok){ $failed = [pscustomobject]@{ Box=$B; Why="The cluster role could not be moved to $($B.Name)."; Tech=$mv.Detail }; break }
+        [void](Invoke-ClusterOp 'MS' 'start'); Update-BoxStates @($B)
+        $up = Wait-NodeService 'MS' $B -Port 9000
+        if(-not $up.Up){ $failed = [pscustomobject]@{ Box=$B; Why="The Management Server did not come up on $($B.Name) after the role moved there."; Tech=$up.Detail }; break }
+        Set-StageStatus 'MS' "$($A.Name): ServerConfigurator while $($B.Name) serves..." 'Work'
+        $s2 = Invoke-MsStandbyNodeSc $A $tp
+        if(-not $s2.Ok){ $failed = [pscustomobject]@{ Box=$A; Why=$s2.Why; Tech=$s2.Tech }; break }
+        Set-StageStatus 'MS' "Moving the role back to $($A.Name)..." 'Work'
+        $mv = Move-ClusterRole 'MS' ([string]$A.Target)
+        if(-not $mv.Ok){ $failed = [pscustomobject]@{ Box=$A; Why="The cluster role could not be moved back to $($A.Name)."; Tech=$mv.Detail }; break }
+        [void](Invoke-ClusterOp 'MS' 'start'); Update-BoxStates @($A)
+        $up = Wait-NodeService 'MS' $A -Port 9000
+        if(-not $up.Up){ $failed = [pscustomobject]@{ Box=$A; Why="The Management Server did not come up on $($A.Name) after the role moved back there."; Tech=$up.Detail }; break }
+    } while($false)
+    if($failed){
+        # Never leave (or put) the MS role on a node that cannot start it: go to the node registered last.
+        Move-MsToWorkingNode
+        Set-StageStatus 'MS' "FAILED on $($failed.Box.Name)" 'Bad'
+        $next = "Click 'Undo this run (roll back)' to undo what this run changed, or fix the problem and click 'Turn encryption ON' again. If the Management Server does not start on the node that has the role now, run 'Re-register this node' on that node."
+        Set-RunFailure $role $failed.Box.Name $failed.Why $failed.Tech $next
+        return $false
+    }
+    [void](Update-ClusterInfo 'MS')
+    # Every node that ran ServerConfigurator made the other node stale - copy the IDP secrets of the node registered last to it.
+    [void](Sync-MsClusterSecrets -Source ([string]$script:MsLastRegistered))
+    Set-StageStatus 'MS' "Done - encryption ON on $(@($Todo).Count) cluster node(s); the role is on $($cl.Owner)" 'Good'
+    Write-Log "Management Server stage took $([math]::Round(((Get-Date) - $t0).TotalMinutes,1)) min; the Management Server was unavailable only while the role moved." 'Good'
+    $true
+}
+
 # -- Milestone Administrators role check (pre-flight, needs MilestonePSTools) ---------------------
 # ServerConfigurator stops with exit 100 'not authorized' when the run-as account is not in the
 # Milestone Administrators role. Best effort: blocks ONLY when the role members were read and neither
@@ -5870,7 +6051,11 @@ function Invoke-MsStage { param([bool]$Want)
         $notEnc=@($esBoxes | Where-Object { $_.Encrypted -ne $true })
         if($notEnc.Count){ Write-Log "Event server and add-ons is not encrypted on $((@($notEnc | ForEach-Object { $_.Name })) -join ', ') - optional, left as it is. It can only be changed later while the Management Server is not encrypted." 'Info' }
     }
-    if($script:MsCluster){ return (Invoke-ClusterStage 'MS' $Want $todo) }
+    if($script:MsCluster){
+        $why = Get-MsStandbyOnBlocker $Want $todo
+        if(-not $why){ return (Invoke-MsStandbyOnStage $todo) }
+        Write-Log "Management Server cluster: the usual one-node-at-a-time flow is used: $why"
+        return (Invoke-ClusterStage 'MS' $Want $todo) }
     $ms=$script:MsBox
     # W5: the final live guard now also covers a standalone MS - mark it touched so Test-FinalMsLiveGuard runs.
     $script:MsTouched = $true
