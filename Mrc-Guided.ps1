@@ -1668,12 +1668,16 @@ function Format-Err { param($ErrRec)
 function Ensure-TrustedHosts { param([string[]]$Hosts)
     try {
         $cur=(Get-Item WSMan:\localhost\Client\TrustedHosts -ErrorAction Stop).Value
-        $set=@($cur -split ',' | ForEach-Object { $_.Trim() } | Where-Object {$_})
+        $raw=@($cur -split ',' | ForEach-Object { $_.Trim() } | Where-Object {$_})
+        # Written back without duplicates (a lab MS had one address 141 times, 2026-11-05).
+        $set=@(); foreach($h in $raw){ if($set -notcontains $h){ $set+=$h } }
         # A bare '*' means trust-all and is only valid as the SOLE pattern - appending host names
         # to it makes WinRM reject the whole value. Nothing to add in that case anyway.
         if($set -contains '*'){ Write-Log 'TrustedHosts already "*" (trust-all) - nothing to add.'; return }
         $add=@($Hosts | Where-Object { $_ -and ($set -notcontains $_) -and -not (Test-LocalTarget $_) } | Select-Object -Unique)
-        if($add.Count){ Set-Item WSMan:\localhost\Client\TrustedHosts -Value (($set+$add) -join ',') -Force; Write-Log "TrustedHosts += $($add -join ',')" }
+        $dup=$raw.Count - $set.Count
+        if($add.Count -or $dup){ Set-Item WSMan:\localhost\Client\TrustedHosts -Value (($set+$add) -join ',') -Force
+            Write-Log "TrustedHosts += $(if($add.Count){$add -join ','}else{'nothing'})$(if($dup){"; $dup duplicate entries removed"})" }
     } catch { Write-Log "TrustedHosts not updated ($($_.Exception.Message.Split([char]10)[0])) - run elevated if WinRM to IPs fails" 'Err' }
 }
 
@@ -2743,6 +2747,13 @@ function Resolve-NodeConn { param([string]$Node,[pscredential]$Cred)
         else { Write-Log "[$($info.Name)] its name $fq resolves to $(if($res.Count){$res -join ', '}else{'nothing'})$(if($toCluster.Count){' (a cluster / role address)'}elseif($toHere.Count){' (this computer)'}) - the node's own IP address is used instead." }
     }
     foreach($ip in @($info.Ips)){ if($ip -and -not $script:ClusterIpSet.ContainsKey([string]$ip) -and -not (Test-LocalTarget $ip) -and $cands -notcontains $ip){ $cands += [string]$ip } }
+    # Owner 2026-11-28: a node address that does not answer on port 5985 (WinRM) is skipped at once, when another
+    # one does (lab: an Event Server node's unreachable second network card cost about 24 s on every run).
+    if($cands.Count -gt 1){
+        $open = Test-TcpPortMany -Hosts $cands -Port 5985 -TimeoutMs 3000
+        $live = @($cands | Where-Object { $open[[string]$_] })
+        if($live.Count -and $live.Count -lt $cands.Count){ Write-Log "[$($info.Name)] not answering on port 5985 (WinRM), not tried: $(@($cands | Where-Object { -not $open[[string]$_] }) -join ', ')"; $cands = $live }
+    }
     foreach($c in $cands){
         if(Test-IpAddress $c){ Ensure-TrustedHosts -Hosts @($c) }
         try {
@@ -2795,6 +2806,34 @@ function Set-RecBoxState { param($Box,$R)
         $Box.Encrypted=$null; $Box.Detail="state unknown: $(if($R.Error){$R.Error}else{'RecorderConfig.xml and netsh both unusable'})"
     }
 }
+function Test-TcpPortMany { param([string[]]$Hosts,[int]$Port,[int]$TimeoutMs=3000)
+    $r=@{}; $pend=@{}
+    foreach($h in @(@($Hosts) | Where-Object { $_ } | Select-Object -Unique)){
+        $tc = New-Object System.Net.Sockets.TcpClient
+        try { $pend[$h]=@{ Tc=$tc; Iar=$tc.BeginConnect($h,$Port,$null,$null) } } catch { $r[$h]=$false; try { $tc.Close() } catch {} }
+    }
+    $deadline=(Get-Date).AddMilliseconds($TimeoutMs)
+    while(@($pend.Values | Where-Object { -not $_.Iar.IsCompleted }).Count -and (Get-Date) -lt $deadline){ [System.Threading.Thread]::Sleep(100) }
+    foreach($h in @($pend.Keys)){
+        $p=$pend[$h]; $ok=$false
+        if($p.Iar.IsCompleted){ try { $p.Tc.EndConnect($p.Iar); $ok=[bool]$p.Tc.Connected } catch {} }
+        try { $p.Tc.Close() } catch {}
+        $r[$h]=$ok
+    }
+    $r
+}
+# Owner 2026-11-28: a recording server that does not answer is skipped at once. Port 5985 (WinRM, what the wizard
+# connects to) of ALL recorders is tried in one go, 3 s in total; not ping (Windows often blocks it). Before,
+# Get-ConnAddr waited up to 20 s for each dead recorder, one after another (~150 dead took about 50 min).
+function Split-DeadRecorders { param([object[]]$Boxes,[int]$TimeoutMs=3000,[int]$Port=5985)
+    $remote=@(@($Boxes) | Where-Object { $_ -and -not (Test-LocalTarget $_.Addr) })
+    if(-not $remote.Count){ return @{ Live=@($Boxes); Dead=@() } }
+    $open=Test-TcpPortMany -Hosts @($remote | ForEach-Object { [string]$_.Addr }) -Port $Port -TimeoutMs $TimeoutMs
+    $dead=@($remote | Where-Object { -not $open[[string]$_.Addr] })
+    if($dead.Count){ $n=@($dead | Group-Object { [string]$_.Addr } | ForEach-Object { if($_.Count -gt 1){ "$($_.Name) ($($_.Count) recording servers)" } else { $_.Name } })
+        Write-Log "$($dead.Count) of $($remote.Count) recording server(s) do not answer on port $Port (WinRM) within $([int]($TimeoutMs/1000)) s - skipped: $(@($n | Select-Object -First 10) -join ', ')$(if($n.Count -gt 10){" and $($n.Count - 10) more addresses"})" 'Err' }
+    @{ Live=@(@($Boxes) | Where-Object { $dead -notcontains $_ }); Dead=$dead }
+}
 function Update-RecorderStates { param([object[]]$Boxes)
     $remote=@()
     foreach($b in @($Boxes)){
@@ -2802,6 +2841,10 @@ function Update-RecorderStates { param([object[]]$Boxes)
             try { Set-RecBoxState $b (& $script:RecorderStateSb) } catch { $b.Reachable=$true; $b.Encrypted=$null; $b.Detail="netsh failed: $(Get-FirstLine $_.Exception.Message)" }
         } else { $remote+=$b }
     }
+    if(-not $remote.Count){ return }
+    $sp=Split-DeadRecorders $remote
+    foreach($b in @($sp.Dead)){ $b.Reachable=$false; $b.Encrypted=$null; $b.Detail='cannot connect: nothing answers on port 5985 (WinRM) within 3 s' }
+    $remote=@($sp.Live)
     if(-not $remote.Count){ return }
     # W14: resolve each box's connection address first (Kerberos-to-IP fallback) - same host path every
     # other recorder connection goes through, so a workgroup recorder addressed by name is not silently
@@ -4396,7 +4439,7 @@ function Get-TargetMsUrl { $gb = Get-MsGateBox; '{0}://{1}/' -f $(if($gb.Encrypt
 function Invoke-RecorderFanOut { param([object[]]$Boxes,[scriptblock]$Sb,[object[]]$ArgumentList=@())
     $res = @{}
     $connOf = @{}
-    foreach($b in @($Boxes)){ try { $connOf[[string]$b.Addr] = Get-ConnAddr $b.Addr $b.Cred } catch {} }
+    foreach($b in @((Split-DeadRecorders $Boxes).Live)){ try { $connOf[[string]$b.Addr] = Get-ConnAddr $b.Addr $b.Cred } catch {} }
     $addrs = @(@($Boxes) | ForEach-Object { $connOf[[string]$_.Addr] } | Where-Object { $_ } | Select-Object -Unique)
     if(-not $addrs.Count){ return $res }
     $ev = $null

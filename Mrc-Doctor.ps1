@@ -634,13 +634,25 @@ function Invoke-OnBox { param([string]$Computer,[pscredential]$Cred,[scriptblock
         Invoke-OnBoxRaw -Computer $ip -Cred $Cred -Sb $Sb -ArgumentList $ArgumentList
     }
 }
+# Owner 2026-11-28: a recording server that does not answer is skipped at once. Port 5985 (WinRM, what the wizard
+# connects to) of ALL recorders is tried in one go, 3 s in total; not ping (Windows often blocks it). Before,
+# Get-ConnAddr waited up to 20 s for each dead recorder, one after another (~150 dead took about 50 min).
+function Split-DeadRecorders { param([object[]]$Boxes,[int]$TimeoutMs=3000,[int]$Port=5985)
+    $remote=@(@($Boxes) | Where-Object { $_ -and -not (Test-LocalTarget $_.Addr) })
+    if(-not $remote.Count){ return @{ Live=@($Boxes); Dead=@() } }
+    $open=Test-TcpPortMany -Hosts @($remote | ForEach-Object { [string]$_.Addr }) -Port $Port -TimeoutMs $TimeoutMs
+    $dead=@($remote | Where-Object { -not $open[[string]$_.Addr] })
+    if($dead.Count){ $n=@($dead | Group-Object { [string]$_.Addr } | ForEach-Object { if($_.Count -gt 1){ "$($_.Name) ($($_.Count) recording servers)" } else { $_.Name } })
+        Write-Log "$($dead.Count) of $($remote.Count) recording server(s) do not answer on port $Port (WinRM) within $([int]($TimeoutMs/1000)) s - skipped: $(@($n | Select-Object -First 10) -join ', ')$(if($n.Count -gt 10){" and $($n.Count - 10) more addresses"})" 'Err' }
+    @{ Live=@(@($Boxes) | Where-Object { $dead -notcontains $_ }); Dead=$dead }
+}
 # One Invoke-Command fan-out over many recorders (WinRM runs them in parallel). Returns Addr -> result.
 # W14: connects through Get-ConnAddr (Kerberos-to-IP fallback), same as every other recorder path - the
 # result stays keyed by each box's ORIGINAL Addr so callers do not need to know about the resolved address.
 function Invoke-RecorderFanOut { param([object[]]$Boxes,[scriptblock]$Sb,[object[]]$ArgumentList=@())
     $res = @{}
     $connOf = @{}
-    foreach($b in @($Boxes)){ try { $connOf[[string]$b.Addr] = Get-ConnAddr $b.Addr $b.Cred } catch {} }
+    foreach($b in @((Split-DeadRecorders $Boxes).Live)){ try { $connOf[[string]$b.Addr] = Get-ConnAddr $b.Addr $b.Cred } catch {} }
     $addrs = @(@($Boxes) | ForEach-Object { $connOf[[string]$_.Addr] } | Where-Object { $_ } | Select-Object -Unique)
     if(-not $addrs.Count){ return $res }
     $ev = $null
@@ -672,6 +684,13 @@ function Resolve-NodeConn { param([string]$Node,[pscredential]$Cred)
         else { Write-Log "[$($info.Name)] its name $fq resolves to $(if($res.Count){$res -join ', '}else{'nothing'})$(if($toCluster.Count){' (a cluster / role address)'}elseif($toHere.Count){' (this computer)'}) - the node's own IP address is used instead." }
     }
     foreach($ip in @($info.Ips)){ if($ip -and -not $script:ClusterIpSet.ContainsKey([string]$ip) -and -not (Test-LocalTarget $ip) -and $cands -notcontains $ip){ $cands += [string]$ip } }
+    # Owner 2026-11-28: a node address that does not answer on port 5985 (WinRM) is skipped at once, when another
+    # one does (lab: an Event Server node's unreachable second network card cost about 24 s on every run).
+    if($cands.Count -gt 1){
+        $open = Test-TcpPortMany -Hosts $cands -Port 5985 -TimeoutMs 3000
+        $live = @($cands | Where-Object { $open[[string]$_] })
+        if($live.Count -and $live.Count -lt $cands.Count){ Write-Log "[$($info.Name)] not answering on port 5985 (WinRM), not tried: $(@($cands | Where-Object { -not $open[[string]$_] }) -join ', ')"; $cands = $live }
+    }
     foreach($c in $cands){
         if(Test-IpAddress $c){ Ensure-TrustedHosts -Hosts @($c) }
         try {

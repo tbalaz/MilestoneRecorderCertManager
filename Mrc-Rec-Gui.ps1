@@ -1243,12 +1243,16 @@ function Resolve-Signer {
 function Ensure-TrustedHosts { param([string[]]$Hosts)
     try {
         $cur=(Get-Item WSMan:\localhost\Client\TrustedHosts -ErrorAction Stop).Value
-        $set=@($cur -split ',' | ForEach-Object { $_.Trim() } | Where-Object {$_})
+        $raw=@($cur -split ',' | ForEach-Object { $_.Trim() } | Where-Object {$_})
+        # Written back without duplicates (a lab MS had one address 141 times, 2026-11-05).
+        $set=@(); foreach($h in $raw){ if($set -notcontains $h){ $set+=$h } }
         # A bare '*' means trust-all and is only valid as the SOLE pattern - appending host names
         # to it makes WinRM reject the whole value. Nothing to add in that case anyway.
         if($set -contains '*'){ Write-Log 'TrustedHosts already "*" (trust-all) - nothing to add.'; return }
         $add=@($Hosts | Where-Object { $_ -and ($set -notcontains $_) -and -not (Test-LocalTarget $_) } | Select-Object -Unique)
-        if($add.Count){ Set-Item WSMan:\localhost\Client\TrustedHosts -Value (($set+$add) -join ',') -Force; Write-Log "TrustedHosts += $($add -join ',')" }
+        $dup=$raw.Count - $set.Count
+        if($add.Count -or $dup){ Set-Item WSMan:\localhost\Client\TrustedHosts -Value (($set+$add) -join ',') -Force
+            Write-Log "TrustedHosts += $(if($add.Count){$add -join ','}else{'nothing'})$(if($dup){"; $dup duplicate entries removed"})" }
     } catch { Write-Log "TrustedHosts not updated ($($_.Exception.Message.Split([char]10)[0])) - run elevated if WinRM to IPs fails" 'Err' }
 }
 
